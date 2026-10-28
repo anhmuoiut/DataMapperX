@@ -1,0 +1,24 @@
+{
+    "ICT_I3070 Test Log": {
+        "type": "text",
+        "file_extensions": ".log,.txt,.csv",
+        "sn_regex": "(VSE[A-Z0-9]+)",
+        "block_regex": "\\{@BLOCK\\|(?P<component>[^|]+)\\|00\\b",
+        "measure_regex": "\\{@A-(?P<type>[A-Z0-9]+)\\|[^|]*\\|(?P<measured>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)(?P<tail>.*)",
+        "lim2_regex": "\\{@LIM2\\|(?P<max>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)\\|(?P<min>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)\\}\\}",
+        "lim3_regex": "\\{@LIM3\\|(?P<normal>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)\\|(?P<max>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)\\|(?P<min>[+-]?\\d+(?:\\.\\d+)?E[+-]?\\d+)\\}\\}"
+    },
+    "Function Test Log": {
+        "type": "excel",
+        "file_extensions": ".xlsx,.xlsm",
+        "sn_regex": "(VSE[A-Z0-9]+)",
+        "sn_sheet": "Session",
+        "data_sheet": "Results",
+        "row_start": "2",
+        "component_col": "C",
+        "measure_col": "F",
+        "min_col": "E",
+        "max_col": "G",
+        "unit_col": "H"
+    }
+}
