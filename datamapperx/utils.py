@@ -30,6 +30,23 @@ def looks_like_cell_coordinate(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z]{1,3}\d{1,7}", safe_text(value)))
 
 
+def column_number(letters: str) -> int:
+    """'A' -> 1, 'Z' -> 26, 'AA' -> 27."""
+    number = 0
+    for char in letters.upper():
+        number = number * 26 + ord(char) - 64
+    return number
+
+
+def column_letter(number: int) -> str:
+    """1 -> 'A', 27 -> 'AA'."""
+    letters = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
 def normalize_excel_column(value: Any, label: str, allow_blank: bool = False) -> str:
     col = safe_text(value).upper()
     if not col and allow_blank:

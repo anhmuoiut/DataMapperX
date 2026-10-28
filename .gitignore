@@ -1,8 +1,6 @@
 # Build output
 build/
 dist/
-dist*/
-*.spec.bak
 version_info.txt
 
 # Python
@@ -18,16 +16,12 @@ venv/
 app_debug.log*
 settings.json
 
-# Assets that must not be published (company branding). The app falls back to
-# assets/DataMapperX.png when this file is missing.
-assets/Jabil_logo.png
-
-# Superseded snapshots kept locally only
-DataMapperX_V1.py
-DataMapperX_V2.py
+# Real test logs used for local checks; they hold company data and must not be published
+samples/
 
 # Editors / OS
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+previews/

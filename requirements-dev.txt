@@ -1,4 +1,5 @@
 -r requirements.txt
 pyinstaller>=6.9
+pillow>=10  # only tools/make_logo_png.py needs it
 pytest>=8
 ruff>=0.6

@@ -6,17 +6,15 @@ import codecs
 import logging
 import re
 from collections.abc import Iterator, Sequence
-from itertools import islice
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from zipfile import BadZipFile
 
-from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string
-
 from .models import Measurement, ParsedFile
 from .profiles import compile_text_profile_regexes
 from .utils import (
+    column_number,
     compile_profile_regex,
     group_value,
     looks_like_cell_coordinate,
@@ -24,6 +22,7 @@ from .utils import (
     parse_positive_int,
     safe_text,
 )
+from .xlsx import read_workbook
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +43,17 @@ def sn_from_match(match: re.Match[str]) -> str:
     return safe_text(value).upper()
 
 
-def extract_sn_from_text(source: str, sn_regex: str = "") -> str:
-    source = safe_text(source)
-    if not source:
+def _find_sn(source: Any, pattern: re.Pattern[str] | None) -> str:
+    """The serial number in ``source`` according to ``pattern`` (the default pattern when None)."""
+    text = safe_text(source)
+    if not text:
         return ""
-    pattern = compile_profile_regex(sn_regex, "SN_Regex", re.IGNORECASE) or SN_PATTERN
-    match = pattern.search(source)
+    match = (pattern or SN_PATTERN).search(text)
     return sn_from_match(match) if match else ""
+
+
+def extract_sn_from_text(source: str, sn_regex: str = "") -> str:
+    return _find_sn(source, compile_profile_regex(sn_regex, "SN_Regex", re.IGNORECASE))
 
 
 # -----------------------------------------------------------------------------
@@ -103,6 +106,46 @@ def _limits_from_tail(tail: str, lim2_re, lim3_re) -> tuple[str, str]:
     return "", ""
 
 
+@dataclass(frozen=True, slots=True)
+class TextRecord:
+    """A component line and the measurement line that follows it (indexes are 0-based)."""
+
+    block_index: int
+    block_match: re.Match[str]
+    block_offset: int  # the block pattern is matched against the stripped line; this is the stripped prefix
+    measure_index: int
+    measure_match: re.Match[str]
+    component: str
+
+
+def iter_text_records(lines: Sequence[str], block_re: re.Pattern[str], measure_re: re.Pattern[str]) -> Iterator[TextRecord]:
+    """Pair each component line with its measurement line, which is the next non-blank line."""
+    total = len(lines)
+    i = 0
+    while i < total:
+        stripped = lines[i].strip()
+        block_match = block_re.search(stripped)
+        if not block_match:
+            i += 1
+            continue
+
+        component = safe_text(group_value(block_match, "component", fallback_first=True))
+
+        j = i + 1
+        while j < total and not lines[j].strip():
+            j += 1
+
+        measure_match = measure_re.search(lines[j]) if component and j < total else None
+        if measure_match is None:
+            # Not followed by a measurement: look at the very next line, which may be another block.
+            i += 1
+            continue
+
+        offset = len(lines[i]) - len(lines[i].lstrip())
+        yield TextRecord(i, block_match, offset, j, measure_match, component)
+        i = j + 1
+
+
 def parse_text_file(path: Path, profile: dict, compiled: dict | None = None) -> ParsedFile:
     text = read_text_file(path)
     compiled = compiled or compile_text_profile_regexes(profile)
@@ -114,29 +157,8 @@ def parse_text_file(path: Path, profile: dict, compiled: dict | None = None) -> 
 
     entries: dict[str, Measurement] = {}
     duplicates: dict[str, list[Measurement]] = {}
-    lines = text.splitlines()
-    total = len(lines)
-
-    i = 0
-    while i < total:
-        block_match = block_re.search(lines[i].strip())
-        if not block_match:
-            i += 1
-            continue
-
-        component = safe_text(group_value(block_match, "component", fallback_first=True))
-
-        # The measurement is on the next non-blank line.
-        j = i + 1
-        while j < total and not lines[j].strip():
-            j += 1
-
-        measure_match = measure_re.search(lines[j]) if component and j < total else None
-        if measure_match is None:
-            # Not followed by a measurement: look at the very next line, which may be another block.
-            i += 1
-            continue
-
+    for record in iter_text_records(text.splitlines(), block_re, measure_re):
+        measure_match = record.measure_match
         min_value, max_value = _limits_from_tail(
             group_value(measure_match, "tail"), compiled["lim2_re"], compiled["lim3_re"]
         )
@@ -144,15 +166,14 @@ def parse_text_file(path: Path, profile: dict, compiled: dict | None = None) -> 
             entries,
             duplicates,
             Measurement(
-                component=component,
+                component=record.component,
                 measured=safe_text(group_value(measure_match, "measured", fallback_first=True)),
                 min_value=safe_text(min_value),
                 max_value=safe_text(max_value),
                 unit=safe_text(group_value(measure_match, "type").upper()),
-                source_row=str(i + 1),
+                source_row=str(record.block_index + 1),
             ),
         )
-        i = j + 1
 
     return ParsedFile(sn=sn, entries=entries, duplicates=duplicates, row_label="Lines")
 
@@ -160,52 +181,113 @@ def parse_text_file(path: Path, profile: dict, compiled: dict | None = None) -> 
 # -----------------------------------------------------------------------------
 # Excel logs
 # -----------------------------------------------------------------------------
+_SN_SCAN_ROWS, _SN_SCAN_COLUMNS = 80, 30  # where to hunt for a serial number when no cell is given
+
+
 def _cell(row: Sequence[Any], index: int | None) -> Any:
     if index is None or index >= len(row):
         return None
     return row[index]
 
 
-def _iter_sheet_text(ws, max_rows: int = 80, max_cols: int = 30) -> Iterator[str]:
-    """Yield the text of the first cells of a sheet (used to hunt for a serial number)."""
-    for row in islice(ws.iter_rows(max_col=max_cols, values_only=True), max_rows):
-        for value in row:
-            text = safe_text(value)
-            if text:
-                yield text
+@dataclass(frozen=True, slots=True)
+class _ExcelSettings:
+    """A profile's Excel rules, checked once before any file is opened."""
+
+    sn_sheet: str
+    data_sheet: str
+    sn_cell: str  # such as "B1" when the serial number rule is a cell, otherwise ""
+    sn_pattern: re.Pattern[str] | None  # the rule when it is a pattern; None means the default pattern
+    row_start: int
+    columns: tuple[int | None, ...]  # component, measured, min, max, unit (0-based; None when not used)
+    skip_headings: bool
+
+    @classmethod
+    def from_profile(cls, profile: dict) -> _ExcelSettings:
+        rule = safe_text(profile.get("sn_regex", ""))
+        is_cell = looks_like_cell_coordinate(rule)
+        letters = (
+            normalize_excel_column(profile.get("component_col", "A"), "Component_Col"),
+            normalize_excel_column(profile.get("measure_col", "B"), "Measure_Col"),
+            normalize_excel_column(profile.get("min_col", "C"), "Min_Col", allow_blank=True),
+            normalize_excel_column(profile.get("max_col", "D"), "Max_Col", allow_blank=True),
+            normalize_excel_column(profile.get("unit_col", "E"), "Unit_Col", allow_blank=True),
+        )
+        return cls(
+            sn_sheet=safe_text(profile.get("sn_sheet", "")),
+            data_sheet=safe_text(profile.get("data_sheet", "")),
+            sn_cell=rule.upper() if is_cell else "",
+            sn_pattern=None if is_cell else compile_profile_regex(rule, "SN_Regex", re.IGNORECASE),
+            row_start=parse_positive_int(profile.get("row_start", 2), "Row_Start"),
+            columns=tuple(column_number(letter) - 1 if letter else None for letter in letters),
+            # Section headings ("INITIALIZE (Init)") have a name but no result; they are not measurements.
+            skip_headings=profile.get("skip_empty_rows", True) is not False,
+        )
 
 
-def _column_index(letter: str) -> int | None:
-    return column_index_from_string(letter) - 1 if letter else None
+def _excel_sn(reader, sheet: str, path: Path, settings: _ExcelSettings) -> str:
+    rows, columns = _SN_SCAN_ROWS, _SN_SCAN_COLUMNS
+    cell_row = cell_column = 0
+    if settings.sn_cell:
+        match = re.fullmatch(r"([A-Z]+)(\d+)", settings.sn_cell)
+        cell_row, cell_column = int(match.group(2)), column_number(match.group(1))
+        rows, columns = max(rows, cell_row), max(columns, cell_column)
+    grid = reader.grid(sheet, rows, columns)
 
-
-def _excel_sn(ws_sn, path: Path, sn_rule: str) -> str:
-    is_cell = looks_like_cell_coordinate(sn_rule)
-    regex_rule = "" if is_cell else sn_rule
-
-    if is_cell:
-        try:
-            cell_text = safe_text(ws_sn[sn_rule.upper()].value)
-        except (IndexError, KeyError, ValueError):
-            cell_text = ""
-        sn = extract_sn_from_text(cell_text) or cell_text.upper()
+    if settings.sn_cell:
+        value = grid[cell_row - 1][cell_column - 1] if 1 <= cell_row <= len(grid) and cell_column <= len(grid[cell_row - 1]) else None
+        text = safe_text(value)
+        sn = _find_sn(text, None) or text.upper()
         if sn:
             return sn
 
-    sn = extract_sn_from_text(path.name, regex_rule)
+    sn = _find_sn(path.name, settings.sn_pattern)
     if sn:
         return sn
-
-    for cell_text in _iter_sheet_text(ws_sn):
-        sn = extract_sn_from_text(cell_text, regex_rule)
-        if sn:
-            return sn
+    for row in grid[:_SN_SCAN_ROWS]:
+        for value in row[:_SN_SCAN_COLUMNS]:
+            sn = _find_sn(value, settings.sn_pattern)
+            if sn:
+                return sn
     return ""
 
 
+def _read_excel(reader, path: Path, settings: _ExcelSettings) -> ParsedFile:
+    names = reader.sheet_names
+    if not names:
+        raise ValueError(f"'{path.name}' has no worksheets.")
+    sn_sheet = settings.sn_sheet if settings.sn_sheet in names else names[0]
+    second = names[1] if len(names) > 1 else names[0]
+    data_sheet = settings.data_sheet if settings.data_sheet in names else second
+
+    sn = _excel_sn(reader, sn_sheet, path, settings)
+    idx_comp, idx_meas, idx_min, idx_max, idx_unit = settings.columns
+
+    entries: dict[str, Measurement] = {}
+    duplicates: dict[str, list[Measurement]] = {}
+    for row_no, row in reader.iter_rows(data_sheet, min_row=settings.row_start):
+        component = safe_text(_cell(row, idx_comp))
+        if not component:
+            continue
+        measurement = Measurement(
+            component=component,
+            measured=safe_text(_cell(row, idx_meas)),
+            min_value=safe_text(_cell(row, idx_min)),
+            max_value=safe_text(_cell(row, idx_max)),
+            unit=safe_text(_cell(row, idx_unit)),
+            source_row=str(row_no),
+        )
+        if settings.skip_headings and not (measurement.measured or measurement.min_value or measurement.max_value or measurement.unit):
+            continue
+        _register(entries, duplicates, measurement)
+
+    return ParsedFile(sn=sn, entries=entries, duplicates=duplicates, row_label="Rows")
+
+
 def parse_excel_file(path: Path, profile: dict) -> ParsedFile:
+    settings = _ExcelSettings.from_profile(profile)
     try:
-        wb = load_workbook(str(path), data_only=True, read_only=True)
+        return read_workbook(path, lambda reader: _read_excel(reader, path, settings))
     except PermissionError:
         raise PermissionError(
             f"Cannot access '{path.name}'.\n\n"
@@ -214,59 +296,6 @@ def parse_excel_file(path: Path, profile: dict) -> ParsedFile:
         ) from None
     except BadZipFile:
         raise ValueError(f"'{path.name}' is not a valid Excel workbook.") from None
-
-    try:
-        return _parse_workbook(wb, path, profile)
-    finally:
-        wb.close()
-
-
-def _parse_workbook(wb, path: Path, profile: dict) -> ParsedFile:
-    sn_sheet_name = safe_text(profile.get("sn_sheet", ""))
-    data_sheet_name = safe_text(profile.get("data_sheet", ""))
-
-    ws_sn = wb[sn_sheet_name] if sn_sheet_name in wb.sheetnames else wb.worksheets[0]
-    if data_sheet_name in wb.sheetnames:
-        ws_data = wb[data_sheet_name]
-    elif len(wb.worksheets) > 1:
-        ws_data = wb.worksheets[1]
-    else:
-        ws_data = wb.active
-
-    # Some tools write a wrong <dimension> tag; read-only mode would then stop after the first row.
-    for ws in (ws_sn, ws_data):
-        if hasattr(ws, "reset_dimensions"):
-            ws.reset_dimensions()
-
-    sn = _excel_sn(ws_sn, path, safe_text(profile.get("sn_regex", "")))
-
-    row_start = parse_positive_int(profile.get("row_start", 2), "Row_Start")
-    idx_comp = _column_index(normalize_excel_column(profile.get("component_col", "A"), "Component_Col"))
-    idx_meas = _column_index(normalize_excel_column(profile.get("measure_col", "B"), "Measure_Col"))
-    idx_min = _column_index(normalize_excel_column(profile.get("min_col", "C"), "Min_Col", allow_blank=True))
-    idx_max = _column_index(normalize_excel_column(profile.get("max_col", "D"), "Max_Col", allow_blank=True))
-    idx_unit = _column_index(normalize_excel_column(profile.get("unit_col", "E"), "Unit_Col", allow_blank=True))
-
-    entries: dict[str, Measurement] = {}
-    duplicates: dict[str, list[Measurement]] = {}
-    for row_no, row in enumerate(ws_data.iter_rows(min_row=row_start, values_only=True), start=row_start):
-        component = safe_text(_cell(row, idx_comp))
-        if not component:
-            continue
-        _register(
-            entries,
-            duplicates,
-            Measurement(
-                component=component,
-                measured=safe_text(_cell(row, idx_meas)),
-                min_value=safe_text(_cell(row, idx_min)),
-                max_value=safe_text(_cell(row, idx_max)),
-                unit=safe_text(_cell(row, idx_unit)),
-                source_row=str(row_no),
-            ),
-        )
-
-    return ParsedFile(sn=sn, entries=entries, duplicates=duplicates, row_label="Rows")
 
 
 # -----------------------------------------------------------------------------

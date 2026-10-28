@@ -5,26 +5,46 @@ from __future__ import annotations
 import math
 import os
 import re
-from collections.abc import Iterator, Sequence
+import textwrap
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
-
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, Side
-from openpyxl.utils import get_column_letter
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from .config import MISSING_TEXT
 from .models import LogRecord
-from .utils import safe_text
+from .utils import column_letter, safe_text
+
+if TYPE_CHECKING:  # openpyxl is imported only when a workbook is written: it costs about half a second
+    from openpyxl import Workbook
 
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 _MAX_EXACT_DIGITS = 15  # beyond this a float silently loses digits, so keep such values as text
 
-_BOLD = Font(bold=True)
-_CENTER = Alignment(horizontal="center")
-_RIGHT = Alignment(horizontal="right")
-_THIN = Side(style="thin")
-_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+# Look of the workbook. The layout (which cell holds what) is unchanged; only the styling is.
+@cache
+def _styles() -> SimpleNamespace:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    line = Side(style="thin", color="B7C4D1")
+    return SimpleNamespace(
+        header_font=Font(bold=True, color="FFFFFF"),
+        header_fill=PatternFill("solid", fgColor="005288"),
+        band_fill=PatternFill("solid", fgColor="EAF1F8"),  # every other sample, so a sample's files read as a group
+        border=Border(left=line, right=line, top=line, bottom=line),
+        header_align=Alignment(horizontal="center", vertical="center", wrap_text=True),
+        center=Alignment(horizontal="center", vertical="center"),
+        left=Alignment(horizontal="left", vertical="center"),
+        right=Alignment(horizontal="right", vertical="center"),
+    )
+
+
+_COLUMN_PADDING = 3  # characters of room beyond the longest value, so nothing shows as ####
+_MIN_WIDTH, _MAX_WIDTH = 10, 60
+_HEADING_WIDTH = 24  # a long heading wraps onto more lines instead of making the column this wide or wider
+_LINE_HEIGHT = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,13 +121,47 @@ def set_cell_value(cell, raw: str) -> None:
     set_text(cell, text)
 
 
+def _style_header(cell) -> None:
+    st = _styles()
+    cell.font = st.header_font
+    cell.fill = st.header_fill
+    cell.alignment = st.header_align
+    cell.border = st.border
+
+
+def _shown_length(cell) -> int:
+    """How many characters Excel needs to show the cell in full."""
+    value = cell.value
+    if value is None:
+        return 0
+    if isinstance(value, float) and "E" in cell.number_format:
+        mantissa = cell.number_format.split("E")[0]
+        decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+        return len(f"{value:.{decimals}E}")
+    return len(str(value))
+
+
+def _column_width(shown: Iterable[int], heading: str = "") -> float:
+    """Wide enough for the longest value. A long heading wraps rather than widening the column past a limit."""
+    data = max(shown, default=0) + _COLUMN_PADDING
+    words = max((len(word) for word in heading.split()), default=0) + 2
+    wanted = max(data, min(len(heading) + 2, _HEADING_WIDTH), words)
+    return float(min(_MAX_WIDTH, max(_MIN_WIDTH, wanted)))
+
+
+def _heading_lines(heading: str, width: float) -> int:
+    return max(1, len(textwrap.wrap(heading, width=max(4, int(width) - 2), break_long_words=False)))
+
+
 def _write_summary(ws, first_col: int, components: Sequence[str], summary: dict[str, dict[str, str]]) -> None:
-    for offset, title in enumerate(("NAME", "MIN", "MAX", "UNIT")):
+    st = _styles()
+    titles = ("NAME", "MIN", "MAX", "UNIT")
+    shown: list[list[int]] = [[] for _ in titles]
+    for offset, title in enumerate(titles):
         cell = ws.cell(1, first_col + offset)
         cell.value = title
-        cell.font = _BOLD
-        cell.alignment = _CENTER
-        cell.border = _BORDER
+        _style_header(cell)
+        shown[offset].append(len(title))
 
     for row, component in enumerate(components, start=2):
         info = summary.get(component, {})
@@ -118,9 +172,12 @@ def _write_summary(ws, first_col: int, components: Sequence[str], summary: dict[
                 set_cell_value(cell, value)
             else:
                 set_text(cell, value)
-            cell.border = _BORDER
-            if offset > 0:
-                cell.alignment = _RIGHT
+            cell.border = st.border
+            cell.alignment = (st.left, st.right, st.right, st.center)[offset]
+            shown[offset].append(_shown_length(cell))
+
+    for offset in range(len(titles)):
+        ws.column_dimensions[column_letter(first_col + offset)].width = _column_width(shown[offset])
 
 
 def generate_excel(
@@ -139,44 +196,56 @@ def generate_excel(
             + ", ".join(invalid)
         )
 
+    from openpyxl import Workbook
+
+    st = _styles()
     wb = Workbook()
     ws = wb.active
     ws.title = "Raw Data"
 
-    for col, title in enumerate(("STT", "SN", *components), start=1):
-        cell = ws.cell(1, col)
-        set_text(cell, title)
-        cell.font = _BOLD
-        cell.alignment = _CENTER
+    headings = ("STT", "SN", *components)
+    for col, title in enumerate(headings, start=1):
+        set_text(ws.cell(1, col), title)
+        _style_header(ws.cell(1, col))
 
     last_data_col = 2 + len(components)
-    last_row = 1
+    shown: list[list[int]] = [[] for _ in headings]  # data only: a long heading wraps instead of widening its column
+    band = False
+    previous_sn = None
     for row_no, row in enumerate(iter_export_rows(grouped, components), start=2):
-        last_row = row_no
-        ws.cell(row_no, 1, row.index).alignment = _CENTER
-        set_text(ws.cell(row_no, 2), row.sn)
-        for col, value in enumerate(row.values, start=3):
-            cell = ws.cell(row_no, col)
+        if row.sn != previous_sn:
+            band = not band if previous_sn is not None else False
+            previous_sn = row.sn
+        cells = [ws.cell(row_no, col) for col in range(1, last_data_col + 1)]
+        cells[0].value = row.index
+        cells[0].alignment = st.center
+        set_text(cells[1], row.sn)
+        cells[1].alignment = st.left
+        for cell, value in zip(cells[2:], row.values, strict=True):
             if value != MISSING_TEXT:
                 set_cell_value(cell, value)
             else:
                 cell.value = MISSING_TEXT
-            cell.alignment = _RIGHT
-
-    for r in range(1, last_row + 1):
-        for c in range(1, last_data_col + 1):
-            ws.cell(r, c).border = _BORDER
+            cell.alignment = st.right
+        for index, cell in enumerate(cells):
+            cell.border = st.border
+            if band:
+                cell.fill = st.band_fill
+            shown[index].append(_shown_length(cell))
 
     summary_first_col = last_data_col + 2
     _write_summary(ws, summary_first_col, components, summarize_limits(grouped, components))
 
-    ws.column_dimensions["A"].width = 8
-    ws.column_dimensions["B"].width = 22
-    for col in range(3, last_data_col + 1):
-        ws.column_dimensions[get_column_letter(col)].width = 18
-    for col in range(summary_first_col, summary_first_col + 4):
-        ws.column_dimensions[get_column_letter(col)].width = 16
+    for col, title in enumerate(headings, start=1):
+        # The first two columns are always short; the rest follow their values, with long headings wrapped.
+        ws.column_dimensions[column_letter(col)].width = _column_width(shown[col - 1], title if col > 2 else "")
+    header_lines = max(_heading_lines(title, ws.column_dimensions[column_letter(col)].width) for col, title in enumerate(headings, start=1))
+    ws.row_dimensions[1].height = max(24, _LINE_HEIGHT * header_lines + 9)
+
     ws.freeze_panes = "C2"
+    ws.sheet_view.showGridLines = False  # the table has its own borders and bands
+    ws.page_setup.orientation = "landscape"
+    ws.print_title_rows = "1:1"
 
     _save_atomically(wb, output_path)
 

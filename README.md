@@ -26,7 +26,17 @@ Your last profile, folder, counts and component choices are remembered. Shortcut
 
 ### Profiles
 
-A profile tells the app how to read one kind of log. Two are built in (**ICT_I3070 Test Log**, **Function Test Log**). To handle another format, open **Manage…**, select a built-in profile and press **Duplicate**, then edit the copy. The live regex tester shows how a pasted line is read.
+A profile tells the app how to read one kind of log. Three are built in: **ICT_I3070 Test Log** (HP / Keysight i3070 text logs), **Function Test Log** and **EOL Test Log** (Excel workbooks with a *Session* and a *Results* sheet). If a scan finds nothing, the app checks whether another profile reads that folder and offers to switch.
+
+#### Teaching the app a new log format (no regular expressions)
+
+Open **Manage… → New**, then pick **one example log**. The app looks at it and fills in the settings; you only check and correct them.
+
+- **Excel logs** - the results sheet, its columns (by their headings, such as *Test*, *Result*, *Min*, *Max*, *Units*) and the cell that holds the serial number are found automatically. Change any of them from a drop-down list.
+- **Text logs** - a standard i3070 log is recognised straight away. For any other format, select the part of a line that changes in the sample (a component name, a measured value, a limit) and press what it is: **Component**, **Measured value**, **Unit**, **Lower limit**, **Upper limit**. The app writes the pattern for you, such as `TESTING [Component]`, and paints everything it reads on the sample so you can see it is right. A pattern is just text from the log with the changing parts replaced by blanks: `[Component]`, `[Measured]`, `[Unit]`, `[Min]`, `[Max]`, or `[Any]` for a part to skip.
+- **Check** - the table shows exactly what will be read from the sample, and the app tries the same settings on other files in the folder and tells you if any cannot be read.
+
+Limits of the pattern approach: the component line and the measurement line must be separate lines (the measurement is the next non-blank line), and a name that is followed by more fields on its line needs a separator after it so the app knows where it ends. People who prefer regular expressions can still edit them under **Advanced** in the profile editor; **Duplicate** copies a built-in profile as a starting point.
 
 Your data lives in `%APPDATA%\DataMapperX\` (`profiles.json`, `settings.json`, `app_debug.log`); *Help → Open data folder* takes you there.
 

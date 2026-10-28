@@ -37,7 +37,7 @@ def ict_block(component: str, measured: str, lim_max: str | None = None, lim_min
     return f"{{@BLOCK|{component}|00|1\n" + "\n" * blank_lines + f"{{@A-{kind}|0|{measured}{tail}\n"
 
 
-def write_ict_log(path: Path, sn: str, blocks: list[str], name_has_sn: bool = True) -> Path:
+def write_ict_log(path: Path, sn: str, blocks: list[str]) -> Path:
     body = f"{{@BATCH|{sn}|board\n" + "".join(blocks)
     path.write_text(body, encoding="utf-8")
     return path

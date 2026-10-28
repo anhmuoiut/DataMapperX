@@ -28,12 +28,12 @@ class Palette:
 
 
 _LIGHT = Palette(
-    mode="light", bg="#fafafa", surface="#ffffff", fg="#1c1c1c", muted="#5f5f5f", line="#d0d0d0", accent="#005fb8",
-    ok="#0f7b0f", warn="#9d5d00", danger="#c42b1c", banner_bg="#e5f1fb", banner_fg="#003e73",
+    mode="light", bg="#f3f6fa", surface="#ffffff", fg="#182536", muted="#526174", line="#dce3ec", accent="#005fb8",
+    ok="#167347", warn="#915900", danger="#ba2836", banner_bg="#e8f2fd", banner_fg="#164b7a",
 )
 _DARK = Palette(
-    mode="dark", bg="#1c1c1c", surface="#2b2b2b", fg="#fafafa", muted="#a6a6a6", line="#454545", accent="#60cdff",
-    ok="#6ccb5f", warn="#fce100", danger="#ff99a4", banner_bg="#0e2f44", banner_fg="#cfe9ff",
+    mode="dark", bg="#151b24", surface="#1e2734", fg="#edf3fb", muted="#b0bfd0", line="#354459", accent="#73cbff",
+    ok="#78d4a0", warn="#f0c475", danger="#ff9ba7", banner_bg="#203a52", banner_fg="#cdeaff",
 )
 
 
@@ -56,6 +56,48 @@ def resolve_mode(setting: str) -> str:
     if setting in ("light", "dark"):
         return setting
     return "dark" if system_prefers_dark() else "light"
+
+
+
+def work_area(root: tk.Misc, anchor: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
+    """Return the nearest monitor's usable bounds, excluding taskbars and docked toolbars."""
+    fallback = (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+    if sys.platform != "win32":
+        return fallback
+    try:
+        from ctypes import wintypes
+
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        user32 = ctypes.windll.user32
+        from_point = user32.MonitorFromPoint
+        from_point.argtypes = [wintypes.POINT, wintypes.DWORD]
+        from_point.restype = wintypes.HANDLE
+        from_window = user32.MonitorFromWindow
+        from_window.argtypes = [wintypes.HWND, wintypes.DWORD]
+        from_window.restype = wintypes.HANDLE
+        get_info = user32.GetMonitorInfoW
+        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+        get_info.restype = wintypes.BOOL
+
+        # Selecting the nearest monitor also recovers positions saved before a monitor was disconnected.
+        nearest = 2  # MONITOR_DEFAULTTONEAREST
+        monitor = from_point(wintypes.POINT(*anchor), nearest) if anchor is not None else from_window(root.winfo_id(), nearest)
+        info = MonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if monitor and get_info(monitor, ctypes.byref(info)):
+            area = info.rcWork
+            if area.right > area.left and area.bottom > area.top:
+                return area.left, area.top, area.right, area.bottom
+    except (AttributeError, OSError, tk.TclError, TypeError, ValueError):
+        pass
+    return fallback
 
 
 def set_dark_titlebar(window: tk.Misc, dark: bool) -> None:
@@ -83,19 +125,63 @@ def apply_theme(root: tk.Tk, setting: str) -> Palette:
 
 
 def configure_styles(root: tk.Tk, p: Palette) -> None:
-    """App-specific styles layered over the base theme."""
+    """App-specific surfaces and type hierarchy, keeping native controls and focus states."""
     style = ttk.Style(root)
+    style.configure(".", font=("Segoe UI", 10))
+    style.configure("TFrame", background=p.bg)
+    style.configure("TLabel", background=p.bg, foreground=p.fg)
+    style.configure("TLabelframe", background=p.bg)
+    style.configure("TLabelframe.Label", background=p.bg, foreground=p.fg)
+    style.configure("TPanedwindow", background=p.bg)
+    style.configure("TSeparator", background=p.line)
+
+    style.configure("Surface.TFrame", background=p.surface)
+    style.configure("Surface.TLabel", background=p.surface, foreground=p.fg)
+    style.configure("SurfaceMuted.TLabel", background=p.surface, foreground=p.muted)
+    style.configure("SurfaceHint.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
+    style.configure("Surface.TLabelframe", background=p.surface, borderwidth=0, relief="flat")
+    style.configure("Surface.TLabelframe.Label", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 11))
+    style.configure("Surface.TSeparator", background=p.line)
+    style.configure("Surface.TCheckbutton", background=p.surface, foreground=p.fg)
+    style.configure("Surface.Switch.TCheckbutton", background=p.surface, foreground=p.fg)
+    style.configure("Surface.TRadiobutton", background=p.surface, foreground=p.fg)
+
     style.configure("Title.TLabel", font=("Segoe UI Semibold", 18))
+    style.configure("Brand.TLabel", font=("Segoe UI Semibold", 20), foreground=p.fg)
+    style.configure("Subtitle.TLabel", foreground=p.muted, font=("Segoe UI", 10))
+    style.configure("Section.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 11))
+    style.configure("Step.TLabel", background=p.surface, foreground=p.accent, font=("Segoe UI Semibold", 10))
     style.configure("Muted.TLabel", foreground=p.muted)
     style.configure("Hint.TLabel", foreground=p.muted, font=("Segoe UI", 9))
+    style.configure("Metric.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 20))
+    style.configure("MetricCaption.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
     style.configure("Stat.TLabel", font=("Segoe UI Semibold", 16))
-    style.configure("StatCaption.TLabel", foreground=p.muted, font=("Segoe UI", 8))
+    style.configure("StatCaption.TLabel", foreground=p.muted, font=("Segoe UI", 9))
     style.configure("Ok.TLabel", foreground=p.ok)
     style.configure("Warn.TLabel", foreground=p.warn)
     style.configure("Bad.TLabel", foreground=p.danger)
+    for name, color in (("Ok", p.ok), ("Warn", p.warn), ("Bad", p.danger)):
+        style.configure(f"Surface{name}.TLabel", background=p.surface, foreground=color)
+
     style.configure("Banner.TFrame", background=p.banner_bg)
     style.configure("Banner.TLabel", background=p.banner_bg, foreground=p.banner_fg)
-    style.configure("Treeview", rowheight=26)
-    # Hints drawn on top of an entry / list must use that widget's own background to look like part of it.
+    style.configure("StepActive.TLabel", background=p.banner_bg, foreground=p.banner_fg, padding=(10, 5))
+    style.configure("StepIdle.TLabel", background=p.bg, foreground=p.muted, padding=(10, 5))
+    style.configure("Toolbar.TButton", padding=(10, 5))
+    style.configure("Compact.TButton", padding=(8, 5))
+
+    # Reuse the native accent elements and state maps; do not replace their focus / disabled rendering.
+    style.layout("Primary.TButton", style.layout("Accent.TButton"))
+    style.configure("Primary.TButton", **style.configure("Accent.TButton"))
+    style.map("Primary.TButton", **style.map("Accent.TButton"))
+    style.configure("Primary.TButton", font=("Segoe UI Semibold", 10), padding=(16, 9))
+
+    selected_fg = "#122739" if p.mode == "dark" else "#ffffff"
+    style.configure("Treeview", rowheight=28, background=p.surface, fieldbackground=p.surface, foreground=p.fg)
+    style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(10, 8))
+    style.map("Treeview", background=[("selected", p.accent)], foreground=[("selected", selected_fg)])
+    style.configure("Component.Treeview", rowheight=30, indent=10, padding=4, borderwidth=0)
+
+    # Placeholders blend into their actual control, including when a card uses a different surface.
     style.configure("EntryHint.TLabel", background=style.lookup("TEntry", "fieldbackground") or p.surface, foreground=p.muted)
-    style.configure("ListHint.TLabel", background=style.lookup("Treeview", "background") or p.surface, foreground=p.muted)
+    style.configure("ListHint.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 10))

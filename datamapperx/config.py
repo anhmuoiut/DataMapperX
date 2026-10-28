@@ -4,6 +4,7 @@ from __future__ import annotations
 
 APP_TITLE = "DataMapperX"
 APP_DEVELOPER_LINE = "Developed by MAN_TRAN8118@jabil.com"
+APP_CREDIT = "Developed by MAN TRAN"  # shown at the bottom of the main window
 
 # GitHub repository that publishes releases (owner/name). The auto-updater reads
 # https://github.com/<repo>/releases/latest/download/latest.json
@@ -22,6 +23,9 @@ DEFAULT_REPEATS = "3"
 
 # Rows shown in the on-screen preview (the export always writes every row).
 PREVIEW_ROW_LIMIT = 500
+# Columns shown at once. Drawing a wide table costs time per column (about 17 ms each), so the preview is paged;
+# the export always writes every column.
+PREVIEW_COLUMNS_PER_PAGE = 20
 
 # Environment variable that relocates all user data (profiles, settings, log).
 # Used by the tests so they never touch the real profile of the person running them.

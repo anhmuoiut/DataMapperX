@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <title>DataMapperX — Log to Grid</title>
+  <desc>Three measurement lines become an organized data table.</desc>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="#005FB8"/>
+  <path d="M54 88H92M54 128H92M54 168H92" stroke="#78E0DA" stroke-width="16" stroke-linecap="round"/>
+  <rect x="112" y="62" width="94" height="132" rx="16" fill="#FFFFFF"/>
+  <path d="M112 106H206M112 150H206M159 106V194" stroke="#005FB8" stroke-width="10"/>
+</svg>

@@ -14,10 +14,11 @@ from tkinter import filedialog, messagebox, ttk
 from .. import updater
 from .._version import __version__
 from ..config import (
-    APP_DEVELOPER_LINE,
+    APP_CREDIT,
     APP_TITLE,
     DEFAULT_OUTPUT_FILE,
     MISSING_TEXT,
+    PREVIEW_COLUMNS_PER_PAGE,
     PREVIEW_ROW_LIMIT,
 )
 from ..exporter import generate_excel, iter_export_rows
@@ -25,6 +26,7 @@ from ..models import ScanResult
 from ..paths import log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
 from ..reporting import describe_empty_scan, full_report, summarize_scan
+from ..sampling import suggest_profile
 from ..scanner import scan_folder
 from ..settings import Settings, load_settings, save_settings
 from ..utils import parse_positive_int
@@ -32,9 +34,9 @@ from .dialogs import AboutDialog, ExportDoneDialog, ReportDialog, open_path, set
 from .duplicate_dialog import DuplicateDialog
 from .profile_dialog import ProfileManager
 from .tasks import TaskRunner
-from .theme import Palette, apply_theme, resolve_mode
+from .theme import Palette, apply_theme, resolve_mode, work_area
 from .update_dialog import UpdateDialog
-from .widgets import ItemList
+from .widgets import ItemList, fit_tree_columns
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +65,9 @@ class MainWindow(tk.Tk):
         self.is_busy = False
         self._cancel = threading.Event()
         self._preview_job: str | None = None
+        self._preview_page = 0
         self._progress_determinate = False
         self._update_info: updater.UpdateInfo | None = None
-        self._scanned_profile_name = ""
 
         self.title(APP_TITLE)
         set_window_icon(self)
@@ -88,6 +90,7 @@ class MainWindow(tk.Tk):
         self.available_info_var = tk.StringVar()
         self.selected_info_var = tk.StringVar()
         self.preview_info_var = tk.StringVar()
+        self.pager_var = tk.StringVar()
 
         if self.settings.last_profile in self.profiles:
             self.profile_var.set(self.settings.last_profile)
@@ -112,21 +115,29 @@ class MainWindow(tk.Tk):
 
     # ------------------------------------------------------------------ window basics
     def _setup_geometry(self) -> None:
-        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
-        width = min(1360, max(1000, int(screen_w * 0.88)))
-        height = min(880, max(700, int(screen_h * 0.86)))
-        self.minsize(min(1000, screen_w - 80), min(680, screen_h - 80))
-
         match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.settings.geometry or "")
-        if match:
-            w, h, x, y = (int(g) for g in match.groups())
-            on_screen = -50 <= x <= screen_w - 120 and -10 <= y <= screen_h - 120
-            if on_screen and w >= 800 and h >= 560:
-                self.geometry(f"{w}x{h}+{x}+{y}")
-                return
-        self.geometry(f"{width}x{height}")
+        restored = tuple(int(value) for value in match.groups()) if match else None
+        anchor = (restored[2] + 80, restored[3] + 40) if restored else None
+        left, top, right, bottom = work_area(self, anchor)
+        # Reserve native window borders/title bar; the monitor work area already excludes the taskbar.
+        max_width, max_height = max(1, right - left - 24), max(1, bottom - top - 48)
+        min_width, min_height = min(1000, max_width), min(640, max_height)
+        self.minsize(min_width, min_height)
+        if restored:
+            width, height, x, y = restored
+        else:
+            width = min(1360, max(1000, int((right - left) * 0.88)))
+            height = min(880, max(680, int((bottom - top) * 0.86)))
+            x, y = left + (right - left - width) // 2, top + 16
+        width = max(min_width, min(width, max_width))
+        height = max(min_height, min(height, max_height))
+        x = max(left + 8, min(x, right - width - 16))
+        y = max(top + 8, min(y, bottom - height - 40))
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _on_close(self) -> None:
+        # A scan still running would keep the (windowless) process alive until it finished reading every file.
+        self._cancel.set()
         self._remember_inputs()
         self.settings.geometry = self.geometry()
         save_settings(self.settings)
@@ -162,21 +173,19 @@ class MainWindow(tk.Tk):
         self._build_header()
         self._build_banner()
 
-        # Left: the workflow sidebar. Right: component pickers above the data preview.
-        content = ttk.Frame(self)
-        content.grid(row=2, column=0, sticky="nsew", padx=14, pady=(2, 0))
-        content.rowconfigure(0, weight=1)
-        content.columnconfigure(0, weight=0, minsize=400)
-        content.columnconfigure(1, weight=1)
-        self._build_workspace(content)
+        self.content_frame = ttk.Frame(self)
+        self.content_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(4, 0))
+        self.content_frame.rowconfigure(0, weight=1)
+        self.content_frame.columnconfigure(0, minsize=300)
+        self.content_frame.columnconfigure(1, weight=1)
+        self._build_workspace(self.content_frame)
 
-        right = ttk.PanedWindow(content, orient=tk.VERTICAL)
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        lists = ttk.Frame(right)
-        preview = ttk.Frame(right)
-        right.add(lists, weight=2)
-        right.add(preview, weight=3)
-
+        self.workspace_panes = ttk.PanedWindow(self.content_frame, orient=tk.VERTICAL)
+        self.workspace_panes.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+        lists = ttk.Frame(self.workspace_panes)
+        preview = ttk.Frame(self.workspace_panes)
+        self.workspace_panes.add(lists, weight=1)
+        self.workspace_panes.add(preview, weight=1)
         lists.rowconfigure(0, weight=1)
         lists.columnconfigure(0, weight=1, uniform="lists")
         lists.columnconfigure(1, weight=1, uniform="lists")
@@ -184,44 +193,41 @@ class MainWindow(tk.Tk):
         self._build_selected(lists)
         self._build_preview(preview)
         self._build_statusbar()
+        for listing in (self.available_list, self.selected_list):
+            listing.tree.configure(height=5)
+            listing.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_actions(), add="+")
+        self.after_idle(self._fit_workspace)
+
+    def _fit_workspace(self) -> None:
+        """Give both the component lists and the export preview room on small displays."""
+        height = self.workspace_panes.winfo_height()
+        if height > 100:
+            self.workspace_panes.sashpos(0, int(height * 0.51))
 
     def _build_header(self) -> None:
-        header = ttk.Frame(self, padding=(18, 12, 18, 6))
+        header = ttk.Frame(self, padding=(20, 16, 20, 12))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
-
         self._icon_image = None
         icon = resource_path("assets", "DataMapperX.png")
         if icon.exists():
             try:
-                self._icon_image = tk.PhotoImage(file=str(icon))
+                image = tk.PhotoImage(file=str(icon))
+                self._icon_image = image.subsample(max(1, image.height() // 32))
                 ttk.Label(header, image=self._icon_image).grid(row=0, column=0, rowspan=2, padx=(0, 12))
             except tk.TclError:
                 logger.debug("Could not load header icon", exc_info=True)
-
-        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Label(header, text=APP_DEVELOPER_LINE, style="Muted.TLabel").grid(row=1, column=1, sticky="w")
-
+        self._brand_logos = self._load_brand_logos()
+        self._brand_label = ttk.Label(header)
+        self._brand_label.place(relx=0.5, rely=0.5, anchor="center")  # centred on the window, not on the free gap
+        self._update_brand_logo()
+        ttk.Label(header, text=APP_TITLE, style="Brand.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(header, text="Test logs to structured Excel", style="Subtitle.TLabel").grid(row=1, column=1, sticky="w")
         right = ttk.Frame(header)
         right.grid(row=0, column=2, rowspan=2, sticky="e")
-
-        # Optional company logo; it is kept out of the public repository, so it only shows when present.
-        self._brand_image = None
-        brand = resource_path("assets", "Jabil_logo.png")
-        if brand.exists():
-            try:
-                image = tk.PhotoImage(file=str(brand))
-                self._brand_image = image.subsample(max(1, round(image.height() / 30)))
-                # A white chip keeps the dark-blue logo legible in dark mode too.
-                tk.Label(right, image=self._brand_image, bg="#ffffff", padx=8, pady=4, borderwidth=0).pack(
-                    side="left", padx=(0, 18)
-                )
-            except tk.TclError:
-                logger.debug("Could not load brand logo", exc_info=True)
-
-        ttk.Label(right, text=f"v{__version__}", style="Muted.TLabel").pack(side="left", padx=(0, 14))
-        ttk.Checkbutton(right, text="Dark mode", style="Switch.TCheckbutton", variable=self.dark_var, command=self._on_theme_toggle).pack(side="left", padx=(0, 10))
-
+        ttk.Label(right, text=f"v{__version__}", style="Muted.TLabel").pack(side="left", padx=(0, 18))
+        ttk.Checkbutton(right, text="Dark mode", style="Switch.TCheckbutton", variable=self.dark_var,
+                        command=self._on_theme_toggle).pack(side="left", padx=(0, 14))
         menu_button = ttk.Menubutton(right, text="Help")
         menu = tk.Menu(menu_button, tearoff=False)
         menu.add_command(label="Check for updates…", command=lambda: self._check_for_update(manual=True))
@@ -235,166 +241,220 @@ class MainWindow(tk.Tk):
         menu_button.configure(menu=menu)
         menu_button.pack(side="left")
 
+    def _load_brand_logos(self) -> dict[str, tk.PhotoImage]:
+        """The company logo, one picture per theme (white letters on dark). Missing files simply mean no logo."""
+        height = 76 if self.winfo_fpixels("1i") / 96 >= 1.5 else 38  # a larger picture on high-DPI screens
+        logos: dict[str, tk.PhotoImage] = {}
+        for mode in ("light", "dark"):
+            path = resource_path("assets", f"Jabil-Logo-{mode}-{height}.png")
+            if path.exists():
+                try:
+                    logos[mode] = tk.PhotoImage(file=str(path))
+                except tk.TclError:
+                    logger.debug("Could not load %s", path, exc_info=True)
+        return logos
+
+    def _update_brand_logo(self) -> None:
+        image = self._brand_logos.get(self.palette.mode)
+        if image is None:
+            self._brand_label.place_forget()
+        else:
+            self._brand_label.configure(image=image)
+            self._brand_label.place(relx=0.5, rely=0.5, anchor="center")
+
     def _build_banner(self) -> None:
-        self.banner = ttk.Frame(self, style="Banner.TFrame", padding=(18, 8))
-        self.banner.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        self.banner = ttk.Frame(self, style="Banner.TFrame", padding=(16, 8))
+        self.banner.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 6))
         self.banner.columnconfigure(0, weight=1)
-        self.banner_label = ttk.Label(self.banner, style="Banner.TLabel")
+        self.banner_label = ttk.Label(self.banner, style="Banner.TLabel", wraplength=480)
         self.banner_label.grid(row=0, column=0, sticky="w")
         buttons = ttk.Frame(self.banner, style="Banner.TFrame")
-        buttons.grid(row=0, column=1, sticky="e")
+        buttons.grid(row=0, column=1, sticky="e", padx=(12, 0))
         ttk.Button(buttons, text="Update now", style="Accent.TButton", command=self._open_update_dialog).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Skip this version", command=lambda: self.skip_update(self._update_info.version if self._update_info else "")).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="✕", width=3, command=self.hide_update_banner).pack(side="left")
+        ttk.Button(buttons, text="×", width=3, command=self.hide_update_banner).pack(side="left")
         self.banner.grid_remove()
 
-    def _card(self, parent: tk.Misc, title: str, column: int, padx: tuple[int, int]) -> ttk.LabelFrame:
-        card = ttk.LabelFrame(parent, text=title, padding=12)
+    def _card(self, parent: tk.Misc, title: str, column: int, padx: tuple[int, int]) -> ttk.Frame:
+        card = ttk.Frame(parent, style="Surface.TFrame", padding=14)
         card.grid(row=0, column=column, sticky="nsew", padx=padx, pady=(0, 6))
+        ttk.Label(card, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 12))
         return card
 
     def _build_workspace(self, parent: tk.Misc) -> None:
-        card = self._card(parent, "1  Source", 0, (0, 0))
+        card = self.source_card = self._card(parent, "01  Source", 0, (0, 0))
         card.columnconfigure(0, weight=1)
-
-        head = ttk.Frame(card)
-        head.grid(row=0, column=0, sticky="ew")
+        head = ttk.Frame(card, style="Surface.TFrame")
+        head.grid(row=1, column=0, sticky="ew")
         head.columnconfigure(0, weight=1)
-        ttk.Label(head, text="Profile").grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text="Log profile", style="Surface.TLabel").grid(row=0, column=0, sticky="w")
         self.manage_button = ttk.Button(head, text="Manage…", command=self.manage_profiles)
         self.manage_button.grid(row=0, column=1, sticky="e")
-
-        self.profile_combo = ttk.Combobox(card, textvariable=self.profile_var, values=list(self.profiles), state="readonly")
-        self.profile_combo.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        self.profile_combo = ttk.Combobox(card, width=24, textvariable=self.profile_var, values=list(self.profiles), state="readonly")
+        self.profile_combo.grid(row=2, column=0, sticky="ew", pady=(4, 3))
         self.profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_profile_changed())
-        self.hint_label = ttk.Label(card, textvariable=self.hint_var, style="Hint.TLabel", wraplength=360, justify="left")
-        self.hint_label.grid(row=2, column=0, sticky="w", pady=(0, 10))
-
-        ttk.Label(card, text="Source folder").grid(row=3, column=0, sticky="w")
-        folder_row = ttk.Frame(card)
-        folder_row.grid(row=4, column=0, sticky="ew", pady=(4, 10))
+        self.hint_label = ttk.Label(card, textvariable=self.hint_var, style="SurfaceHint.TLabel", wraplength=270, justify="left")
+        self.hint_label.grid(row=3, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(card, text="Source folder", style="Surface.TLabel").grid(row=4, column=0, sticky="w")
+        folder_row = ttk.Frame(card, style="Surface.TFrame")
+        folder_row.grid(row=5, column=0, sticky="ew", pady=(4, 12))
         folder_row.columnconfigure(0, weight=1)
-        self.folder_entry = ttk.Entry(folder_row, textvariable=self.folder_var)
+        self.folder_entry = ttk.Entry(folder_row, width=18, textvariable=self.folder_var)
         self.folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.folder_entry.bind("<Return>", lambda _e: self.scan_logs())
         self.browse_button = ttk.Button(folder_row, text="Browse…", command=self.pick_folder)
         self.browse_button.grid(row=0, column=1)
-
-        counts = ttk.Frame(card)
-        counts.grid(row=5, column=0, sticky="ew")
-        counts.columnconfigure(1, weight=1)
-        counts.columnconfigure(3, weight=1)
-        ttk.Label(counts, text="Expected samples").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.expected_spin = ttk.Spinbox(counts, from_=1, to=9999, width=6, textvariable=self.expected_var)
-        self.expected_spin.grid(row=0, column=1, sticky="w", padx=(0, 12))
-        ttk.Label(counts, text="Files per sample").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        self.repeats_spin = ttk.Spinbox(counts, from_=1, to=999, width=6, textvariable=self.repeats_var)
-        self.repeats_spin.grid(row=0, column=3, sticky="w")
-
-        actions = ttk.Frame(card)
-        actions.grid(row=6, column=0, sticky="ew", pady=(12, 0))
-        actions.columnconfigure(0, weight=2)
+        counts = ttk.Frame(card, style="Surface.TFrame")
+        counts.grid(row=6, column=0, sticky="ew")
+        counts.columnconfigure(0, weight=1, uniform="counts")
+        counts.columnconfigure(1, weight=1, uniform="counts")
+        ttk.Label(counts, text="Expected samples", style="SurfaceHint.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(counts, text="Files per sample", style="SurfaceHint.TLabel").grid(row=0, column=1, sticky="w")
+        self.expected_spin = ttk.Spinbox(counts, from_=1, to=9999, width=7, textvariable=self.expected_var)
+        self.expected_spin.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
+        self.repeats_spin = ttk.Spinbox(counts, from_=1, to=999, width=7, textvariable=self.repeats_var)
+        self.repeats_spin.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        actions = ttk.Frame(card, style="Surface.TFrame")
+        actions.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
-        actions.columnconfigure(2, weight=1)
         self.scan_button = ttk.Button(actions, text="Scan logs", style="Accent.TButton", command=self.scan_logs)
-        self.scan_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.scan_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.cancel_button = ttk.Button(actions, text="Cancel", command=self._cancel_scan, state="disabled")
-        self.cancel_button.grid(row=0, column=1, sticky="ew", padx=3)
+        self.cancel_button.grid(row=1, column=0, sticky="ew", padx=(0, 4))
         self.reset_button = ttk.Button(actions, text="Reset", command=self.reset_workflow)
-        self.reset_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
-
-        ttk.Separator(card).grid(row=7, column=0, sticky="ew", pady=12)
-        stats = ttk.Frame(card)
-        stats.grid(row=8, column=0, sticky="ew")
-        for col, (caption, var) in enumerate((("SAMPLES", self.samples_var), ("FILES", self.files_var), ("COMPONENTS", self.components_var))):
+        self.reset_button.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+        ttk.Separator(card, style="Surface.TSeparator").grid(row=8, column=0, sticky="ew", pady=14)
+        stats = ttk.Frame(card, style="Surface.TFrame")
+        stats.grid(row=9, column=0, sticky="ew")
+        for col, (caption, var) in enumerate((("Samples", self.samples_var), ("Files", self.files_var), ("Fields", self.components_var))):
             stats.columnconfigure(col, weight=1, uniform="stats")
-            block = ttk.Frame(stats)
+            block = ttk.Frame(stats, style="Surface.TFrame")
             block.grid(row=0, column=col, sticky="w")
-            ttk.Label(block, textvariable=var, style="Stat.TLabel").pack(anchor="w")
-            ttk.Label(block, text=caption, style="StatCaption.TLabel").pack(anchor="w")
-
-        verdict = ttk.Frame(card)
-        verdict.grid(row=9, column=0, sticky="ew", pady=(10, 0))
-        verdict.columnconfigure(0, weight=1)
-        self.verdict_label = ttk.Label(verdict, textvariable=self.verdict_var, wraplength=250, justify="left")
-        self.verdict_label.grid(row=0, column=0, sticky="w")
-        self.details_button = ttk.Button(verdict, text="Details…", command=self._show_scan_details, state="disabled")
-        self.details_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
-
+            ttk.Label(block, textvariable=var, style="Metric.TLabel").pack(anchor="w")
+            ttk.Label(block, text=caption, style="MetricCaption.TLabel").pack(anchor="w")
+        self.verdict_label = ttk.Label(card, textvariable=self.verdict_var, style="SurfaceMuted.TLabel", wraplength=270, justify="left")
+        self.verdict_label.grid(row=10, column=0, sticky="ew", pady=(12, 6))
+        self.details_button = ttk.Button(card, text="View scan details", command=self._show_scan_details, state="disabled")
+        self.details_button.grid(row=11, column=0, sticky="ew")
+        card.rowconfigure(12, weight=1)
+        self.credit_label = ttk.Label(card, text=APP_CREDIT, style="SurfaceHint.TLabel")
+        self.credit_label.grid(row=13, column=0, sticky="sw", pady=(10, 0))
         self._busy_widgets: list[ttk.Widget] = [
             self.manage_button, self.browse_button, self.scan_button, self.reset_button,
             self.expected_spin, self.repeats_spin, self.folder_entry,
         ]
 
     def _build_available(self, parent: tk.Misc) -> None:
-        card = self._card(parent, "2  Available components", 0, (0, 5))
-        card.rowconfigure(1, weight=1)
+        card = self._card(parent, "02  Available components", 0, (0, 6))
+        card.rowconfigure(2, weight=1)
         card.columnconfigure(0, weight=1)
-        self.search_entry = ttk.Entry(card, textvariable=self.search_var)
-        self.search_entry.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.search_hint = ttk.Label(self.search_entry, text="Filter components…", style="EntryHint.TLabel")
+        self.search_entry = ttk.Entry(card, width=18, textvariable=self.search_var)
+        self.search_entry.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.search_hint = ttk.Label(self.search_entry, text="Search components…", style="EntryHint.TLabel")
         self.search_hint.place(x=10, rely=0.5, anchor="w")
         self.search_hint.bind("<Button-1>", lambda _e: self.search_entry.focus_set())
         self.available_list = ItemList(card, on_activate=self.add_components)
-        self.available_list.grid(row=1, column=0, sticky="nsew")
-        footer = ttk.Frame(card)
-        footer.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.available_list.grid(row=2, column=0, sticky="nsew")
+        footer = ttk.Frame(card, style="Surface.TFrame")
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
-        ttk.Label(footer, textvariable=self.available_info_var, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(footer, text="Add all shown", command=self.add_all_shown).grid(row=0, column=1, padx=(0, 6))
-        ttk.Button(footer, text="Add  →", style="Accent.TButton", command=self.add_components).grid(row=0, column=2)
+        footer.columnconfigure(1, weight=1)
+        ttk.Label(footer, textvariable=self.available_info_var, style="SurfaceHint.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.add_all_button = ttk.Button(footer, text="Add all shown", command=self.add_all_shown)
+        self.add_all_button.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.add_button = ttk.Button(footer, text="Add →", command=self.add_components)
+        self.add_button.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+        self._busy_widgets.append(self.search_entry)
 
     def _build_selected(self, parent: tk.Misc) -> None:
-        card = self._card(parent, "3  Selected components (export order)", 1, (5, 0))
-        card.rowconfigure(0, weight=1)
+        card = self._card(parent, "Selected for export", 1, (6, 0))
+        card.rowconfigure(2, weight=1)
         card.columnconfigure(0, weight=1)
+        ttk.Label(card, text="Top to bottom = Excel column order", style="SurfaceHint.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
         self.selected_list = ItemList(card, on_activate=self.remove_components, on_delete=self.remove_components)
-        self.selected_list.grid(row=0, column=0, sticky="nsew")
-        footer = ttk.Frame(card)
-        footer.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.selected_list.grid(row=2, column=0, sticky="nsew")
+        footer = ttk.Frame(card, style="Surface.TFrame")
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
-        ttk.Label(footer, textvariable=self.selected_info_var, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(footer, text="▲", width=3, command=lambda: self.move_selected(-1)).grid(row=0, column=1, padx=2)
-        ttk.Button(footer, text="▼", width=3, command=lambda: self.move_selected(1)).grid(row=0, column=2, padx=2)
-        ttk.Button(footer, text="Remove", command=self.remove_components).grid(row=0, column=3, padx=2)
-        ttk.Button(footer, text="Clear", command=self.clear_selected).grid(row=0, column=4, padx=(2, 0))
+        ttk.Label(footer, textvariable=self.selected_info_var, style="SurfaceHint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        buttons = ttk.Frame(footer, style="Surface.TFrame")
+        buttons.grid(row=1, column=0, sticky="ew")
+        buttons.columnconfigure(2, weight=1)
+        self.move_up_button = ttk.Button(buttons, text="↑", width=3, command=lambda: self.move_selected(-1))
+        self.move_up_button.grid(row=0, column=0, padx=(0, 4))
+        self.move_down_button = ttk.Button(buttons, text="↓", width=3, command=lambda: self.move_selected(1))
+        self.move_down_button.grid(row=0, column=1, padx=(0, 6))
+        self.remove_button = ttk.Button(buttons, text="Remove", command=self.remove_components)
+        self.remove_button.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        self.clear_button = ttk.Button(buttons, text="Clear", command=self.clear_selected)
+        self.clear_button.grid(row=0, column=3)
 
     def _build_preview(self, parent: tk.Misc) -> None:
-        card = ttk.LabelFrame(parent, text="4  Preview  (exactly what will be exported)", padding=12)
-        card.pack(fill="both", expand=True, pady=(4, 6))
-        card.rowconfigure(1, weight=1)
+        card = ttk.Frame(parent, style="Surface.TFrame", padding=14)
+        card.pack(fill="both", expand=True, pady=(6, 6))
+        card.rowconfigure(2, weight=1)
         card.columnconfigure(0, weight=1)
-
-        toolbar = ttk.Frame(card)
+        toolbar = ttk.Frame(card, style="Surface.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(0, weight=1)
-        ttk.Label(toolbar, textvariable=self.preview_info_var, style="Hint.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(toolbar, text="03  Preview & export", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.pager = ttk.Frame(toolbar, style="Surface.TFrame")
+        self.pager.grid(row=0, column=1, padx=(12, 0))
+        self.pager_prev = ttk.Button(self.pager, text="‹", width=3, style="Compact.TButton", command=lambda: self._page_preview(-1))
+        self.pager_prev.pack(side="left")
+        ttk.Label(self.pager, textvariable=self.pager_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
+        self.pager_next = ttk.Button(self.pager, text="›", width=3, style="Compact.TButton", command=lambda: self._page_preview(1))
+        self.pager_next.pack(side="left")
+        self.pager.grid_remove()
         self.export_button = ttk.Button(toolbar, text="Export Excel…", style="Accent.TButton", command=self.export_excel)
-        self.export_button.grid(row=0, column=1, sticky="e")
-        self._busy_widgets.append(self.export_button)
-
-        frame = ttk.Frame(card)
-        frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.export_button.grid(row=0, column=2, sticky="e", padx=(12, 0))
+        self.preview_info_label = ttk.Label(card, textvariable=self.preview_info_var, style="SurfaceHint.TLabel", wraplength=500, justify="left")
+        self.preview_info_label.grid(row=1, column=0, sticky="w", pady=(4, 8))
+        frame = ttk.Frame(card, style="Surface.TFrame")
+        frame.grid(row=2, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-        self.preview_tree = ttk.Treeview(frame, show="headings", selectmode="browse")
+        self.preview_tree = ttk.Treeview(frame, show="headings", selectmode="browse", height=5)
         ysb = ttk.Scrollbar(frame, orient="vertical", command=self.preview_tree.yview)
         xsb = ttk.Scrollbar(frame, orient="horizontal", command=self.preview_tree.xview)
         self.preview_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
         self.preview_tree.grid(row=0, column=0, sticky="nsew")
         ysb.grid(row=0, column=1, sticky="ns")
         xsb.grid(row=1, column=0, sticky="ew")
+        frame.bind("<Configure>", lambda event: self.empty_label.configure(wraplength=max(140, event.width - 50)))
+        card.bind("<Configure>", lambda event: self.preview_info_label.configure(wraplength=max(180, event.width - 32)))
         self._apply_tag_colors()
-        self.empty_label = ttk.Label(frame, style="Muted.TLabel", justify="center", font=("Segoe UI", 11))
+        self.empty_label = ttk.Label(self.preview_tree, style="ListHint.TLabel", justify="center", padding=12)
+        self._busy_widgets.append(self.export_button)
 
     def _build_statusbar(self) -> None:
-        bar = ttk.Frame(self, padding=(18, 4, 18, 10))
+        bar = ttk.Frame(self, padding=(20, 8, 20, 10))
         bar.grid(row=3, column=0, sticky="ew")
         bar.columnconfigure(0, weight=1)
-        ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        self.progress = ttk.Progressbar(bar, length=220, mode="determinate")
+        self.status_label = ttk.Label(bar, textvariable=self.status_var, style="Hint.TLabel", wraplength=780, justify="left")
+        self.status_label.grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(bar, length=160, mode="determinate")
         self.progress.grid(row=0, column=1, sticky="e", padx=(12, 0))
         self.progress.grid_remove()
+        bar.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(250, event.width - 230)))
+
+    def _update_actions(self) -> None:
+        """Reflect what is actionable and keep the running task's inputs stable."""
+        ready = not self.is_busy
+        has_data = bool(self.scan_result and self.scan_result.grouped)
+        selected = self.selected_list.selected_indices()
+        controls = (
+            (self.export_button, ready and has_data and bool(self.selected_components)),
+            (self.add_button, ready and bool(self.available_list.selected_items())),
+            (self.add_all_button, ready and bool(self.available_list.items())),
+            (self.remove_button, ready and bool(selected)),
+            (self.clear_button, ready and bool(self.selected_components)),
+            (self.move_up_button, ready and bool(selected) and selected[0] > 0),
+            (self.move_down_button, ready and bool(selected) and selected[-1] < len(self.selected_components) - 1),
+        )
+        for button, enabled in controls:
+            button.configure(state="normal" if enabled else "disabled")
 
     def _apply_tag_colors(self) -> None:
         self.preview_tree.tag_configure("invalid", foreground=self.palette.danger)
@@ -405,6 +465,7 @@ class MainWindow(tk.Tk):
         self.settings.theme = "dark" if self.dark_var.get() else "light"
         self.palette = apply_theme(self, self.settings.theme)
         self._apply_tag_colors()
+        self._update_brand_logo()
         save_settings(self.settings)
 
     # ------------------------------------------------------------------ helpers
@@ -421,6 +482,7 @@ class MainWindow(tk.Tk):
                 pass
         self.profile_combo.configure(state="disabled" if busy else "readonly")
         self.cancel_button.configure(state="normal" if busy and cancellable else "disabled")
+        self._update_actions()
 
         if busy:
             self._progress_determinate = False
@@ -545,7 +607,7 @@ class MainWindow(tk.Tk):
                       expected: int, repeats: int) -> None:
         self._set_busy(False)
         self.scan_result = result
-        self._scanned_profile_name = profile_name
+        self._preview_page = 0
         self.reviewed_duplicates = set()
 
         # Keep what the user had selected, or restore their choice from last time for this profile.
@@ -563,6 +625,14 @@ class MainWindow(tk.Tk):
             self._set_verdict("bad", "No usable data found.", details=False)
             self.set_status("Scan finished: nothing usable found.")
             text = describe_empty_scan(folder, profile_name, profile, result)
+            better = None if result.cancelled else self._profile_that_reads(folder, profile_name)
+            if better:
+                question = f"{text}\n\nThe files in this folder look like '{better}'. Switch to that profile and scan again?"
+                if messagebox.askyesno(APP_TITLE, question, parent=self):
+                    self.profile_var.set(better)
+                    self._on_profile_changed()
+                    self.scan_logs()
+                return
             (messagebox.showerror if result.parse_warnings else messagebox.showwarning)(APP_TITLE, text, parent=self)
             return
 
@@ -576,9 +646,18 @@ class MainWindow(tk.Tk):
         self.set_status(f"Scan complete{suffix}: {result.total_sns} samples, {result.total_files} files, "
                         f"{len(result.components)} components.{restored}")
 
+    def _profile_that_reads(self, folder: Path, current: str) -> str | None:
+        """Another profile that can read the files in ``folder``; never raises, because it only helps a failed scan."""
+        others = {name: profile for name, profile in self.profiles.items() if name != current}
+        try:
+            return suggest_profile(folder, others)
+        except Exception:
+            logger.debug("Could not look for a better profile", exc_info=True)
+            return None
+
     def _set_verdict(self, level: str, text: str, *, details: bool) -> None:
         self.verdict_var.set(("✓  " if level == "ok" else "⚠  ") + text)
-        self.verdict_label.configure(style={"ok": "Ok.TLabel", "warn": "Warn.TLabel", "bad": "Bad.TLabel"}[level])
+        self.verdict_label.configure(style={"ok": "SurfaceOk.TLabel", "warn": "SurfaceWarn.TLabel", "bad": "SurfaceBad.TLabel"}[level])
         self.details_button.configure(state="normal" if details else "disabled")
 
     def _show_scan_details(self) -> None:
@@ -595,7 +674,7 @@ class MainWindow(tk.Tk):
         for var in (self.samples_var, self.files_var, self.components_var):
             var.set("–")
         self.verdict_var.set("No scan yet.")
-        self.verdict_label.configure(style="TLabel")
+        self.verdict_label.configure(style="SurfaceMuted.TLabel")
         self.details_button.configure(state="disabled")
         self.search_var.set("")
         self._refresh_lists()
@@ -603,6 +682,8 @@ class MainWindow(tk.Tk):
         self.set_status(status)
 
     def reset_workflow(self) -> None:
+        if self.is_busy:
+            return
         self.folder_var.set("")
         self._clear_results("Ready. Choose a profile and a folder, then scan.")
 
@@ -630,13 +711,15 @@ class MainWindow(tk.Tk):
             self.available_info_var.set(f"{len(shown)} of {len(remaining)} shown")
         else:
             self.available_info_var.set(f"{len(remaining)} available")
+        self._update_actions()
 
     def _refresh_selected(self) -> None:
         self.selected_list.set_items(
             self.selected_components, empty_text="Double-click a component on the left,\nor select some and press Add →."
         )
         count = len(self.selected_components)
-        self.selected_info_var.set(f"{count} selected" if count else "")
+        self.selected_info_var.set(f"{count} selected" if count else "No columns selected")
+        self._update_actions()
 
     def _refresh_lists(self) -> None:
         self._refresh_available()
@@ -656,6 +739,8 @@ class MainWindow(tk.Tk):
         self._add(self.available_list.items())
 
     def _add(self, names: list[str]) -> None:
+        if self.is_busy:
+            return
         added = [n for n in names if n not in self.selected_components]
         if not added:
             return
@@ -678,6 +763,8 @@ class MainWindow(tk.Tk):
         self._schedule_preview()
 
     def remove_components(self) -> None:
+        if self.is_busy:
+            return
         indices = self.selected_list.selected_indices()
         for index in reversed(indices):
             del self.selected_components[index]
@@ -685,11 +772,15 @@ class MainWindow(tk.Tk):
             self._selection_changed()
 
     def clear_selected(self) -> None:
+        if self.is_busy:
+            return
         if self.selected_components:
             self.selected_components = []
             self._selection_changed()
 
     def move_selected(self, direction: int) -> None:
+        if self.is_busy:
+            return
         indices = self.selected_list.selected_indices()
         items = self.selected_components
         if not indices or (direction < 0 and indices[0] == 0) or (direction > 0 and indices[-1] == len(items) - 1):
@@ -705,9 +796,22 @@ class MainWindow(tk.Tk):
             self.after_cancel(self._preview_job)
         self._preview_job = self.after(120, self._refresh_preview)
 
+    def _update_pager(self, first: int, shown: int, total: int, pages: int) -> None:
+        if pages <= 1:
+            self.pager.grid_remove()
+            return
+        self.pager_var.set(f"Columns {first + 1}–{first + shown} of {total}")
+        self.pager_prev.configure(state="normal" if self._preview_page > 0 else "disabled")
+        self.pager_next.configure(state="normal" if self._preview_page < pages - 1 else "disabled")
+        self.pager.grid()
+
+    def _page_preview(self, step: int) -> None:
+        self._preview_page = max(0, self._preview_page + step)
+        self._schedule_preview()
+
     def _show_empty(self, message: str) -> None:
         self.empty_label.configure(text=message)
-        self.empty_label.place(relx=0.5, rely=0.42, anchor="center")
+        self.empty_label.place(relx=0.5, rely=0.55, anchor="center")
 
     def _refresh_preview(self) -> None:
         self._preview_job = None
@@ -716,24 +820,27 @@ class MainWindow(tk.Tk):
         result = self.scan_result
         components = list(self.selected_components)
 
-        columns = ["no", "sn", "file", *[f"c{i}" for i in range(len(components))]]
+        # Only one page of columns is drawn (the table's cost grows with every column on screen).
+        pages = max(1, -(-len(components) // PREVIEW_COLUMNS_PER_PAGE))
+        self._preview_page = max(0, min(self._preview_page, pages - 1))
+        first = self._preview_page * PREVIEW_COLUMNS_PER_PAGE
+        page = components[first : first + PREVIEW_COLUMNS_PER_PAGE]
+        self._update_pager(first, len(page), len(components), pages)
+
+        columns = ["no", "sn", "file", *[f"c{i}" for i in range(len(page))]]
         tree.configure(columns=columns, displaycolumns=columns)
-        tree.heading("no", text="No.")
-        tree.column("no", width=56, minwidth=40, stretch=False, anchor="center")
-        tree.heading("sn", text="Serial number")
-        tree.column("sn", width=170, minwidth=100, stretch=False, anchor="w")
-        tree.heading("file", text="File")
-        tree.column("file", width=280, minwidth=120, stretch=not components, anchor="w")
-        for i, name in enumerate(components):
-            tree.heading(f"c{i}", text=name)
-            tree.column(f"c{i}", width=max(100, min(220, len(name) * 8 + 28)), minwidth=70, stretch=False, anchor="e")
+        headings = {"no": "No.", "sn": "Serial number", "file": "File", **{f"c{i}": name for i, name in enumerate(page)}}
+        for column, text in headings.items():
+            tree.heading(column, text=text)
+            tree.column(column, anchor={"no": "center", "sn": "w", "file": "w"}.get(column, "e"))
+        fit_tree_columns(tree, headings, [])  # headings only, until there are rows to measure
 
         if result is None or not result.grouped:
-            self._show_empty("Scan a folder to see your data here.")
-            self.preview_info_var.set("")
+            self._show_empty("Your data preview starts here.\nChoose a source folder, then scan its logs.")
+            self.preview_info_var.set("The preview uses the same rows and column order as your Excel file.")
             return
         if not components:
-            self._show_empty("Pick components in step 2 to see their values here.")
+            self._show_empty("Choose the measurements you need.\nAdd components in step 2 to build your Excel columns.")
             self.preview_info_var.set(f"{result.total_files} files found")
         else:
             self.empty_label.place_forget()
@@ -742,15 +849,21 @@ class MainWindow(tk.Tk):
         wrong = set(result.sns_with_wrong_repeat_count(repeats)) if repeats else set()
         shown = 0
         any_missing = False
+        table: list[tuple] = []
         for row in islice(iter_export_rows(result.grouped, components), PREVIEW_ROW_LIMIT):
             missing = bool(components) and MISSING_TEXT in row.values
             any_missing = any_missing or missing
             tags = ("invalid",) if row.sn in wrong else ("missing",) if missing else ()
-            tree.insert("", tk.END, values=(row.index, row.sn, row.filename, *row.values), tags=tags)
+            values = (row.index, row.sn, row.filename, *row.values[first : first + PREVIEW_COLUMNS_PER_PAGE])
+            tree.insert("", tk.END, values=values, tags=tags)
+            table.append(values)
             shown += 1
+        fit_tree_columns(tree, headings, table)  # each column as wide as its longest value, no wasted space
 
         if components:
             note = f"Showing {shown} of {result.total_files} rows." if shown < result.total_files else f"{shown} rows."
+            if pages > 1:
+                note += f"  The Excel file has all {len(components)} columns."
             if wrong:
                 note += "  Red: sample has the wrong number of files."
             if any_missing:

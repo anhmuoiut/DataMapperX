@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from tkinter import ttk
 
 from .theme import Palette
@@ -87,11 +88,11 @@ class ItemList(ttk.Frame):
         on_activate: Callable[[], None] | None = None,
         on_delete: Callable[[], None] | None = None,
     ) -> None:
-        super().__init__(master)
+        super().__init__(master, style="Surface.TFrame")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(self, show="tree", selectmode="extended")
+        self.tree = ttk.Treeview(self, show="tree", selectmode="extended", style="Component.Treeview")
         self.tree.column("#0", stretch=True, minwidth=80)
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -105,7 +106,13 @@ class ItemList(ttk.Frame):
             self.tree.bind("<Delete>", lambda _e: on_delete(), add="+")
         self.tree.bind("<Control-a>", self._select_all)
         self.tree.bind("<Control-A>", self._select_all)
-        self._placeholder = ttk.Label(self.tree, style="ListHint.TLabel", justify="center", wraplength=260)
+        self._placeholder = ttk.Label(self.tree, style="ListHint.TLabel", justify="center", anchor="center")
+        self.tree.bind("<Configure>", self._resize_placeholder, add="+")
+        self._placeholder.bind("<Button-1>", lambda _event: self.tree.focus_set())
+
+    def _resize_placeholder(self, event=None) -> None:
+        width = event.width if event is not None else self.tree.winfo_width()
+        self._placeholder.configure(wraplength=max(100, width - 40))
 
     def _select_all(self, _event=None) -> str:
         self.tree.selection_set(self.tree.get_children())
@@ -113,14 +120,17 @@ class ItemList(ttk.Frame):
 
     def set_items(self, items: Sequence[str], empty_text: str = "") -> None:
         """Replace the contents. ``empty_text`` is shown in the middle of the list while it is empty."""
-        self.tree.delete(*self.tree.get_children())
-        for index, text in enumerate(items):
-            self.tree.insert("", tk.END, iid=str(index), text=text)
+        # A count or theme refresh should not discard keyboard focus, selection, or scroll position.
+        if self.items() != list(items):
+            self.tree.delete(*self.tree.get_children())
+            for index, text in enumerate(items):
+                self.tree.insert("", tk.END, iid=str(index), text=text)
         if items or not empty_text:
             self._placeholder.place_forget()
         else:
             self._placeholder.configure(text=empty_text)
-            self._placeholder.place(relx=0.5, rely=0.4, anchor="center")
+            self._resize_placeholder()
+            self._placeholder.place(relx=0.5, rely=0.45, anchor="center", relwidth=0.86)
 
     def items(self) -> list[str]:
         return [self.tree.item(iid, "text") for iid in self.tree.get_children()]
@@ -181,3 +191,41 @@ class ReadOnlyText(ttk.Frame):
             else:
                 self.text.insert(tk.END, plain + "\n")
         self.text.configure(state="disabled")
+
+
+MAX_COLUMN_WIDTH = 420
+_CELL_PADDING = 24  # the cell's own padding plus a little room so text is never clipped
+_HEADING_PADDING = 34  # the heading is padded more (and may grow a sort arrow)
+
+
+def _style_font(widget: tk.Misc, style_name: str, fallback: tuple[str, int]) -> tkfont.Font:
+    spec = ttk.Style(widget).lookup(style_name, "font") or fallback
+    try:
+        return tkfont.Font(root=widget, font=spec)
+    except tk.TclError:
+        return tkfont.Font(root=widget, font=fallback)
+
+
+def fit_tree_columns(
+    tree: ttk.Treeview,
+    headings: Mapping[str, str],
+    rows: Iterable[Sequence[object]],
+    *,
+    min_width: int = 44,
+    max_width: int = MAX_COLUMN_WIDTH,
+) -> None:
+    """Make every column just wide enough for its heading and its longest value.
+
+    ``rows`` are the value tuples in column order. Only the few longest texts of a column are measured, which
+    is enough to find the widest one and keeps this fast for hundreds of rows.
+    """
+    style = str(tree.cget("style")) or "Treeview"
+    cell_font = _style_font(tree, style, ("Segoe UI", 10))
+    heading_font = _style_font(tree, f"{style}.Heading", ("Segoe UI Semibold", 9))
+    table = [tuple(str(value) for value in row) for row in rows]
+    for index, column in enumerate(tree["columns"]):
+        longest = sorted({row[index] for row in table if index < len(row)}, key=len, reverse=True)[:4]
+        data = max((cell_font.measure(text) for text in longest), default=0) + _CELL_PADDING
+        heading = heading_font.measure(headings.get(column, "")) + _HEADING_PADDING
+        width = min(max_width, max(data, heading, min_width))
+        tree.column(column, width=width, minwidth=min(width, 40), stretch=False)

@@ -17,6 +17,7 @@ from typing import Any
 
 from .config import EXCEL_FILE_EXTENSIONS, TEXT_FILE_EXTENSIONS
 from .paths import app_dir, profiles_path
+from .patterns import TemplateError, compile_template, sn_regex_from_example
 from .utils import (
     atomic_write_json,
     compile_profile_regex,
@@ -28,7 +29,9 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-BUILT_IN_PROFILE_NAMES = ("ICT_I3070 Test Log", "Function Test Log")
+BUILT_IN_PROFILE_NAMES = ("ICT_I3070 Test Log", "Function Test Log", "EOL Test Log")
+# Built-ins added after v1.1.0. A profile with one of these names was written by the user, so it is kept.
+_NEWER_BUILT_INS = ("EOL Test Log",)
 
 DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
     "ICT_I3070 Test Log": {
@@ -44,6 +47,21 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         "type": "excel",
         "file_extensions": ".xlsx,.xlsm",
         "sn_regex": r"(VSE[A-Z0-9]+)",
+        "sn_sheet": "Session",
+        "data_sheet": "Results",
+        "row_start": "2",
+        "component_col": "C",
+        "measure_col": "F",
+        "min_col": "E",
+        "max_col": "G",
+        "unit_col": "H",
+    },
+    # Same workbook layout as the function test, but the serial number is not a "VSE..." code, so it is read from
+    # the Session sheet instead of being searched for in the file name.
+    "EOL Test Log": {
+        "type": "excel",
+        "file_extensions": ".xlsx,.xlsm",
+        "sn_regex": "B1",
         "sn_sheet": "Session",
         "data_sheet": "Results",
         "row_start": "2",
@@ -117,27 +135,114 @@ def validate_profile(profile: dict) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Fill-in-the-blank patterns <-> regular expressions
+# -----------------------------------------------------------------------------
+# pattern name -> (profile regex key, pattern rule)
+PATTERN_FIELDS: dict[str, tuple[str, str]] = {
+    "block": ("block_regex", "block"),
+    "measure": ("measure_regex", "measure"),
+    "lim2": ("lim2_regex", "limits"),
+    "lim3": ("lim3_regex", "limits"),
+}
+_PATTERN_TITLES = {"block": "Component line", "measure": "Measurement line", "lim2": "Limits (style A)", "lim3": "Limits (style B)"}
+
+
+def text_profile_from_patterns(patterns: dict[str, str], sn_example: str = "", extensions: str = "") -> dict[str, Any]:
+    """Build a text profile from fill-in-the-blank patterns (keys ``block``, ``measure``, ``lim2``, ``lim3``).
+
+    The patterns are stored next to the regular expressions they produce, so the profile can be reopened in the
+    guided editor. Raises ``TemplateError`` naming the pattern that is wrong.
+    """
+    profile: dict[str, Any] = {"type": "text", "file_extensions": extensions or ",".join(TEXT_FILE_EXTENSIONS)}
+    sn_example = safe_text(sn_example)
+    try:
+        profile["sn_regex"] = sn_regex_from_example(sn_example) if sn_example else ""
+    except TemplateError as exc:
+        raise TemplateError(f"Serial number: {exc}") from None
+    if sn_example:
+        profile["sn_example"] = sn_example
+
+    for name, (regex_key, rule) in PATTERN_FIELDS.items():
+        template = safe_text(patterns.get(name))
+        try:
+            profile[regex_key] = compile_template(template, rule)
+        except TemplateError as exc:
+            raise TemplateError(f"{_PATTERN_TITLES[name]}: {exc}") from None
+        if template:
+            profile[f"{name}_template"] = template
+    return profile
+
+
+def patterns_from_profile(profile: dict) -> tuple[dict[str, str], list[str]]:
+    """The patterns a saved profile can be edited with, and the rules that only exist as a custom regex.
+
+    A pattern is only offered while it still produces the stored regular expression, so the guided editor never
+    shows something that is not what the profile really does.
+    """
+    patterns: dict[str, str] = {}
+    custom: list[str] = []
+    for name, (regex_key, rule) in PATTERN_FIELDS.items():
+        regex = safe_text(profile.get(regex_key))
+        template = safe_text(profile.get(f"{name}_template"))
+        if template:
+            try:
+                if compile_template(template, rule) == regex:
+                    patterns[name] = template
+                    continue
+            except TemplateError:
+                pass
+        if regex:
+            custom.append(name)
+    return patterns, custom
+
+
+# -----------------------------------------------------------------------------
 # Persistence
 # -----------------------------------------------------------------------------
 def _fresh_defaults() -> dict[str, dict[str, Any]]:
     return json.loads(json.dumps(DEFAULT_PROFILES))
 
 
-def _seed_if_needed(path: Path) -> None:
-    """First run only: copy a ``profiles.json`` placed next to the exe, else write defaults."""
-    if path.exists():
-        return
-    shipped = app_dir() / "profiles.json"
+# Written next to profiles.json once the profiles of an older version have been imported.
+_LEGACY_IMPORTED = "legacy_profiles_imported"
+
+
+def import_profiles_from(source: Path, data: dict[str, Any]) -> list[str]:
+    """Add the user's own profiles from an older ``profiles.json`` to ``data``; returns the names added.
+
+    Version 1.1.0 kept profiles next to the program. Built-in profiles are ignored (they are always restored)
+    and a profile that already exists is never overwritten. Raises ``OSError`` / ``ValueError`` if unreadable.
+    """
+    loaded = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError("profiles.json must contain a JSON object")
+    skip = set(BUILT_IN_PROFILE_NAMES) | {old for old, _new in _LEGACY_NAMES}
+    added = []
+    for name, definition in loaded.items():
+        if name not in skip and name not in data and isinstance(definition, dict):
+            data[name] = definition
+            added.append(name)
+    return added
+
+
+def _import_legacy_profiles(data: dict[str, Any], path: Path) -> bool:
+    """Once per data folder: bring over the profiles of the old ``profiles.json`` next to the program."""
+    legacy = app_dir() / "profiles.json"
+    marker = path.with_name(_LEGACY_IMPORTED)
     try:
-        if shipped.exists() and shipped.resolve() != path.resolve():
-            shutil.copy2(shipped, path)
-            return
-    except OSError:
-        logger.warning("Could not seed profiles from %s", shipped, exc_info=True)
+        if marker.exists() or not legacy.is_file() or legacy.resolve() == path.resolve():
+            return False
+        added = import_profiles_from(legacy, data)
+    except (OSError, ValueError):
+        logger.warning("Could not import profiles from %s", legacy, exc_info=True)
+        return False
     try:
-        atomic_write_json(path, _fresh_defaults())
+        marker.write_text(f"Profiles imported from {legacy}\n", encoding="utf-8")
     except OSError:
-        logger.warning("Could not write default profiles to %s", path, exc_info=True)
+        logger.debug("Could not write %s", marker, exc_info=True)
+    if added:
+        logger.info("Imported profiles from %s: %s", legacy, ", ".join(added))
+    return bool(added)
 
 
 def _back_up_corrupt(path: Path) -> None:
@@ -149,9 +254,15 @@ def _back_up_corrupt(path: Path) -> None:
         logger.warning("Could not back up unreadable profiles file", exc_info=True)
 
 
+def _unused_name(wanted: str, taken: dict[str, Any]) -> str:
+    name, n = wanted, 2
+    while name in taken:
+        name, n = f"{wanted} {n}", n + 1
+    return name
+
+
 def load_profiles(path: Path | None = None) -> dict[str, dict[str, Any]]:
     path = path or profiles_path()
-    _seed_if_needed(path)
 
     data: dict[str, Any] = {}
     try:
@@ -166,7 +277,7 @@ def load_profiles(path: Path | None = None) -> dict[str, dict[str, Any]]:
         # Keep the unreadable file so the user's custom profiles are not lost when we rewrite it.
         _back_up_corrupt(path)
 
-    changed = False
+    changed = _import_legacy_profiles(data, path)
     for old_name, new_name in _LEGACY_NAMES:
         if old_name in data:
             data[new_name] = data.pop(old_name)
@@ -175,8 +286,11 @@ def load_profiles(path: Path | None = None) -> dict[str, dict[str, Any]]:
     # Built-ins first (stable order), then the user's own profiles.
     ordered: dict[str, dict[str, Any]] = {}
     for name, definition in _fresh_defaults().items():
-        if data.get(name) != definition:
+        stored = data.get(name)
+        if stored != definition:
             changed = True
+            if name in _NEWER_BUILT_INS and isinstance(stored, dict):
+                data[_unused_name(f"{name} (yours)", data)] = stored  # do not overwrite what the user made
         ordered[name] = definition
     for name, definition in data.items():
         if name in ordered:

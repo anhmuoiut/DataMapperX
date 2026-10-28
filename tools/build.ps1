@@ -31,7 +31,7 @@ try {
 
     # Use a throw-away data folder so the test never touches your real profiles or settings.
     $env:DATAMAPPERX_HOME = Join-Path $env:TEMP "DataMapperX_selftest"
-    $process = Start-Process -FilePath $exe -ArgumentList "--smoke-test" -Wait -PassThru
+    $process = Start-Process -FilePath $exe -ArgumentList "--smoke-test" -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Self-test FAILED (exit code $($process.ExitCode)). See $env:DATAMAPPERX_HOME\app_debug.log" }
     Write-Host "Self-test passed."
 }

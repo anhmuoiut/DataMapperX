@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 import threading
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -109,7 +111,7 @@ def serve(monkeypatch, payload: bytes, final_url: str | None = None, length: int
     def fake_urlopen(request, timeout=None):
         return FakeResponse(payload, final_url or request.full_url, length)
 
-    monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
 
 def test_check_returns_update_only_when_newer(monkeypatch):
@@ -133,9 +135,9 @@ def test_check_refuses_redirect_to_other_host(monkeypatch):
 
 def test_check_wraps_network_failure(monkeypatch):
     def boom(*_a, **_k):
-        raise updater.urllib.error.URLError("no route")
+        raise urllib.error.URLError("no route")
 
-    monkeypatch.setattr(updater.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
     with pytest.raises(UpdateError, match="Could not reach GitHub"):
         check_for_update("1.0.0")
 

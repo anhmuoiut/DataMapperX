@@ -198,3 +198,88 @@ def test_formula_like_text_is_never_a_formula():
     cell = FakeCell()
     set_cell_value(cell, "=HYPERLINK(\"http://x\")")
     assert cell.data_type == "s"
+
+
+# ----------------------------------------------------------------------------- how the workbook looks
+LONG_NAME = "Aux With Load [3v8], Iout (Load) at max input voltage"
+
+
+def export_styled(tmp_path, ict_profile):
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    for sn in ("VSE001", "VSE002", "VSE003"):
+        for run in range(2):
+            blocks = [
+                ict_block(LONG_NAME, "+4.99580144882202E+00", "+5.5E+00", "+4.5E+00", kind="MEA"),
+                ict_block("R1", "+3.888312E+07", "+9.999999E+99", "+1.000000E+04", kind="JUM"),
+                ict_block("C2", "+7", None, None, kind="CAP"),
+            ]
+            write_ict_log(folder / f"{sn}_{run + 1}.log", sn, blocks)
+    result = scan_folder(folder, ict_profile)
+    components = [LONG_NAME, "R1", "C2"]
+    output = tmp_path / "out.xlsx"
+    generate_excel(result.grouped, components, output, 2)
+    return load_workbook(output)["Raw Data"]
+
+
+def test_header_row_is_styled_and_wraps_long_names(tmp_path, ict_profile):
+    ws = export_styled(tmp_path, ict_profile)
+    for col in range(1, 6):
+        cell = ws.cell(1, col)
+        assert cell.font.bold and cell.font.color.rgb.endswith("FFFFFF")
+        assert cell.fill.fgColor.rgb.endswith("005288")
+        assert cell.alignment.wrap_text and cell.alignment.horizontal == "center" and cell.alignment.vertical == "center"
+    # The long heading wraps onto several lines, so its column stays narrower than the heading and the row grows.
+    assert ws.column_dimensions["C"].width < len(LONG_NAME)
+    assert ws.row_dimensions[1].height >= 3 * 15
+
+
+def test_every_column_is_wide_enough_for_its_longest_value(tmp_path, ict_profile):
+    ws = export_styled(tmp_path, ict_profile)
+    width = lambda letter: ws.column_dimensions[letter].width  # noqa: E731
+    assert width("C") >= len("4.99580144882202") + 3  # a long decimal is not cut to a rounded number or shown as ####
+    assert width("D") >= len("3.888312E+07") + 3  # scientific notation too
+    assert width("B") >= len("VSE001") + 3
+    assert all(width(letter) >= 10 for letter in "ABCDE")
+
+
+def test_the_limits_table_has_room_for_its_longest_name_and_values(tmp_path, ict_profile):
+    ws = export_styled(tmp_path, ict_profile)
+    name_col = 7  # data ends in column E (STT, SN, 3 components); the table starts after one empty column
+    assert ws.cell(1, name_col).value == "NAME" and ws.cell(2, name_col).value == LONG_NAME
+    assert ws.column_dimensions["G"].width >= len(LONG_NAME) + 3
+    assert ws.column_dimensions["I"].width >= len("9.999999E+99") + 3
+    assert ws.cell(1, name_col).fill.fgColor.rgb.endswith("005288") and ws.cell(2, name_col).alignment.horizontal == "left"
+    assert ws.cell(2, 8).alignment.horizontal == "right" and ws.cell(2, 10).alignment.horizontal == "center"
+
+
+def test_samples_alternate_in_colour_so_the_files_of_one_sample_group_together(tmp_path, ict_profile):
+    ws = export_styled(tmp_path, ict_profile)
+
+    def shaded(row):
+        return ws.cell(row, 1).fill.fill_type == "solid"
+
+    # rows 2-3 = first sample, 4-5 = second, 6-7 = third
+    assert [shaded(r) for r in range(2, 8)] == [False, False, True, True, False, False]
+    assert shaded(4) == shaded(5) and ws.cell(4, 5).fill.fgColor.rgb.endswith("EAF1F8")
+
+
+def test_values_are_aligned_by_kind_and_the_layout_is_unchanged(tmp_path, ict_profile):
+    ws = export_styled(tmp_path, ict_profile)
+    assert ws.cell(2, 1).alignment.horizontal == "center" and ws.cell(2, 2).alignment.horizontal == "left"
+    assert ws.cell(2, 3).alignment.horizontal == "right"
+    assert [ws.cell(1, c).value for c in (1, 2, 3, 4, 5)] == ["STT", "SN", LONG_NAME, "R1", "C2"]
+    assert ws.cell(2, 4).value == 38883120.0 and ws.cell(2, 4).number_format == "0.000000E+00"
+    assert ws.freeze_panes == "C2" and ws.sheet_view.showGridLines is False
+
+
+def test_a_very_long_name_cannot_make_a_column_unreasonably_wide(tmp_path, ict_profile):
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    huge = "X" * 100
+    write_ict_log(folder / "VSE001_1.log", "VSE001", [ict_block(huge, "+1.0E+00", "+2.0E+00", "+0.0E+00")])
+    result = scan_folder(folder, ict_profile)
+    output = tmp_path / "huge.xlsx"
+    generate_excel(result.grouped, [huge], output, 1)
+    ws = load_workbook(output)["Raw Data"]
+    assert ws.column_dimensions["C"].width <= 60 and ws.column_dimensions["E"].width == 60  # data column, then the NAME column

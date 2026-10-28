@@ -29,8 +29,6 @@ import re
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,7 +86,6 @@ class UpdateInfo:
     min_supported: str
     notes: str
     published_at: str
-    asset_name: str
     asset_url: str
     sha256: str
     size: int
@@ -123,7 +120,6 @@ def parse_manifest(data: object) -> UpdateInfo:
         min_supported=min_supported,
         notes=str(data.get("notes") or "").strip(),
         published_at=str(data.get("published_at") or ""),
-        asset_name=asset,
         asset_url=f"{RELEASES_URL}/download/v{version}/{asset}",
         sha256=sha256,
         size=size,
@@ -139,6 +135,8 @@ def _check_host(url: str) -> None:
 
 
 def _open(url: str, timeout: float):
+    import urllib.request  # here, not at the top: it pulls in ssl and http, which the window does not need to open
+
     _check_host(url)
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Cache-Control": "no-cache"})
     try:
