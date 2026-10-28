@@ -1,0 +1,71 @@
+name: Release
+
+# Publish a version by pushing a tag, e.g.:  git tag v1.3.0 && git push origin v1.3.0
+# Installed copies of the app find the new release by themselves (see datamapperx/updater.py).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the build provenance
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Tag must match the version in the code
+        shell: pwsh
+        run: |
+          $version = python -c "from datamapperx._version import __version__ as v; print(v)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match datamapperx/_version.py (v$version). Fix one of them and re-tag."
+          }
+
+      - name: Lint and test
+        run: |
+          python -m ruff check .
+          python -m pytest
+
+      - name: Build the exe and run its self-test
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/build.ps1
+
+      - name: Write the update manifest
+        run: python tools/make_manifest.py dist/DataMapperX.exe dist/latest.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/DataMapperX.exe
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $manifest = Get-Content dist/latest.json -Raw | ConvertFrom-Json
+          $notes = @(
+            $manifest.notes,
+            "",
+            "---",
+            "SHA-256 of DataMapperX.exe: ``$($manifest.sha256)``"
+          ) -join "`n"
+          Set-Content -Path release-notes.md -Value $notes -Encoding utf8
+
+          # Create as a draft, then publish, so users never see a release that is missing its files.
+          gh release create "${{ github.ref_name }}" dist/DataMapperX.exe dist/latest.json `
+            --title "DataMapperX $($manifest.version)" --notes-file release-notes.md --verify-tag --draft
+          gh release edit "${{ github.ref_name }}" --draft=false --latest

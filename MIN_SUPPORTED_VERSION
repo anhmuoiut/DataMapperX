@@ -1,0 +1,4 @@
+# Lowest version that may still be used. Copies older than this are forced to update (they cannot be
+# used until they do). Leave the value empty to force nobody.
+#
+# Example: put 1.4.0 on the line below, commit, and publish a new release.
