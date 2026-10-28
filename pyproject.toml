@@ -1,0 +1,22 @@
+[project]
+name = "datamapperx"
+dynamic = ["version"]
+description = "Collect measurements from test logs into one Excel workbook."
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1,<4",
+    "sv-ttk>=2.6,<3",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["DataMapperX_V1.py", "DataMapperX_V2.py", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF100"]
+ignore = ["E501", "SIM105", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
