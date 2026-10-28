@@ -45,7 +45,7 @@ class UpdateDialog(Dialog):
 
         notes = ReadOnlyText(body, self.palette, height=9, width=64)
         notes.grid(row=2, column=0, sticky="nsew")
-        notes.set_text(info.notes or "No release notes were provided.")
+        notes.set_markdown(info.notes or "No release notes were provided.")
 
         # Download progress (hidden until the user presses Update now).
         self.progress_frame = ttk.Frame(body)

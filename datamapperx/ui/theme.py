@@ -18,6 +18,7 @@ class Palette:
     surface: str
     fg: str
     muted: str
+    line: str
     accent: str
     ok: str
     warn: str
@@ -27,11 +28,11 @@ class Palette:
 
 
 _LIGHT = Palette(
-    mode="light", bg="#fafafa", surface="#ffffff", fg="#1c1c1c", muted="#5f5f5f", accent="#005fb8",
+    mode="light", bg="#fafafa", surface="#ffffff", fg="#1c1c1c", muted="#5f5f5f", line="#d0d0d0", accent="#005fb8",
     ok="#0f7b0f", warn="#9d5d00", danger="#c42b1c", banner_bg="#e5f1fb", banner_fg="#003e73",
 )
 _DARK = Palette(
-    mode="dark", bg="#1c1c1c", surface="#2b2b2b", fg="#fafafa", muted="#a6a6a6", accent="#60cdff",
+    mode="dark", bg="#1c1c1c", surface="#2b2b2b", fg="#fafafa", muted="#a6a6a6", line="#454545", accent="#60cdff",
     ok="#6ccb5f", warn="#fce100", danger="#ff99a4", banner_bg="#0e2f44", banner_fg="#cfe9ff",
 )
 

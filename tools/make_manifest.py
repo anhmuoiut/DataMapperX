@@ -61,7 +61,7 @@ def main() -> None:
         "asset": exe.name,
         "sha256": hashlib.sha256(data).hexdigest(),
         "size": len(data),
-        "published_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "published_at": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "notes": notes,
     }
     output.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

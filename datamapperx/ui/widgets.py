@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tkinter as tk
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -149,17 +150,34 @@ class ReadOnlyText(ttk.Frame):
         self.text = tk.Text(
             self, wrap="word", height=height, width=width, relief="flat", borderwidth=0, padx=10, pady=8,
             bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
-            highlightthickness=1, highlightbackground=palette.muted, highlightcolor=palette.accent,
+            highlightthickness=1, highlightbackground=palette.line, highlightcolor=palette.accent,
             font=("Segoe UI", 10),
         )
         scroll = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=scroll.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
+        self.text.tag_configure("heading", font=("Segoe UI Semibold", 11), spacing1=8, spacing3=2)
+        self.text.tag_configure("bullet", lmargin1=12, lmargin2=28)
         self.text.configure(state="disabled")
 
     def set_text(self, content: str) -> None:
         self.text.configure(state="normal")
         self.text.delete("1.0", tk.END)
         self.text.insert("1.0", content)
+        self.text.configure(state="disabled")
+
+    def set_markdown(self, content: str) -> None:
+        """Show the small Markdown subset used in release notes: headings, bullets, **bold**, `code`."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", tk.END)
+        for line in content.splitlines():
+            stripped = line.strip()
+            plain = re.sub(r"`([^`]*)`", r"\1", re.sub(r"\*\*(.+?)\*\*", r"\1", stripped))
+            if stripped.startswith("#"):
+                self.text.insert(tk.END, plain.lstrip("#").strip() + "\n", "heading")
+            elif stripped.startswith(("- ", "* ")):
+                self.text.insert(tk.END, "•  " + plain[2:] + "\n", "bullet")
+            else:
+                self.text.insert(tk.END, plain + "\n")
         self.text.configure(state="disabled")

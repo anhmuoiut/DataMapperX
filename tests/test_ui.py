@@ -249,6 +249,16 @@ def test_every_dialog_opens_and_closes(app, tmp_path):
     assert results == [False]  # closing without applying keeps defaults
 
 
+def test_release_notes_render_headings_and_bullets(app):
+    from datamapperx.ui.widgets import ReadOnlyText
+
+    box = ReadOnlyText(app, app.palette)
+    box.set_markdown("### New\n- **Faster** scan of `OneDrive` folders\nplain line")
+    text = box.text.get("1.0", "end").strip().splitlines()
+    assert text == ["New", "•  Faster scan of OneDrive folders", "plain line"]
+    assert "heading" in box.text.tag_names("1.0") and "bullet" in box.text.tag_names("2.0")
+
+
 def test_duplicate_dialog_applies_the_chosen_occurrence(app, tmp_path):
     from datamapperx.ui.duplicate_dialog import DuplicateDialog
 

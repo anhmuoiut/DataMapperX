@@ -64,7 +64,7 @@ class ProfileManager(Dialog):
             left, width=26, exportselection=False, activestyle="none", relief="flat", borderwidth=0,
             bg=self.palette.surface, fg=self.palette.fg, selectbackground=self.palette.accent,
             selectforeground="#ffffff" if self.palette.mode == "light" else "#000000",
-            highlightthickness=1, highlightbackground=self.palette.muted, font=("Segoe UI", 10),
+            highlightthickness=1, highlightbackground=self.palette.line, font=("Segoe UI", 10),
         )
         self.listbox.grid(row=1, column=0, sticky="ns")
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
@@ -93,7 +93,7 @@ class ProfileManager(Dialog):
         self._entry(right, 4, "SN_Regex / Cell:", v["sn_regex"])
         ttk.Label(
             right, text="For Excel you can enter a cell such as B2, or leave blank to search the filename and cells.",
-            style="Hint.TLabel", wraplength=480,
+            style="Hint.TLabel", wraplength=400, justify="left",
         ).grid(row=5, column=1, sticky="w", pady=(0, 4))
 
         self.text_frame = ttk.Frame(right)
