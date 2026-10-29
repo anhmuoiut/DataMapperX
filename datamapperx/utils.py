@@ -16,6 +16,22 @@ def safe_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+_PLAIN_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def to_number(text: Any) -> float | None:
+    """The number written in ``text`` (``+1.5E+03``, ``-2``, ``.5``), or None for anything else.
+
+    Only plain decimal / scientific notation counts, so ``nan``, ``inf`` and ``1_000`` are text, not numbers.
+    """
+    plain = safe_text(text)
+    if plain and _PLAIN_NUMBER.fullmatch(plain):
+        number = float(plain)
+        if number - number == 0:  # finite: rules out an exponent so large it overflows to inf
+            return number
+    return None
+
+
 def parse_positive_int(value: Any, label: str, min_value: int = 1) -> int:
     try:
         parsed = int(str(value).strip())

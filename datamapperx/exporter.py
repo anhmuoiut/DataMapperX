@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from .config import MISSING_TEXT
-from .models import LogRecord
+from .models import LogRecord, Measurement
 from .utils import column_letter, safe_text
 
 if TYPE_CHECKING:  # openpyxl is imported only when a workbook is written: it costs about half a second
@@ -69,20 +69,29 @@ def iter_export_rows(grouped: dict[str, list[LogRecord]], components: Sequence[s
 
 
 def summarize_limits(grouped: dict[str, list[LogRecord]], components: Sequence[str]) -> dict[str, dict[str, str]]:
-    """Min / max / unit per component, taken from the first file (in SN order) that has it."""
+    """Min / max / unit per component, taken from the first file (in SN order) that has it.
+
+    One pass over the files that stops as soon as every component has been seen, so asking for every component
+    of a big scan (as the component list does) costs about one file, not one sort of all SNs per component.
+    """
+    first: dict[str, Measurement] = {}
+    remaining = set(components)
+    for sn in sorted(grouped):
+        for record in grouped[sn]:
+            for component in remaining.intersection(record.entries):
+                first[component] = record.entries[component]
+            remaining.difference_update(first)
+        if not remaining:
+            break
+
     summary: dict[str, dict[str, str]] = {}
     for component in components:
-        found = {"min": MISSING_TEXT, "max": MISSING_TEXT, "unit": MISSING_TEXT}
-        for sn in sorted(grouped):
-            entry = next((r.entries[component] for r in grouped[sn] if component in r.entries), None)
-            if entry:
-                found = {
-                    "min": entry.min_value or MISSING_TEXT,
-                    "max": entry.max_value or MISSING_TEXT,
-                    "unit": entry.unit or MISSING_TEXT,
-                }
-                break
-        summary[component] = found
+        entry = first.get(component)
+        summary[component] = {
+            "min": (entry.min_value if entry else "") or MISSING_TEXT,
+            "max": (entry.max_value if entry else "") or MISSING_TEXT,
+            "unit": (entry.unit if entry else "") or MISSING_TEXT,
+        }
     return summary
 
 

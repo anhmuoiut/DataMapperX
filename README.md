@@ -17,12 +17,21 @@ The app keeps itself up to date (see [Updates](#updates)), so this is the only t
 
 ## Use
 
-1. **Source** - pick a profile, choose the folder that holds the logs, set how many samples and how many files per sample you expect, then **Scan logs**. The summary tells you immediately if a sample has the wrong number of files.
-2. **Available components** - search, then double-click (or select several and press **Add**).
-3. **Selected components** - the order here is the column order in Excel. Use ▲ ▼ to reorder.
-4. **Preview** - exactly what will be exported. Red rows: wrong number of files. Amber: a value is missing. Then **Export Excel…**.
+The window has two steps, shown along the top: **Select** and **Review & Export**.
 
-Your last profile, folder, counts and component choices are remembered. Shortcuts: `Ctrl+O` folder · `Ctrl+Enter`/`F5` scan · `Esc` cancel · `Ctrl+E` export.
+**Step 1 - Select**
+
+1. **Source** - pick a profile, choose the folder that holds the logs, set how many samples and how many files per sample you expect, then **Scan logs**. The summary tells you immediately if a sample has the wrong number of files.
+2. **Available components** - search, then press **+** at the end of a row to add that component (or double-click it, or select several and press **Add →**). Each row shows the component's Min and Max.
+3. **Selected for export** - the order here is the column order in Excel. Use ↑ ↓ to reorder and **×** at the end of a row to remove it. Then press **Review & Export**.
+
+**Step 2 - Review & Export**
+
+- The table is exactly what will be exported. Amber rows: a value is missing. Red rows: a sample has the wrong number of files. With more than 20 columns, ‹ › page through them (the Excel file always has every column).
+- The **Limits** panel on the right lists every selected component with its Min, Max and Unit, the same limits the Excel file shows beside the data. Click a row of the table to see that row's values next to them; a value outside its limits is marked ▲ (above max) or ▼ (below min).
+- The checks at the bottom sum it up (samples found, files per sample, empty cells, rows outside their limits). **Export Excel…** is disabled while a sample has the wrong number of files. **← Back** returns to step 1.
+
+Your last profile, folder, counts and component choices are remembered. The header has a **Dark mode / Light mode** button and the **Help** menu; the version and credit are at the bottom left of the Source card. Shortcuts: `Ctrl+O` folder · `Ctrl+Enter`/`F5` scan · `Esc` cancel · `Ctrl+E` go to Review & Export, then export.
 
 ### Profiles
 
@@ -69,11 +78,13 @@ datamapperx/
   profiles.py           profile definitions, validation, load/save
   parsing.py            read one text / Excel log
   scanner.py            walk a folder, parse in parallel, group by SN
-  exporter.py           build the workbook (the preview uses the same rows)
+  exporter.py           build the workbook (the review uses the same rows)
+  review.py             compare values with their limits, summarise before exporting
   reporting.py          explain scan problems in plain language
   settings.py           remembered preferences
   updater.py            check / download / verify / install updates
   ui/                   tkinter windows, built on the sv-ttk (Windows 11) theme
+    controls.py         the component lists, the step bar and the check chips
 tests/                  pytest suite
 tools/                  build + release helpers
 .github/workflows/      CI and release automation

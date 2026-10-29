@@ -1,4 +1,4 @@
-"""The main DataMapperX window."""
+"""The main DataMapperX window: two steps, Select (folder, profile, components) then Review & Export."""
 
 from __future__ import annotations
 
@@ -21,30 +21,33 @@ from ..config import (
     PREVIEW_COLUMNS_PER_PAGE,
     PREVIEW_ROW_LIMIT,
 )
-from ..exporter import generate_excel, iter_export_rows
+from ..exporter import ExportRow, generate_excel, iter_export_rows, summarize_limits
 from ..models import ScanResult
 from ..paths import log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
 from ..reporting import describe_empty_scan, full_report, summarize_scan
+from ..review import HIGH, LOW, MISSING, ReviewSummary, limit_rows, summarize_review
 from ..sampling import suggest_profile
 from ..scanner import scan_folder
 from ..settings import Settings, load_settings, save_settings
 from ..utils import parse_positive_int
+from .controls import ActionList, ChipRow, Column, DataGrid, StepBar
 from .dialogs import AboutDialog, ExportDoneDialog, ReportDialog, open_path, set_window_icon
 from .duplicate_dialog import DuplicateDialog
 from .profile_dialog import ProfileManager
 from .tasks import TaskRunner
 from .theme import Palette, apply_theme, resolve_mode, work_area
 from .update_dialog import UpdateDialog
-from .widgets import ItemList, fit_tree_columns
 
 logger = logging.getLogger(__name__)
+
+CARD_PADDING = 12
 
 SHORTCUTS = (
     ("Ctrl+O", "Choose the source folder"),
     ("Ctrl+Enter  /  F5", "Scan logs"),
     ("Esc", "Cancel a running scan"),
-    ("Ctrl+E", "Export to Excel"),
+    ("Ctrl+E", "Go to Review & Export, then export to Excel"),
     ("Double-click / Enter", "Add or remove the highlighted component"),
     ("Ctrl+A", "Select every component in a list"),
     ("Delete", "Remove the highlighted selected components"),
@@ -60,10 +63,21 @@ class MainWindow(tk.Tk):
         self.tasks = TaskRunner(self)
 
         self.scan_result: ScanResult | None = None
+        self.limits: dict[str, dict[str, str]] = {}  # min / max / unit of every scanned component, as in the Excel file
         self.selected_components: list[str] = []
         self.reviewed_duplicates: set[str] = set()
         self.is_busy = False
         self._cancel = threading.Event()
+        self.step = "select"  # "select" or "review"
+        self._review_built = False  # the review page is built when first needed, so the window opens sooner
+        self._review_row = 0  # the preview row whose values the limits panel shows
+        self._preview_rows: list[ExportRow] = []
+        self._preview_components: tuple[str, ...] = ()
+        self._limit_components: tuple[str, ...] | None = None
+        self._limit_columns: list[Column] = []
+        self._swatches: list[tuple[tk.Frame, str]] = []
+        self._summary: ReviewSummary | None = None
+        self._summary_key: tuple | None = None
         self._preview_job: str | None = None
         self._preview_page = 0
         self._progress_determinate = False
@@ -91,6 +105,10 @@ class MainWindow(tk.Tk):
         self.selected_info_var = tk.StringVar()
         self.preview_info_var = tk.StringVar()
         self.pager_var = tk.StringVar()
+        self.review_count_var = tk.StringVar()
+        self.review_row_var = tk.StringVar()
+        self.limits_title_var = tk.StringVar(value="Limits")
+        self.theme_text_var = tk.StringVar(value=self._theme_button_text())
 
         if self.settings.last_profile in self.profiles:
             self.profile_var.set(self.settings.last_profile)
@@ -101,13 +119,13 @@ class MainWindow(tk.Tk):
         self._bind_shortcuts()
         self._update_profile_hint()
         self._refresh_lists()
-        self._refresh_preview()
 
-        self.search_var.trace_add("write", lambda *_: self._refresh_available())
+        self.search_var.trace_add("write", lambda *_: self._refresh_available(reset_view=True))
         self.repeats_var.trace_add("write", lambda *_: self._schedule_preview())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.report_callback_exception = self._on_callback_error  # type: ignore[method-assign]
 
+        self.after_idle(self._ensure_review_page)  # once the window is on screen
         self.deiconify()
         if self.settings.check_updates:
             self.after(1500, self._check_for_update)
@@ -121,7 +139,7 @@ class MainWindow(tk.Tk):
         left, top, right, bottom = work_area(self, anchor)
         # Reserve native window borders/title bar; the monitor work area already excludes the taskbar.
         max_width, max_height = max(1, right - left - 24), max(1, bottom - top - 48)
-        min_width, min_height = min(1000, max_width), min(640, max_height)
+        min_width, min_height = min(1000, max_width), min(680, max_height)
         self.minsize(min_width, min_height)
         if restored:
             width, height, x, y = restored
@@ -163,49 +181,56 @@ class MainWindow(tk.Tk):
         self.bind("<Control-o>", lambda _e: self.pick_folder())
         self.bind("<Control-Return>", lambda _e: self.scan_logs())
         self.bind("<F5>", lambda _e: self.scan_logs())
-        self.bind("<Control-e>", lambda _e: self.export_excel())
+        self.bind("<Control-e>", lambda _e: self._export_shortcut())
         self.bind("<Escape>", lambda _e: self._cancel_scan() if self.is_busy else None)
+
+    def _export_shortcut(self) -> None:
+        """Ctrl+E: from the first step go and review; from the review step export."""
+        if self.is_busy:
+            return
+        if self.step == "review":
+            self.export_excel()
+        else:
+            self._show_step("review")
 
     # ------------------------------------------------------------------ UI construction
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
         self._build_header()
         self._build_banner()
+        self.step_bar = StepBar(self, self.palette, ("Select", "Review & Export"), self._on_step_clicked)
+        self.step_bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(2, 8))
 
         self.content_frame = ttk.Frame(self)
-        self.content_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(4, 0))
+        self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 0))
         self.content_frame.rowconfigure(0, weight=1)
-        self.content_frame.columnconfigure(0, minsize=300)
-        self.content_frame.columnconfigure(1, weight=1)
-        self._build_workspace(self.content_frame)
+        self.content_frame.columnconfigure(0, weight=1)
 
-        self.workspace_panes = ttk.PanedWindow(self.content_frame, orient=tk.VERTICAL)
-        self.workspace_panes.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
-        lists = ttk.Frame(self.workspace_panes)
-        preview = ttk.Frame(self.workspace_panes)
-        self.workspace_panes.add(lists, weight=1)
-        self.workspace_panes.add(preview, weight=1)
+        # Step 1: the Source card and the two component lists.
+        self.select_page = ttk.Frame(self.content_frame)
+        self.select_page.grid(row=0, column=0, sticky="nsew")
+        self.select_page.rowconfigure(0, weight=1)
+        self.select_page.columnconfigure(0, minsize=300)
+        self.select_page.columnconfigure(1, weight=1)
+        self._build_workspace(self.select_page)
+        lists = ttk.Frame(self.select_page)
+        lists.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
         lists.rowconfigure(0, weight=1)
         lists.columnconfigure(0, weight=1, uniform="lists")
         lists.columnconfigure(1, weight=1, uniform="lists")
         self._build_available(lists)
         self._build_selected(lists)
-        self._build_preview(preview)
-        self._build_statusbar()
-        for listing in (self.available_list, self.selected_list):
-            listing.tree.configure(height=5)
-            listing.tree.bind("<<TreeviewSelect>>", lambda _e: self._update_actions(), add="+")
-        self.after_idle(self._fit_workspace)
 
-    def _fit_workspace(self) -> None:
-        """Give both the component lists and the export preview room on small displays."""
-        height = self.workspace_panes.winfo_height()
-        if height > 100:
-            self.workspace_panes.sashpos(0, int(height * 0.51))
+        # Step 2 is built the first time it is needed (see _ensure_review_page).
+        self.review_page = ttk.Frame(self.content_frame)
+        self.review_page.grid(row=0, column=0, sticky="nsew")
+        self.review_page.grid_remove()
+        self._build_statusbar()
+        self._update_steps()
 
     def _build_header(self) -> None:
-        header = ttk.Frame(self, padding=(20, 16, 20, 12))
+        header = ttk.Frame(self, padding=(20, 10, 20, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
         self._icon_image = None
@@ -222,12 +247,11 @@ class MainWindow(tk.Tk):
         self._brand_label.place(relx=0.5, rely=0.5, anchor="center")  # centred on the window, not on the free gap
         self._update_brand_logo()
         ttk.Label(header, text=APP_TITLE, style="Brand.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Label(header, text="Test logs to structured Excel", style="Subtitle.TLabel").grid(row=1, column=1, sticky="w")
+        ttk.Label(header, text="TE - Solar Edge", style="Subtitle.TLabel").grid(row=1, column=1, sticky="w")
         right = ttk.Frame(header)
         right.grid(row=0, column=2, rowspan=2, sticky="e")
-        ttk.Label(right, text=f"v{__version__}", style="Muted.TLabel").pack(side="left", padx=(0, 18))
-        ttk.Checkbutton(right, text="Dark mode", style="Switch.TCheckbutton", variable=self.dark_var,
-                        command=self._on_theme_toggle).pack(side="left", padx=(0, 14))
+        self.theme_button = ttk.Button(right, textvariable=self.theme_text_var, command=self._toggle_theme)
+        self.theme_button.pack(side="left", padx=(0, 8))
         menu_button = ttk.Menubutton(right, text="Help")
         menu = tk.Menu(menu_button, tearoff=False)
         menu.add_command(label="Check for updates…", command=lambda: self._check_for_update(manual=True))
@@ -240,6 +264,7 @@ class MainWindow(tk.Tk):
         menu.add_command(label=f"About {APP_TITLE}", command=lambda: AboutDialog(self))
         menu_button.configure(menu=menu)
         menu_button.pack(side="left")
+        self.help_button = menu_button
 
     def _load_brand_logos(self) -> dict[str, tk.PhotoImage]:
         """The company logo, one picture per theme (white letters on dark). Missing files simply mean no logo."""
@@ -272,13 +297,13 @@ class MainWindow(tk.Tk):
         buttons.grid(row=0, column=1, sticky="e", padx=(12, 0))
         ttk.Button(buttons, text="Update now", style="Accent.TButton", command=self._open_update_dialog).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Skip this version", command=lambda: self.skip_update(self._update_info.version if self._update_info else "")).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="×", width=3, command=self.hide_update_banner).pack(side="left")
+        ttk.Button(buttons, text="×", width=3, style="Icon.TButton", command=self.hide_update_banner).pack(side="left")
         self.banner.grid_remove()
 
     def _card(self, parent: tk.Misc, title: str, column: int, padx: tuple[int, int]) -> ttk.Frame:
-        card = ttk.Frame(parent, style="Surface.TFrame", padding=14)
+        card = ttk.Frame(parent, style="Surface.TFrame", padding=CARD_PADDING)
         card.grid(row=0, column=column, sticky="nsew", padx=padx, pady=(0, 6))
-        ttk.Label(card, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(card, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 10))
         return card
 
     def _build_workspace(self, parent: tk.Misc) -> None:
@@ -294,10 +319,10 @@ class MainWindow(tk.Tk):
         self.profile_combo.grid(row=2, column=0, sticky="ew", pady=(4, 3))
         self.profile_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_profile_changed())
         self.hint_label = ttk.Label(card, textvariable=self.hint_var, style="SurfaceHint.TLabel", wraplength=270, justify="left")
-        self.hint_label.grid(row=3, column=0, sticky="w", pady=(0, 12))
+        self.hint_label.grid(row=3, column=0, sticky="w", pady=(0, 8))
         ttk.Label(card, text="Source folder", style="Surface.TLabel").grid(row=4, column=0, sticky="w")
         folder_row = ttk.Frame(card, style="Surface.TFrame")
-        folder_row.grid(row=5, column=0, sticky="ew", pady=(4, 12))
+        folder_row.grid(row=5, column=0, sticky="ew", pady=(4, 8))
         folder_row.columnconfigure(0, weight=1)
         self.folder_entry = ttk.Entry(folder_row, width=18, textvariable=self.folder_var)
         self.folder_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -315,7 +340,7 @@ class MainWindow(tk.Tk):
         self.repeats_spin = ttk.Spinbox(counts, from_=1, to=999, width=7, textvariable=self.repeats_var)
         self.repeats_spin.grid(row=1, column=1, sticky="ew", pady=(4, 0))
         actions = ttk.Frame(card, style="Surface.TFrame")
-        actions.grid(row=7, column=0, sticky="ew", pady=(14, 0))
+        actions.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.scan_button = ttk.Button(actions, text="Scan logs", style="Accent.TButton", command=self.scan_logs)
@@ -324,7 +349,7 @@ class MainWindow(tk.Tk):
         self.cancel_button.grid(row=1, column=0, sticky="ew", padx=(0, 4))
         self.reset_button = ttk.Button(actions, text="Reset", command=self.reset_workflow)
         self.reset_button.grid(row=1, column=1, sticky="ew", padx=(4, 0))
-        ttk.Separator(card, style="Surface.TSeparator").grid(row=8, column=0, sticky="ew", pady=14)
+        ttk.Separator(card, style="Surface.TSeparator").grid(row=8, column=0, sticky="ew", pady=9)
         stats = ttk.Frame(card, style="Surface.TFrame")
         stats.grid(row=9, column=0, sticky="ew")
         for col, (caption, var) in enumerate((("Samples", self.samples_var), ("Files", self.files_var), ("Fields", self.components_var))):
@@ -334,12 +359,18 @@ class MainWindow(tk.Tk):
             ttk.Label(block, textvariable=var, style="Metric.TLabel").pack(anchor="w")
             ttk.Label(block, text=caption, style="MetricCaption.TLabel").pack(anchor="w")
         self.verdict_label = ttk.Label(card, textvariable=self.verdict_var, style="SurfaceMuted.TLabel", wraplength=270, justify="left")
-        self.verdict_label.grid(row=10, column=0, sticky="ew", pady=(12, 6))
+        self.verdict_label.grid(row=10, column=0, sticky="ew", pady=(8, 6))
         self.details_button = ttk.Button(card, text="View scan details", command=self._show_scan_details, state="disabled")
         self.details_button.grid(row=11, column=0, sticky="ew")
         card.rowconfigure(12, weight=1)
-        self.credit_label = ttk.Label(card, text=APP_CREDIT, style="SurfaceHint.TLabel")
-        self.credit_label.grid(row=13, column=0, sticky="sw", pady=(10, 0))
+        ttk.Separator(card, style="Surface.TSeparator").grid(row=13, column=0, sticky="ew", pady=(8, 6))
+        about = ttk.Frame(card, style="Surface.TFrame")  # bottom left: version, then who made it, on one line
+        about.grid(row=14, column=0, sticky="w")
+        self.version_label = ttk.Label(about, text=f"Version {__version__}", style="SurfaceHint.TLabel")
+        self.version_label.pack(side="left")
+        ttk.Label(about, text="·", style="SurfaceHint.TLabel").pack(side="left", padx=6)
+        self.credit_label = ttk.Label(about, text=APP_CREDIT, style="SurfaceHint.TLabel")
+        self.credit_label.pack(side="left")
         self._busy_widgets: list[ttk.Widget] = [
             self.manage_button, self.browse_button, self.scan_button, self.reset_button,
             self.expected_spin, self.repeats_spin, self.folder_entry,
@@ -354,7 +385,10 @@ class MainWindow(tk.Tk):
         self.search_hint = ttk.Label(self.search_entry, text="Search components…", style="EntryHint.TLabel")
         self.search_hint.place(x=10, rely=0.5, anchor="w")
         self.search_hint.bind("<Button-1>", lambda _e: self.search_entry.focus_set())
-        self.available_list = ItemList(card, on_activate=self.add_components)
+        self.available_list = ActionList(
+            card, self.palette, action="add", on_action=self._add_at, on_activate=self.add_components,
+            on_select=self._update_actions, name_heading="Component", value_headings=("Min", "Max"),
+        )
         self.available_list.grid(row=2, column=0, sticky="nsew")
         footer = ttk.Frame(card, style="Surface.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -372,7 +406,10 @@ class MainWindow(tk.Tk):
         card.rowconfigure(2, weight=1)
         card.columnconfigure(0, weight=1)
         ttk.Label(card, text="Top to bottom = Excel column order", style="SurfaceHint.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
-        self.selected_list = ItemList(card, on_activate=self.remove_components, on_delete=self.remove_components)
+        self.selected_list = ActionList(
+            card, self.palette, action="remove", on_action=self._remove_at, on_activate=self.remove_components,
+            on_delete=self.remove_components, on_select=self._update_actions, numbered=True,
+        )
         self.selected_list.grid(row=2, column=0, sticky="nsew")
         footer = ttk.Frame(card, style="Surface.TFrame")
         footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -381,56 +418,100 @@ class MainWindow(tk.Tk):
         buttons = ttk.Frame(footer, style="Surface.TFrame")
         buttons.grid(row=1, column=0, sticky="ew")
         buttons.columnconfigure(2, weight=1)
-        self.move_up_button = ttk.Button(buttons, text="↑", width=3, command=lambda: self.move_selected(-1))
+        self.move_up_button = ttk.Button(buttons, text="↑", width=3, style="Icon.TButton", command=lambda: self.move_selected(-1))
         self.move_up_button.grid(row=0, column=0, padx=(0, 4))
-        self.move_down_button = ttk.Button(buttons, text="↓", width=3, command=lambda: self.move_selected(1))
-        self.move_down_button.grid(row=0, column=1, padx=(0, 6))
-        self.remove_button = ttk.Button(buttons, text="Remove", command=self.remove_components)
-        self.remove_button.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        self.move_down_button = ttk.Button(buttons, text="↓", width=3, style="Icon.TButton", command=lambda: self.move_selected(1))
+        self.move_down_button.grid(row=0, column=1)
         self.clear_button = ttk.Button(buttons, text="Clear", command=self.clear_selected)
-        self.clear_button.grid(row=0, column=3)
+        self.clear_button.grid(row=0, column=3, sticky="e")
+        self.review_button = ttk.Button(footer, text="Review & Export  →", style="Accent.TButton", command=lambda: self._show_step("review"))
+        self.review_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
-    def _build_preview(self, parent: tk.Misc) -> None:
-        card = ttk.Frame(parent, style="Surface.TFrame", padding=14)
-        card.pack(fill="both", expand=True, pady=(6, 6))
-        card.rowconfigure(2, weight=1)
+    def _build_review(self, page: ttk.Frame) -> None:
+        """Step 2: the data as it will be exported, the limits beside it, and the checks with the Export button."""
+        page.rowconfigure(0, weight=1)
+        page.columnconfigure(0, weight=1)
+        page.columnconfigure(1, minsize=480)
+
+        card = ttk.Frame(page, style="Surface.TFrame", padding=CARD_PADDING)
+        card.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        card.rowconfigure(3, weight=1)
         card.columnconfigure(0, weight=1)
         toolbar = ttk.Frame(card, style="Surface.TFrame")
         toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.columnconfigure(0, weight=1)
-        ttk.Label(toolbar, text="03  Preview & export", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Review your data", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(toolbar, textvariable=self.review_count_var, style="SurfaceMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.pager = ttk.Frame(toolbar, style="Surface.TFrame")
-        self.pager.grid(row=0, column=1, padx=(12, 0))
-        self.pager_prev = ttk.Button(self.pager, text="‹", width=3, style="Compact.TButton", command=lambda: self._page_preview(-1))
+        self.pager.grid(row=0, column=2, padx=(12, 0))
+        self.pager_prev = ttk.Button(self.pager, text="‹", width=3, style="Icon.TButton", command=lambda: self._page_preview(-1))
         self.pager_prev.pack(side="left")
         ttk.Label(self.pager, textvariable=self.pager_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
-        self.pager_next = ttk.Button(self.pager, text="›", width=3, style="Compact.TButton", command=lambda: self._page_preview(1))
+        self.pager_next = ttk.Button(self.pager, text="›", width=3, style="Icon.TButton", command=lambda: self._page_preview(1))
         self.pager_next.pack(side="left")
         self.pager.grid_remove()
-        self.export_button = ttk.Button(toolbar, text="Export Excel…", style="Accent.TButton", command=self.export_excel)
-        self.export_button.grid(row=0, column=2, sticky="e", padx=(12, 0))
+        self.preview_hint = ttk.Label(
+            card, style="SurfaceHint.TLabel", wraplength=500, justify="left",
+            text="Same rows and column order as your Excel file. Click a row to compare its values with the limits.",
+        )
+        self.preview_hint.grid(row=1, column=0, sticky="w", pady=(4, 6))
+        legend = ttk.Frame(card, style="Surface.TFrame")
+        legend.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        for column, (level, text) in enumerate((("warn", "A value is missing"), ("bad", "Sample has the wrong number of files"))):
+            swatch = tk.Frame(legend, width=12, height=12, highlightthickness=1)
+            swatch.grid(row=0, column=column * 2, padx=(0 if column == 0 else 16, 6))
+            ttk.Label(legend, text=text, style="SurfaceHint.TLabel").grid(row=0, column=column * 2 + 1)
+            self._swatches.append((swatch, level))
+        self.preview_grid = DataGrid(card, self.palette, on_select=self._on_preview_select)
+        self.preview_grid.grid(row=3, column=0, sticky="nsew")
         self.preview_info_label = ttk.Label(card, textvariable=self.preview_info_var, style="SurfaceHint.TLabel", wraplength=500, justify="left")
-        self.preview_info_label.grid(row=1, column=0, sticky="w", pady=(4, 8))
-        frame = ttk.Frame(card, style="Surface.TFrame")
-        frame.grid(row=2, column=0, sticky="nsew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        self.preview_tree = ttk.Treeview(frame, show="headings", selectmode="browse", height=5)
-        ysb = ttk.Scrollbar(frame, orient="vertical", command=self.preview_tree.yview)
-        xsb = ttk.Scrollbar(frame, orient="horizontal", command=self.preview_tree.xview)
-        self.preview_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-        self.preview_tree.grid(row=0, column=0, sticky="nsew")
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        frame.bind("<Configure>", lambda event: self.empty_label.configure(wraplength=max(140, event.width - 50)))
-        card.bind("<Configure>", lambda event: self.preview_info_label.configure(wraplength=max(180, event.width - 32)))
+        self.preview_info_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        card.bind("<Configure>", lambda event: (
+            self.preview_hint.configure(wraplength=max(180, event.width - 32)),
+            self.preview_info_label.configure(wraplength=max(180, event.width - 32)),
+        ))
+
+        side = ttk.Frame(page, style="Surface.TFrame", padding=CARD_PADDING)
+        side.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+        side.rowconfigure(2, weight=1)
+        side.columnconfigure(0, weight=1)
+        ttk.Label(side, textvariable=self.limits_title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(side, textvariable=self.review_row_var, style="Pick.TLabel").grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        self.limits_grid = DataGrid(side, self.palette, font_size=9, row_height=26, padding=8)
+        self.limits_grid.grid(row=2, column=0, sticky="nsew")
+        self.limits_hint = ttk.Label(
+            side, style="SurfaceHint.TLabel", wraplength=380, justify="left",
+            text="▲ above max   ▼ below min   – nothing there. Min, max and unit are the limits the Excel file lists "
+                 "beside the data.",
+        )
+        self.limits_hint.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        side.bind("<Configure>", lambda event: self.limits_hint.configure(wraplength=max(180, event.width - 32)))
+
+        bar = ttk.Frame(page, style="Surface.TFrame", padding=(14, 10))
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+        bar.columnconfigure(0, weight=1)
+        self.check_chips = ChipRow(bar, self.palette)
+        self.check_chips.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        buttons = ttk.Frame(bar, style="Surface.TFrame")
+        buttons.grid(row=0, column=1, sticky="e")
+        self.back_button = ttk.Button(buttons, text="←  Back", command=lambda: self._show_step("select"))
+        self.back_button.pack(side="left", padx=(0, 8))
+        self.export_button = ttk.Button(buttons, text="Export Excel…", style="Accent.TButton", command=self.export_excel)
+        self.export_button.pack(side="left")
+        self._busy_widgets += [self.back_button, self.export_button]
+
+    def _ensure_review_page(self) -> None:
+        """Build step 2 the first time it is needed (shortly after start-up, or when something asks for it)."""
+        if self._review_built:
+            return
+        self._review_built = True
+        self._build_review(self.review_page)
         self._apply_tag_colors()
-        self.empty_label = ttk.Label(self.preview_tree, style="ListHint.TLabel", justify="center", padding=12)
-        self._busy_widgets.append(self.export_button)
+        self._update_actions()
 
     def _build_statusbar(self) -> None:
         bar = ttk.Frame(self, padding=(20, 8, 20, 10))
-        bar.grid(row=3, column=0, sticky="ew")
+        bar.grid(row=4, column=0, sticky="ew")
         bar.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(bar, textvariable=self.status_var, style="Hint.TLabel", wraplength=780, justify="left")
         self.status_label.grid(row=0, column=0, sticky="w")
@@ -439,33 +520,108 @@ class MainWindow(tk.Tk):
         self.progress.grid_remove()
         bar.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(250, event.width - 230)))
 
+    # ------------------------------------------------------------------ steps
+    def _review_ready(self) -> bool:
+        return bool(self.scan_result and self.scan_result.grouped and self.selected_components)
+
+    def _wrong_samples(self) -> list[str]:
+        """Samples that do not have the expected number of files (the export refuses to run while there are any)."""
+        repeats = self._optional_int(self.repeats_var)
+        if self.scan_result is None or repeats is None:
+            return []
+        return self.scan_result.sns_with_wrong_repeat_count(repeats)
+
+    def _on_step_clicked(self, index: int) -> None:
+        if not self.is_busy:
+            self._show_step("select" if index == 0 else "review")
+
+    def _show_step(self, step: str) -> None:
+        if step == "review":
+            if not self._review_ready():
+                self.set_status("Scan a folder and add at least one component first.")
+                return
+            self._ensure_review_page()
+            self.select_page.grid_remove()
+            self.review_page.grid()
+            self.step = "review"
+            self._refresh_review()
+            self.preview_grid.focus_body()
+            self.set_status("Review the values, then export. Click a row to compare it with the limits.")
+        else:
+            if self._review_built:
+                self.review_page.grid_remove()
+            self.select_page.grid()
+            self.step = "select"
+            self._update_steps()
+
+    def _update_steps(self) -> None:
+        count = len(self.selected_components)
+        has_data = bool(self.scan_result and self.scan_result.grouped)
+        ready = has_data and count > 0
+        blocked = ready and bool(self._wrong_samples())
+        later = "Fix the file count first" if blocked else "Check the values, then save Excel"
+        if self.step == "review":
+            self.step_bar.set_step(0, "complete", f"{count} component{'s' if count != 1 else ''} selected")
+            self.step_bar.set_step(1, "current", later)
+        else:
+            self.step_bar.set_step(0, "current", "Folder, profile & components")
+            if not ready:
+                self.step_bar.set_step(1, "locked", "Scan, then select components")
+            else:
+                self.step_bar.set_step(1, "warn" if blocked else "ready", later)
+
     def _update_actions(self) -> None:
         """Reflect what is actionable and keep the running task's inputs stable."""
         ready = not self.is_busy
         has_data = bool(self.scan_result and self.scan_result.grouped)
         selected = self.selected_list.selected_indices()
-        controls = (
-            (self.export_button, ready and has_data and bool(self.selected_components)),
+        controls = [
             (self.add_button, ready and bool(self.available_list.selected_items())),
             (self.add_all_button, ready and bool(self.available_list.items())),
-            (self.remove_button, ready and bool(selected)),
             (self.clear_button, ready and bool(self.selected_components)),
             (self.move_up_button, ready and bool(selected) and selected[0] > 0),
             (self.move_down_button, ready and bool(selected) and selected[-1] < len(self.selected_components) - 1),
-        )
+            (self.review_button, ready and has_data and bool(self.selected_components)),
+        ]
+        if self._review_built:
+            controls += [
+                (self.export_button, ready and has_data and bool(self.selected_components) and not self._wrong_samples()),
+                (self.back_button, ready),
+            ]
         for button, enabled in controls:
             button.configure(state="normal" if enabled else "disabled")
+        self.available_list.set_enabled(ready)
+        self.selected_list.set_enabled(ready)
+        self._update_steps()
 
     def _apply_tag_colors(self) -> None:
-        self.preview_tree.tag_configure("invalid", foreground=self.palette.danger)
-        self.preview_tree.tag_configure("missing", foreground=self.palette.warn)
+        if not self._review_built:
+            return
+        p = self.palette
+        self.preview_grid.set_palette(p)
+        self.limits_grid.set_palette(p)
+        for swatch, level in self._swatches:
+            fill, line = (p.warn_bg, p.warn_line) if level == "warn" else (p.bad_bg, p.bad_line)
+            swatch.configure(bg=fill, highlightbackground=line)
+        self.check_chips.set_palette(p)
 
     # ------------------------------------------------------------------ theme
+    def _theme_button_text(self) -> str:
+        return "☀  Light mode" if resolve_mode(self.settings.theme) == "dark" else "☾  Dark mode"
+
+    def _toggle_theme(self) -> None:
+        self.dark_var.set(not self.dark_var.get())
+        self._on_theme_toggle()
+
     def _on_theme_toggle(self) -> None:
         self.settings.theme = "dark" if self.dark_var.get() else "light"
         self.palette = apply_theme(self, self.settings.theme)
+        self.theme_text_var.set(self._theme_button_text())
         self._apply_tag_colors()
         self._update_brand_logo()
+        self.step_bar.set_palette(self.palette)
+        self.available_list.set_palette(self.palette)
+        self.selected_list.set_palette(self.palette)
         save_settings(self.settings)
 
     # ------------------------------------------------------------------ helpers
@@ -577,9 +733,9 @@ class MainWindow(tk.Tk):
         profile = dict(self.profiles[profile_name])  # snapshot: later edits must not affect this scan
         self._remember_inputs()
         self._cancel.clear()
+        self._show_step("select")  # a new scan starts from the first step (the review of the old data no longer applies)
         self._set_busy(True, cancellable=True)
         self.set_status("Looking for log files…")
-        self.preview_tree.delete(*self.preview_tree.get_children())
 
         self.tasks.run(
             lambda report: scan_folder(folder, profile, self._cancel, progress=report),
@@ -607,6 +763,9 @@ class MainWindow(tk.Tk):
                       expected: int, repeats: int) -> None:
         self._set_busy(False)
         self.scan_result = result
+        self.limits = summarize_limits(result.grouped, result.components)  # the Min / Max columns and the limits panel
+        self._summary_key = None
+        self._review_row = 0
         self._preview_page = 0
         self.reviewed_duplicates = set()
 
@@ -619,7 +778,7 @@ class MainWindow(tk.Tk):
         self.files_var.set(f"{result.total_files:,}")
         self.components_var.set(f"{len(result.components):,}")
         self._refresh_lists()
-        self._refresh_preview()
+        self.available_list.reset_view()
 
         if not result.grouped:
             self._set_verdict("bad", "No usable data found.", details=False)
@@ -669,6 +828,9 @@ class MainWindow(tk.Tk):
 
     def _clear_results(self, status: str) -> None:
         self.scan_result = None
+        self.limits = {}
+        self._summary_key = None
+        self._review_row = 0
         self.selected_components = []
         self.reviewed_duplicates = set()
         for var in (self.samples_var, self.files_var, self.components_var):
@@ -677,8 +839,10 @@ class MainWindow(tk.Tk):
         self.verdict_label.configure(style="SurfaceMuted.TLabel")
         self.details_button.configure(state="disabled")
         self.search_var.set("")
+        self._show_step("select")
         self._refresh_lists()
-        self._refresh_preview()
+        if self._review_built:
+            self._refresh_preview()
         self.set_status(status)
 
     def reset_workflow(self) -> None:
@@ -688,7 +852,11 @@ class MainWindow(tk.Tk):
         self._clear_results("Ready. Choose a profile and a folder, then scan.")
 
     # ------------------------------------------------------------------ component lists
-    def _refresh_available(self) -> None:
+    def _limit_texts(self, component: str) -> tuple[str, str]:
+        info = self.limits.get(component, {})
+        return info.get("min") or "–", info.get("max") or "–"
+
+    def _refresh_available(self, *, reset_view: bool = False) -> None:
         components = self.scan_result.components if self.scan_result else []
         chosen = set(self.selected_components)
         keyword = self.search_var.get().strip().lower()
@@ -700,7 +868,9 @@ class MainWindow(tk.Tk):
             empty = "Every component is selected."
         else:
             empty = "No component matches the filter."
-        self.available_list.set_items(shown, empty_text=empty)
+        self.available_list.set_items(shown, empty_text=empty, values=[self._limit_texts(c) for c in shown])
+        if reset_view:
+            self.available_list.reset_view()
         if keyword:
             self.search_hint.place_forget()
         else:
@@ -715,7 +885,7 @@ class MainWindow(tk.Tk):
 
     def _refresh_selected(self) -> None:
         self.selected_list.set_items(
-            self.selected_components, empty_text="Double-click a component on the left,\nor select some and press Add →."
+            self.selected_components, empty_text="Press + on a component on the left,\nor double-click it."
         )
         count = len(self.selected_components)
         self.selected_info_var.set(f"{count} selected" if count else "No columns selected")
@@ -738,6 +908,19 @@ class MainWindow(tk.Tk):
     def add_all_shown(self) -> None:
         self._add(self.available_list.items())
 
+    def _add_at(self, index: int) -> None:
+        """The + button at the end of an available row."""
+        items = self.available_list.items()
+        if 0 <= index < len(items):
+            self._add([items[index]])
+
+    def _remove_at(self, index: int) -> None:
+        """The × button at the end of a selected row."""
+        if self.is_busy or not 0 <= index < len(self.selected_components):
+            return
+        del self.selected_components[index]
+        self._selection_changed()
+
     def _add(self, names: list[str]) -> None:
         if self.is_busy:
             return
@@ -756,6 +939,7 @@ class MainWindow(tk.Tk):
 
     def _on_duplicates_reviewed(self, reviewed: set[str], applied: bool) -> None:
         self.reviewed_duplicates |= reviewed
+        self._summary_key = None  # the chosen occurrences change values
         self.set_status(
             f"Duplicate choices applied for {len(reviewed)} component name(s)." if applied
             else f"Default duplicate choices kept for {len(reviewed)} component name(s)."
@@ -790,11 +974,20 @@ class MainWindow(tk.Tk):
         self._selection_changed()
         self.selected_list.select_indices([i + direction for i in indices])
 
-    # ------------------------------------------------------------------ preview
+    # ------------------------------------------------------------------ review (step 2)
     def _schedule_preview(self) -> None:
+        """Redraw the review a moment from now (a burst of changes becomes one redraw). Only while it is on screen."""
+        if self.step != "review" or not self._review_built:
+            return
         if self._preview_job is not None:
             self.after_cancel(self._preview_job)
-        self._preview_job = self.after(120, self._refresh_preview)
+        self._preview_job = self.after(120, self._refresh_review)
+
+    def _refresh_review(self) -> None:
+        self._ensure_review_page()
+        self._refresh_preview()
+        self._refresh_checks()
+        self._update_actions()
 
     def _update_pager(self, first: int, shown: int, total: int, pages: int) -> None:
         if pages <= 1:
@@ -809,66 +1002,143 @@ class MainWindow(tk.Tk):
         self._preview_page = max(0, self._preview_page + step)
         self._schedule_preview()
 
-    def _show_empty(self, message: str) -> None:
-        self.empty_label.configure(text=message)
-        self.empty_label.place(relx=0.5, rely=0.55, anchor="center")
-
     def _refresh_preview(self) -> None:
+        """The table of rows (one page of columns) and, beside it, the limits for the chosen row."""
+        self._ensure_review_page()
         self._preview_job = None
-        tree = self.preview_tree
-        tree.delete(*tree.get_children())
         result = self.scan_result
         components = list(self.selected_components)
+        self._preview_components = tuple(components)
+        self._preview_rows = []
 
-        # Only one page of columns is drawn (the table's cost grows with every column on screen).
+        # One page of columns at a time keeps the table readable; the export always has every column.
         pages = max(1, -(-len(components) // PREVIEW_COLUMNS_PER_PAGE))
         self._preview_page = max(0, min(self._preview_page, pages - 1))
         first = self._preview_page * PREVIEW_COLUMNS_PER_PAGE
         page = components[first : first + PREVIEW_COLUMNS_PER_PAGE]
         self._update_pager(first, len(page), len(components), pages)
-
-        columns = ["no", "sn", "file", *[f"c{i}" for i in range(len(page))]]
-        tree.configure(columns=columns, displaycolumns=columns)
-        headings = {"no": "No.", "sn": "Serial number", "file": "File", **{f"c{i}": name for i, name in enumerate(page)}}
-        for column, text in headings.items():
-            tree.heading(column, text=text)
-            tree.column(column, anchor={"no": "center", "sn": "w", "file": "w"}.get(column, "e"))
-        fit_tree_columns(tree, headings, [])  # headings only, until there are rows to measure
+        columns = [Column("No.", "center"), Column("Serial number"), Column("File"), *(Column(name, "e") for name in page)]
 
         if result is None or not result.grouped:
-            self._show_empty("Your data preview starts here.\nChoose a source folder, then scan its logs.")
+            self.preview_grid.set_table(columns, [], empty_text="Your data preview starts here.\nChoose a source folder, then scan its logs.")
             self.preview_info_var.set("The preview uses the same rows and column order as your Excel file.")
+            self.review_count_var.set("")
+            self._refresh_limits()
             return
-        if not components:
-            self._show_empty("Choose the measurements you need.\nAdd components in step 2 to build your Excel columns.")
-            self.preview_info_var.set(f"{result.total_files} files found")
-        else:
-            self.empty_label.place_forget()
 
         repeats = self._optional_int(self.repeats_var)
         wrong = set(result.sns_with_wrong_repeat_count(repeats)) if repeats else set()
-        shown = 0
-        any_missing = False
         table: list[tuple] = []
+        tags: list[str] = []
         for row in islice(iter_export_rows(result.grouped, components), PREVIEW_ROW_LIMIT):
             missing = bool(components) and MISSING_TEXT in row.values
-            any_missing = any_missing or missing
-            tags = ("invalid",) if row.sn in wrong else ("missing",) if missing else ()
-            values = (row.index, row.sn, row.filename, *row.values[first : first + PREVIEW_COLUMNS_PER_PAGE])
-            tree.insert("", tk.END, values=values, tags=tags)
-            table.append(values)
-            shown += 1
-        fit_tree_columns(tree, headings, table)  # each column as wide as its longest value, no wasted space
+            tags.append("invalid" if row.sn in wrong else "missing" if missing else "")
+            table.append((row.index, row.sn, row.filename, *row.values[first : first + PREVIEW_COLUMNS_PER_PAGE]))
+            self._preview_rows.append(row)
+        self.preview_grid.set_table(columns, table, tags)
 
+        shown = len(self._preview_rows)
+        self.review_count_var.set(f"({result.total_files} rows)")
         if components:
             note = f"Showing {shown} of {result.total_files} rows." if shown < result.total_files else f"{shown} rows."
             if pages > 1:
                 note += f"  The Excel file has all {len(components)} columns."
-            if wrong:
-                note += "  Red: sample has the wrong number of files."
-            if any_missing:
-                note += "  Amber: a value is missing."
             self.preview_info_var.set(note)
+        else:
+            self.preview_info_var.set(f"{result.total_files} files found. Add components in the Select step to build your Excel columns.")
+
+        if self._preview_rows:  # keep the row you were looking at, or start with the first
+            self._review_row = max(0, min(self._review_row, shown - 1))
+            self.preview_grid.select(self._review_row, notify=False)
+        self._refresh_limits()
+
+    def _on_preview_select(self, index: int) -> None:
+        if index != self._review_row:
+            self._review_row = index
+            self._refresh_limits()
+
+    def _refresh_limits(self) -> None:
+        """The limits panel: every selected component with the chosen row's value, judged against its limits."""
+        components = self._preview_components
+        if components != self._limit_components:  # a different selection
+            self._limit_components = components
+            self.limits_title_var.set(f"Limits ({len(components)})" if components else "Limits")
+            self._limit_columns = self._limit_column_layout(components)
+        if not 0 <= self._review_row < len(self._preview_rows):  # no row to compare: just the limits
+            self.review_row_var.set("Click a row to compare its values with the limits.")
+            rows = [(c, "", *self._limit_texts(c), self.limits.get(c, {}).get("unit", "")) for c in components]
+            self.limits_grid.set_table(self._limit_columns, rows)
+            return
+        row = self._preview_rows[self._review_row]
+        self.review_row_var.set(f"Row {row.index}   ·   {row.sn}   ·   {row.filename}")
+        rows: list[tuple[str, ...]] = []
+        tags: list[str] = []
+        for entry in limit_rows(row, components, self.limits):
+            mark = {HIGH: " ▲", LOW: " ▼"}.get(entry.status, "")
+            rows.append((entry.component, "–" if entry.status == MISSING else entry.value + mark,
+                         entry.low or "–", entry.high or "–", entry.unit))
+            tags.append("gap" if entry.status == MISSING else "out" if entry.status in (HIGH, LOW) else "")
+        self.limits_grid.set_table(self._limit_columns, rows, tags)
+
+    def _limit_column_layout(self, components: tuple[str, ...]) -> list[Column]:
+        """Wide enough for the longest limit and a value of the same size, so no number is ever cut off."""
+        grid = self.limits_grid
+        info = [self.limits.get(c, {}) for c in components]
+        lows, highs = [i.get("min", "") for i in info], [i.get("max", "") for i in info]
+        longest_number = max([*lows, *highs, "+000.0000E+00"], key=len)  # a value can have more digits than its limits
+        return [
+            Column("Component", "w", width=grid.scaled(80), stretch=True),  # the room left over; long names end in …
+            Column("Value", "e", width=grid.width_for("Value", [longest_number + " ▲"]) + grid.scaled(10)),  # room for ▲ / ▼
+            Column("Min", "e", width=grid.width_for("Min", lows)),
+            Column("Max", "e", width=grid.width_for("Max", highs)),
+            Column("Unit", "w", width=grid.width_for("Unit", [i.get("unit", "") for i in info])),
+        ]
+
+    def _review_summary(self) -> ReviewSummary | None:
+        """Empty cells and out-of-limit rows over every row (not just the ones the table shows); kept until the data changes."""
+        result = self.scan_result
+        if result is None or not result.grouped or not self.selected_components:
+            return None
+        key = (id(result), tuple(self.selected_components))
+        if key != self._summary_key:
+            self._summary = summarize_review(result.grouped, self.selected_components, self.limits)
+            self._summary_key = key
+        return self._summary
+
+    @staticmethod
+    def _row_list(rows: tuple[int, ...], shown: int = 6) -> str:
+        text = ", ".join(str(n) for n in rows[:shown])
+        return f"{'rows' if len(rows) > 1 else 'row'} {text}" + (f" … +{len(rows) - shown} more" if len(rows) > shown else "")
+
+    def _refresh_checks(self) -> None:
+        """The chips beside the Export button: what to know before saving."""
+        result = self.scan_result
+        summary = self._review_summary()
+        if result is None or summary is None:
+            self.check_chips.set_chips([])
+            return
+        expected, repeats = self._optional_int(self.expected_var), self._optional_int(self.repeats_var)
+        chips: list[tuple[str, str]] = []
+        if expected is not None:
+            found = result.total_sns
+            chips.append(("ok", f"✓  {found} of {expected} samples") if found == expected
+                         else ("warn", f"!  {found} of {expected} samples. You will be asked to confirm"))
+        if repeats is not None:
+            wrong = self._wrong_samples()
+            if not wrong:
+                chips.append(("ok", f"✓  {repeats} files per sample"))
+            elif len(wrong) == 1:
+                chips.append(("bad", f"!  {wrong[0]} has {len(result.grouped[wrong[0]])} files, not {repeats}. Export is blocked"))
+            else:
+                chips.append(("bad", f"!  {len(wrong)} samples do not have {repeats} files ({', '.join(wrong[:2])}…). Export is blocked"))
+        if summary.empty_cells:
+            count, columns = summary.empty_cells, len(summary.empty_columns)
+            chips.append(("warn", f"!  {count} empty cell{'s' if count != 1 else ''} in {columns} column{'s' if columns != 1 else ''}"))
+        else:
+            chips.append(("ok", "✓  No empty cells"))
+        if summary.outside_rows:
+            chips.append(("info", f"Outside min–max: {self._row_list(summary.outside_rows)}"))
+        self.check_chips.set_chips(chips)
 
     # ------------------------------------------------------------------ export
     def export_excel(self) -> None:

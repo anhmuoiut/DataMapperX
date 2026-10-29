@@ -229,7 +229,7 @@ class SampleWizard(Dialog):
         sn_row.columnconfigure(0, weight=1)
         self.sn_entry = UndoableEntry(sn_row, textvariable=self.vars["sn_example"], width=32)
         self.sn_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ttk.Button(sn_row, text="Use selection", style="Compact.TButton", command=self._mark_serial).grid(row=0, column=1)
+        ttk.Button(sn_row, text="Use selection", command=self._mark_serial).grid(row=0, column=1)
 
         self.rule_entries: dict[str, UndoableEntry] = {}
         for key, title in RULE_ROWS:
@@ -240,7 +240,7 @@ class SampleWizard(Dialog):
             entry.grid(row=row, column=0, sticky="ew", pady=(3, 10))
             entry.bind("<Key>", lambda _e, k=key: self._marks.pop(k, None), add="+")
             self.rule_entries[key] = entry
-            ttk.Button(rules, text="×", width=3, style="Compact.TButton", command=lambda k=key: self._clear_rule(k)).grid(
+            ttk.Button(rules, text="×", width=3, style="Icon.TButton", command=lambda k=key: self._clear_rule(k)).grid(
                 row=row, column=1, padx=(6, 0), pady=(3, 10)
             )
         row += 1
@@ -261,7 +261,7 @@ class SampleWizard(Dialog):
         buttons = ttk.Frame(right, style="Surface.TFrame")
         buttons.grid(row=1, column=0, sticky="w", pady=(6, 6))
         for column, (label, blank) in enumerate(MARK_BUTTONS):
-            ttk.Button(buttons, text=label, style="Compact.TButton", command=lambda b=blank: self._mark(b)).grid(
+            ttk.Button(buttons, text=label, command=lambda b=blank: self._mark(b)).grid(
                 row=0, column=column, padx=(0 if column == 0 else 4, 0)
             )
         view = ttk.Frame(right, style="Surface.TFrame")

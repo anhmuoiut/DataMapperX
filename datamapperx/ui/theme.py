@@ -25,15 +25,28 @@ class Palette:
     danger: str
     banner_bg: str
     banner_fg: str
+    on_accent: str  # text on a filled accent (the current step, a selected row)
+    soft: str  # column-heading strips and other quiet fills inside a card
+    pick: str  # the row you clicked
+    ok_bg: str
+    ok_line: str
+    warn_bg: str
+    warn_line: str
+    bad_bg: str
+    bad_line: str
 
 
 _LIGHT = Palette(
     mode="light", bg="#f3f6fa", surface="#ffffff", fg="#182536", muted="#526174", line="#dce3ec", accent="#005fb8",
     ok="#167347", warn="#915900", danger="#ba2836", banner_bg="#e8f2fd", banner_fg="#164b7a",
+    on_accent="#ffffff", soft="#f1f5f9", pick="#dcebfb",
+    ok_bg="#e7f6ed", ok_line="#a9d9bd", warn_bg="#fff4dc", warn_line="#efd08a", bad_bg="#fdecec", bad_line="#f0b4b4",
 )
 _DARK = Palette(
     mode="dark", bg="#151b24", surface="#1e2734", fg="#edf3fb", muted="#b0bfd0", line="#354459", accent="#73cbff",
     ok="#78d4a0", warn="#f0c475", danger="#ff9ba7", banner_bg="#203a52", banner_fg="#cdeaff",
+    on_accent="#122739", soft="#263244", pick="#27435f",
+    ok_bg="#173a2d", ok_line="#3c7058", warn_bg="#3b2f12", warn_line="#7a6224", bad_bg="#40191c", bad_line="#85383d",
 )
 
 
@@ -153,7 +166,7 @@ def configure_styles(root: tk.Tk, p: Palette) -> None:
     style.configure("Step.TLabel", background=p.surface, foreground=p.accent, font=("Segoe UI Semibold", 10))
     style.configure("Muted.TLabel", foreground=p.muted)
     style.configure("Hint.TLabel", foreground=p.muted, font=("Segoe UI", 9))
-    style.configure("Metric.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 20))
+    style.configure("Metric.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 18))
     style.configure("MetricCaption.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
     style.configure("Stat.TLabel", font=("Segoe UI Semibold", 16))
     style.configure("StatCaption.TLabel", foreground=p.muted, font=("Segoe UI", 9))
@@ -165,23 +178,15 @@ def configure_styles(root: tk.Tk, p: Palette) -> None:
 
     style.configure("Banner.TFrame", background=p.banner_bg)
     style.configure("Banner.TLabel", background=p.banner_bg, foreground=p.banner_fg)
-    style.configure("StepActive.TLabel", background=p.banner_bg, foreground=p.banner_fg, padding=(10, 5))
-    style.configure("StepIdle.TLabel", background=p.bg, foreground=p.muted, padding=(10, 5))
-    style.configure("Toolbar.TButton", padding=(10, 5))
-    style.configure("Compact.TButton", padding=(8, 5))
 
-    # Reuse the native accent elements and state maps; do not replace their focus / disabled rendering.
-    style.layout("Primary.TButton", style.layout("Accent.TButton"))
-    style.configure("Primary.TButton", **style.configure("Accent.TButton"))
-    style.map("Primary.TButton", **style.map("Accent.TButton"))
-    style.configure("Primary.TButton", font=("Segoe UI Semibold", 10), padding=(16, 9))
+    # One button look for the whole app: the theme's own button, its filled "Accent" version for the main action of
+    # a screen, and a square "Icon" version (the same button, just narrower) for arrows and the pager.
+    style.configure("Icon.TButton", padding=(4, 4))
+    style.configure("Pick.TLabel", background=p.pick, foreground=p.fg, padding=(10, 6))
 
-    selected_fg = "#122739" if p.mode == "dark" else "#ffffff"
     style.configure("Treeview", rowheight=28, background=p.surface, fieldbackground=p.surface, foreground=p.fg)
     style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(10, 8))
-    style.map("Treeview", background=[("selected", p.accent)], foreground=[("selected", selected_fg)])
-    style.configure("Component.Treeview", rowheight=30, indent=10, padding=4, borderwidth=0)
+    style.map("Treeview", background=[("selected", p.accent)], foreground=[("selected", p.on_accent)])
 
     # Placeholders blend into their actual control, including when a card uses a different surface.
     style.configure("EntryHint.TLabel", background=style.lookup("TEntry", "fieldbackground") or p.surface, foreground=p.muted)
-    style.configure("ListHint.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 10))

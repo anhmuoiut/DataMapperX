@@ -9,7 +9,9 @@ runs it before publishing anything.
 from __future__ import annotations
 
 import logging
+import shutil
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,7 @@ def _check_window(sample: Path) -> None:
     try:
         app.update()
         _require(bool(app.winfo_exists()), "the main window did not open")
+        _check_steps(app, sample.parent)
         manager = ProfileManager(app, app.profiles, lambda _name: None)
         wizard = SampleWizard(app, lambda _name, _profile: None, sample=sample)
         for _ in range(5):
@@ -91,3 +94,56 @@ def _check_window(sample: Path) -> None:
         manager.destroy()
     finally:
         app.destroy()
+
+
+def _wait(app, condition, what: str, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        app.update()
+        if condition():
+            return
+        time.sleep(0.01)
+    raise SmokeTestError(f"timed out waiting for {what}")
+
+
+def _check_steps(app, folder: Path) -> None:
+    """Scan the sample files, pick the component and walk through both steps of the window."""
+    from tkinter import messagebox
+
+    def refuse(*args, **kwargs):  # a dialog nobody can answer would hang the run
+        raise SmokeTestError(f"the window showed a dialog: {args[1:2]}")
+
+    logs = folder / "steps"  # only the two sample logs: the export written by the logic check must not be scanned
+    logs.mkdir(exist_ok=True)
+    for source in folder.glob("VSE000SMOKE_*.xlsx"):
+        shutil.copy(source, logs / source.name)
+    saved = {name: getattr(messagebox, name) for name in ("showinfo", "showwarning", "showerror", "askyesno")}
+    for name in saved:
+        setattr(messagebox, name, refuse)
+    try:
+        app.profile_var.set("Function Test Log")
+        app.folder_var.set(str(logs))
+        app.expected_var.set("1")
+        app.repeats_var.set("2")
+        app.scan_logs()
+        _wait(app, lambda: not app.is_busy and app.scan_result is not None, "the scan")
+        _require(app.scan_result.total_sns == 1, "the scan found the wrong files")
+        app.clear_selected()  # the data folder may remember the choice from an earlier run
+        _require("R1" in app.available_list.items(), "the window did not list the components")
+        _require(app.available_list._values[0] != ("–", "–"), "the component list did not show the limits")
+        app.add_all_shown()
+        _require(app.selected_components == ["R1"] and app.review_button.instate(["!disabled"]), "the component was not selected")
+        app._show_step("review")
+        app.update()
+        _require(app.step == "review" and len(app.preview_grid.rows()) == 2, "the review did not show the data")
+        _require(len(app.limits_grid.rows()) == 1 and app.check_chips.chips(), "the review did not show the limits")
+        for _ in range(2):  # dark and back again, so the setting it saves is the one it started with
+            app.dark_var.set(not app.dark_var.get())
+            app._on_theme_toggle()
+        app._show_step("select")
+        app.update()
+        _require(app.step == "select", "could not go back to the first step")
+        app.reset_workflow()
+    finally:
+        for name, original in saved.items():
+            setattr(messagebox, name, original)

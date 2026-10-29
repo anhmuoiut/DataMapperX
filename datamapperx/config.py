@@ -23,8 +23,8 @@ DEFAULT_REPEATS = "3"
 
 # Rows shown in the on-screen preview (the export always writes every row).
 PREVIEW_ROW_LIMIT = 500
-# Columns shown at once. Drawing a wide table costs time per column (about 17 ms each), so the preview is paged;
-# the export always writes every column.
+# Columns of the review table shown at once, so a very wide selection stays readable (the table itself scrolls
+# smoothly whatever its size); the export always writes every column.
 PREVIEW_COLUMNS_PER_PAGE = 20
 
 # Environment variable that relocates all user data (profiles, settings, log).
