@@ -1,17 +1,20 @@
-"""The main DataMapperX window: two steps, Select (folder, profile, components) then Review & Export."""
+"""The main DataMapperX window: Data Mapping (Select, then Review & Export) and, beside it, Validation & Reports."""
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
+import time
 import tkinter as tk
 import webbrowser
+from collections.abc import Callable
 from itertools import islice
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .. import updater
+from .. import access, updater
 from .._version import __version__
 from ..config import (
     APP_CREDIT,
@@ -22,8 +25,9 @@ from ..config import (
     PREVIEW_ROW_LIMIT,
 )
 from ..exporter import ExportRow, generate_excel, iter_export_rows, summarize_limits
+from ..grr import GrrResult, summarize_grr
 from ..models import ScanResult
-from ..paths import log_path, resource_path, user_data_dir
+from ..paths import is_frozen, log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
 from ..reporting import describe_empty_scan, full_report, summarize_scan
 from ..review import HIGH, LOW, MISSING, ReviewSummary, limit_rows, summarize_review
@@ -31,6 +35,7 @@ from ..sampling import suggest_profile
 from ..scanner import scan_folder
 from ..settings import Settings, load_settings, save_settings
 from ..utils import parse_positive_int
+from .access_dialog import AccessDialog
 from .controls import ActionList, ChipRow, Column, DataGrid, StepBar
 from .dialogs import AboutDialog, ExportDoneDialog, ReportDialog, open_path, set_window_icon
 from .duplicate_dialog import DuplicateDialog
@@ -38,6 +43,7 @@ from .profile_dialog import ProfileManager
 from .tasks import TaskRunner
 from .theme import Palette, apply_theme, resolve_mode, work_area
 from .update_dialog import UpdateDialog
+from .validation_workspace import MappingSource, ValidationWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +60,12 @@ SHORTCUTS = (
 )
 
 
+ENFORCE_ACCESS_ENV = "DATAMAPPERX_ENFORCE_ACCESS"  # set it to run the owner's off switch from a source checkout too
+
+
 class MainWindow(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, *, background_checks: bool = True) -> None:
+        """``background_checks=False`` keeps the window off the network (tests and the build's self-test)."""
         super().__init__()
         self.withdraw()
         self.settings: Settings = load_settings()
@@ -69,6 +79,11 @@ class MainWindow(tk.Tk):
         self.is_busy = False
         self._cancel = threading.Event()
         self.step = "select"  # "select" or "review"
+        self.workspace = "mapping"  # "mapping" (the two steps) or "validation"
+        self.validation: ValidationWorkspace | None = None  # built the first time it is opened
+        self._data_serial = 0  # moves whenever the scanned data (or the choice among duplicates) changes
+        self._scan_serial = 0  # moves with every new scan (or reset), never for a duplicate choice
+        self._scan_description = ""
         self._review_built = False  # the review page is built when first needed, so the window opens sooner
         self._review_row = 0  # the preview row whose values the limits panel shows
         self._preview_rows: list[ExportRow] = []
@@ -78,10 +93,15 @@ class MainWindow(tk.Tk):
         self._swatches: list[tuple[tk.Frame, str]] = []
         self._summary: ReviewSummary | None = None
         self._summary_key: tuple | None = None
+        self._grr_results: list[GrrResult] = []
+        self._grr_key: tuple | None = None
         self._preview_job: str | None = None
         self._preview_page = 0
         self._progress_determinate = False
         self._update_info: updater.UpdateInfo | None = None
+        self._access_dialog: AccessDialog | None = None
+        # The owner's off switch applies to the program people were given, not to a developer's source checkout.
+        self._enforce_access = background_checks and (is_frozen() or bool(os.environ.get(ENFORCE_ACCESS_ENV)))
 
         self.title(APP_TITLE)
         set_window_icon(self)
@@ -121,14 +141,20 @@ class MainWindow(tk.Tk):
         self._refresh_lists()
 
         self.search_var.trace_add("write", lambda *_: self._refresh_available(reset_view=True))
-        self.repeats_var.trace_add("write", lambda *_: self._schedule_preview())
+        self.repeats_var.trace_add("write", lambda *_: (self._schedule_preview(), self._notify_validation()))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.report_callback_exception = self._on_callback_error  # type: ignore[method-assign]
 
         self.after_idle(self._ensure_review_page)  # once the window is on screen
         self.deiconify()
-        if self.settings.check_updates:
-            self.after(1500, self._check_for_update)
+        if self._enforce_access:
+            now = time.time()
+            access.begin(self.settings, now)
+            block = access.current_block(self.settings, now)
+            if block:  # a copy that was told to stop stays stopped, even before the network answers
+                self.after(150, lambda: self._apply_access(block))
+        if background_checks:
+            self.after(1500, self._start_checks)
         self.after(5000, updater.cleanup_update_leftovers)
 
     # ------------------------------------------------------------------ window basics
@@ -178,9 +204,9 @@ class MainWindow(tk.Tk):
         s.check_updates = bool(self.auto_update_var.get())
 
     def _bind_shortcuts(self) -> None:
-        self.bind("<Control-o>", lambda _e: self.pick_folder())
-        self.bind("<Control-Return>", lambda _e: self.scan_logs())
-        self.bind("<F5>", lambda _e: self.scan_logs())
+        self.bind("<Control-o>", lambda _e: self._in_mapping(self.pick_folder))
+        self.bind("<Control-Return>", lambda _e: self._in_mapping(self.scan_logs))
+        self.bind("<F5>", lambda _e: self._in_mapping(self.scan_logs))
         self.bind("<Control-e>", lambda _e: self._export_shortcut())
         self.bind("<Escape>", lambda _e: self._cancel_scan() if self.is_busy else None)
 
@@ -188,10 +214,13 @@ class MainWindow(tk.Tk):
         """Ctrl+E: from the first step go and review; from the review step export."""
         if self.is_busy:
             return
-        if self.step == "review":
-            self.export_excel()
-        else:
-            self._show_step("review")
+        self._in_mapping(lambda: self.export_excel() if self.step == "review" else self._show_step("review"))
+
+    def _in_mapping(self, action: Callable[[], None]) -> None:
+        """Shortcuts that belong to Data Mapping bring it back first, so nothing happens out of sight."""
+        if self.workspace != "mapping":
+            self._show_workspace("mapping")
+        action()
 
     # ------------------------------------------------------------------ UI construction
     def _build_ui(self) -> None:
@@ -199,8 +228,17 @@ class MainWindow(tk.Tk):
         self.rowconfigure(3, weight=1)
         self._build_header()
         self._build_banner()
-        self.step_bar = StepBar(self, self.palette, ("Select", "Review & Export"), self._on_step_clicked)
-        self.step_bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(2, 8))
+        nav = ttk.Frame(self)
+        nav.grid(row=2, column=0, sticky="ew", padx=18, pady=(2, 8))
+        nav.columnconfigure(1, weight=1)
+        switch = ttk.Frame(nav)
+        switch.grid(row=0, column=0, sticky="w", padx=(0, 14))
+        self.mapping_switch = ttk.Button(switch, text="Data Mapping", command=lambda: self._show_workspace("mapping"))
+        self.mapping_switch.pack(side="left", padx=(0, 6))
+        self.validation_switch = ttk.Button(switch, text="Validation & Reports", command=lambda: self._show_workspace("validation"))
+        self.validation_switch.pack(side="left")
+        self.step_bar = StepBar(nav, self.palette, ("Select", "Review & Export"), self._on_step_clicked)
+        self.step_bar.grid(row=0, column=1, sticky="ew")
 
         self.content_frame = ttk.Frame(self)
         self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 0))
@@ -221,13 +259,21 @@ class MainWindow(tk.Tk):
         lists.columnconfigure(1, weight=1, uniform="lists")
         self._build_available(lists)
         self._build_selected(lists)
+        self._busy_widgets.append(self.validation_switch)
 
         # Step 2 is built the first time it is needed (see _ensure_review_page).
         self.review_page = ttk.Frame(self.content_frame)
         self.review_page.grid(row=0, column=0, sticky="nsew")
         self.review_page.grid_remove()
+        # Validation & Reports is built the first time it is opened (see _ensure_validation_page).
+        self.validation_page = ttk.Frame(self.content_frame)
+        self.validation_page.grid(row=0, column=0, sticky="nsew")
+        self.validation_page.rowconfigure(0, weight=1)
+        self.validation_page.columnconfigure(0, weight=1)
+        self.validation_page.grid_remove()
         self._build_statusbar()
         self._update_steps()
+        self._update_switch()
 
     def _build_header(self) -> None:
         header = ttk.Frame(self, padding=(20, 10, 20, 6))
@@ -255,7 +301,7 @@ class MainWindow(tk.Tk):
         menu_button = ttk.Menubutton(right, text="Help")
         menu = tk.Menu(menu_button, tearoff=False)
         menu.add_command(label="Check for updates…", command=lambda: self._check_for_update(manual=True))
-        menu.add_checkbutton(label="Check for updates at startup", variable=self.auto_update_var, command=self._remember_inputs)
+        menu.add_checkbutton(label="Tell me about new versions", variable=self.auto_update_var, command=self._remember_inputs)
         menu.add_separator()
         menu.add_command(label="Keyboard shortcuts", command=self._show_shortcuts)
         menu.add_command(label="Open data folder", command=lambda: open_path(user_data_dir()))
@@ -429,6 +475,11 @@ class MainWindow(tk.Tk):
 
     def _build_review(self, page: ttk.Frame) -> None:
         """Step 2: the data as it will be exported, the limits beside it, and the checks with the Export button."""
+        outer_page = page
+        outer_page.rowconfigure(0, weight=1)
+        outer_page.columnconfigure(0, weight=1)
+        page = ttk.Frame(outer_page)
+        page.grid(row=0, column=0, sticky="nsew")
         page.rowconfigure(0, weight=1)
         page.columnconfigure(0, weight=1)
         page.columnconfigure(1, minsize=480)
@@ -462,7 +513,10 @@ class MainWindow(tk.Tk):
             swatch.grid(row=0, column=column * 2, padx=(0 if column == 0 else 16, 6))
             ttk.Label(legend, text=text, style="SurfaceHint.TLabel").grid(row=0, column=column * 2 + 1)
             self._swatches.append((swatch, level))
-        self.preview_grid = DataGrid(card, self.palette, on_select=self._on_preview_select)
+        self.preview_grid = DataGrid(
+            card, self.palette, on_select=self._on_preview_select,
+            on_activate=lambda _index: self.review_side_tabs.select(self.limits_page),
+        )
         self.preview_grid.grid(row=3, column=0, sticky="nsew")
         self.preview_info_label = ttk.Label(card, textvariable=self.preview_info_var, style="SurfaceHint.TLabel", wraplength=500, justify="left")
         self.preview_info_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
@@ -471,8 +525,15 @@ class MainWindow(tk.Tk):
             self.preview_info_label.configure(wraplength=max(180, event.width - 32)),
         ))
 
-        side = ttk.Frame(page, style="Surface.TFrame", padding=CARD_PADDING)
-        side.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+        self.review_side_tabs = ttk.Notebook(page)
+        self.review_side_tabs.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+        self.grr_page = ttk.Frame(self.review_side_tabs, style="Surface.TFrame", padding=CARD_PADDING)
+        self.review_side_tabs.add(self.grr_page, text="GRR pre-check")
+        self._build_grr_review(self.grr_page)
+
+        side = ttk.Frame(self.review_side_tabs, style="Surface.TFrame", padding=CARD_PADDING)
+        self.limits_page = side
+        self.review_side_tabs.add(side, text="Limits")
         side.rowconfigure(2, weight=1)
         side.columnconfigure(0, weight=1)
         ttk.Label(side, textvariable=self.limits_title_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
@@ -487,8 +548,8 @@ class MainWindow(tk.Tk):
         self.limits_hint.grid(row=3, column=0, sticky="w", pady=(8, 0))
         side.bind("<Configure>", lambda event: self.limits_hint.configure(wraplength=max(180, event.width - 32)))
 
-        bar = ttk.Frame(page, style="Surface.TFrame", padding=(14, 10))
-        bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+        bar = ttk.Frame(outer_page, style="Surface.TFrame", padding=(14, 10))
+        bar.grid(row=1, column=0, sticky="ew", pady=(6, 6))
         bar.columnconfigure(0, weight=1)
         self.check_chips = ChipRow(bar, self.palette)
         self.check_chips.grid(row=0, column=0, sticky="ew", padx=(0, 12))
@@ -496,9 +557,50 @@ class MainWindow(tk.Tk):
         buttons.grid(row=0, column=1, sticky="e")
         self.back_button = ttk.Button(buttons, text="←  Back", command=lambda: self._show_step("select"))
         self.back_button.pack(side="left", padx=(0, 8))
+        self.validate_button = ttk.Button(buttons, text="Validation & Reports  →", command=lambda: self._show_workspace("validation"))
+        self.validate_button.pack(side="left", padx=(0, 8))
         self.export_button = ttk.Button(buttons, text="Export Excel…", style="Accent.TButton", command=self.export_excel)
         self.export_button.pack(side="left")
-        self._busy_widgets += [self.back_button, self.export_button]
+        self._busy_widgets += [self.back_button, self.validate_button, self.export_button]
+
+    def _build_grr_review(self, page: ttk.Frame) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(3, weight=1)
+        ttk.Label(page, text="Total Gage R&R", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        method = ttk.Label(
+            page, style="SurfaceHint.TLabel", justify="left", wraplength=430,
+            text="A quick check before you export: one-way ANOVA by SN, 6 × SD, each file a repeat, one operator/fixture.\n"
+                 "The colours compare the figures with reference thresholds. They are not a statistical conclusion; "
+                 "Minitab reports the figures without a verdict.",
+        )
+        method.grid(row=1, column=0, sticky="w", pady=(6, 8))
+        legend = ttk.Frame(page, style="Surface.TFrame")
+        legend.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.grr_legend_tiles = []
+        for column, (level, title, bounds) in enumerate((
+            ("pass", "PASS", "≤10%\nNDC ≥5"),
+            ("caution", "CONDITION", ">10% to 30%\nNDC: —"),
+            ("fail", "FAIL", ">30%\nNDC <5"),
+        )):
+            legend.columnconfigure(column, weight=1, uniform="grr_status")
+            tile = tk.Frame(legend, highlightthickness=1, padx=4, pady=5)
+            tile.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0))
+            title_label = tk.Label(tile, text=title, font=("Segoe UI Semibold", 9))
+            title_label.pack(fill="x")
+            bounds_label = tk.Label(tile, text=bounds, font=("Segoe UI", 9), justify="center")
+            bounds_label.pack(fill="x")
+            self.grr_legend_tiles.append((tile, title_label, bounds_label, level))
+        self.grr_grid = DataGrid(page, self.palette, font_size=9, row_height=30, padding=8, on_select=self._on_grr_select)
+        self.grr_grid.grid(row=3, column=0, sticky="nsew")
+        self.grr_summary_var = tk.StringVar()
+        summary = ttk.Label(page, textvariable=self.grr_summary_var, style="SurfaceHint.TLabel", justify="left", wraplength=430)
+        summary.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.grr_detail_var = tk.StringVar(value="Select a test to see its Study Var and calculation notes.")
+        detail = ttk.Label(page, textvariable=self.grr_detail_var, style="SurfaceHint.TLabel", justify="left", wraplength=430)
+        detail.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        page.bind("<Configure>", lambda event: [
+            label.configure(wraplength=max(180, event.width - 32)) for label in (method, summary, detail)
+        ])
 
     def _ensure_review_page(self) -> None:
         """Build step 2 the first time it is needed (shortly after start-up, or when something asks for it)."""
@@ -536,6 +638,8 @@ class MainWindow(tk.Tk):
             self._show_step("select" if index == 0 else "review")
 
     def _show_step(self, step: str) -> None:
+        if self.workspace != "mapping":
+            self._show_workspace("mapping")
         if step == "review":
             if not self._review_ready():
                 self.set_status("Scan a folder and add at least one component first.")
@@ -545,14 +649,67 @@ class MainWindow(tk.Tk):
             self.review_page.grid()
             self.step = "review"
             self._refresh_review()
+            self.review_side_tabs.select(self.grr_page)
             self.preview_grid.focus_body()
-            self.set_status("Review the values, then export. Click a row to compare it with the limits.")
+            self.set_status("Preview your data, then export Excel. Validation & Reports is optional and works on a copy of the data.")
         else:
             if self._review_built:
                 self.review_page.grid_remove()
             self.select_page.grid()
             self.step = "select"
             self._update_steps()
+
+    def _mapping_source(self) -> MappingSource | None:
+        """What Validation & Reports may analyse: the scan and the components chosen in Data Mapping."""
+        result = self.scan_result
+        if result is None or not result.grouped or not self.selected_components:
+            return None
+        return MappingSource(result.grouped, tuple(self.selected_components), self._optional_int(self.repeats_var),
+                             self._data_serial, self._scan_description, self._scan_serial)
+
+    def _data_changed(self) -> None:
+        """The scanned data, the chosen components or the choice among duplicates changed."""
+        self._data_serial += 1
+        self._notify_validation()
+
+    def _notify_validation(self) -> None:
+        if self.validation is not None:
+            self.validation.source_changed()
+
+    def _ensure_validation_page(self) -> None:
+        if self.validation is None:
+            self.validation = ValidationWorkspace(self.validation_page, self.palette, settings=self.settings,
+                                                  save_settings=lambda: save_settings(self.settings), source=self._mapping_source)
+            self.validation.grid(row=0, column=0, sticky="nsew")
+            self.validation.set_palette(self.palette)
+
+    def _show_workspace(self, name: str) -> None:
+        if name == self.workspace:
+            return
+        if name == "validation":
+            if self.is_busy:
+                return
+            self._ensure_validation_page()
+            self.select_page.grid_remove()
+            if self._review_built:
+                self.review_page.grid_remove()
+            self.step_bar.grid_remove()
+            self.validation_page.grid()
+            self.workspace = "validation"
+            self.validation.on_show()
+            self.set_status("Validation & Reports works on a copy of the data. Data Mapping and the Excel export are not affected.")
+        else:
+            self.validation_page.grid_remove()
+            self.step_bar.grid()
+            (self.review_page if self.step == "review" and self._review_built else self.select_page).grid()
+            self.workspace = "mapping"
+            self._update_steps()
+            self.set_status("Ready." if self.step == "select" else "Preview your data, then export Excel.")
+        self._update_switch()
+
+    def _update_switch(self) -> None:
+        self.mapping_switch.configure(style="Accent.TButton" if self.workspace == "mapping" else "TButton")
+        self.validation_switch.configure(style="Accent.TButton" if self.workspace == "validation" else "TButton")
 
     def _update_steps(self) -> None:
         count = len(self.selected_components)
@@ -600,6 +757,16 @@ class MainWindow(tk.Tk):
         p = self.palette
         self.preview_grid.set_palette(p)
         self.limits_grid.set_palette(p)
+        self.grr_grid.set_palette(p)
+        legend_colors = {
+            "pass": (p.ok_bg, p.ok_line, p.ok), "caution": (p.warn_bg, p.warn_line, p.warn),
+            "fail": (p.bad_bg, p.bad_line, p.danger),
+        }
+        for tile, title, bounds, level in self.grr_legend_tiles:
+            fill, line, ink = legend_colors[level]
+            tile.configure(bg=fill, highlightbackground=line)
+            for label in (title, bounds):
+                label.configure(bg=fill, fg=ink)
         for swatch, level in self._swatches:
             fill, line = (p.warn_bg, p.warn_line) if level == "warn" else (p.bad_bg, p.bad_line)
             swatch.configure(bg=fill, highlightbackground=line)
@@ -618,6 +785,8 @@ class MainWindow(tk.Tk):
         self.palette = apply_theme(self, self.settings.theme)
         self.theme_text_var.set(self._theme_button_text())
         self._apply_tag_colors()
+        if self.validation is not None:
+            self.validation.set_palette(self.palette)
         self._update_brand_logo()
         self.step_bar.set_palette(self.palette)
         self.available_list.set_palette(self.palette)
@@ -763,8 +932,11 @@ class MainWindow(tk.Tk):
                       expected: int, repeats: int) -> None:
         self._set_busy(False)
         self.scan_result = result
+        self._scan_serial += 1
+        self._scan_description = f"Data Mapping scan of {folder} (profile {profile_name})"
         self.limits = summarize_limits(result.grouped, result.components)  # the Min / Max columns and the limits panel
         self._summary_key = None
+        self._grr_key = None
         self._review_row = 0
         self._preview_page = 0
         self.reviewed_duplicates = set()
@@ -779,6 +951,7 @@ class MainWindow(tk.Tk):
         self.components_var.set(f"{len(result.components):,}")
         self._refresh_lists()
         self.available_list.reset_view()
+        self._data_changed()
 
         if not result.grouped:
             self._set_verdict("bad", "No usable data found.", details=False)
@@ -828,8 +1001,10 @@ class MainWindow(tk.Tk):
 
     def _clear_results(self, status: str) -> None:
         self.scan_result = None
+        self._scan_serial += 1
         self.limits = {}
         self._summary_key = None
+        self._grr_key = None
         self._review_row = 0
         self.selected_components = []
         self.reviewed_duplicates = set()
@@ -843,6 +1018,8 @@ class MainWindow(tk.Tk):
         self._refresh_lists()
         if self._review_built:
             self._refresh_preview()
+            self._refresh_grr()
+        self._data_changed()
         self.set_status(status)
 
     def reset_workflow(self) -> None:
@@ -901,6 +1078,7 @@ class MainWindow(tk.Tk):
             self.settings.component_sets[profile] = list(self.selected_components)
         self._refresh_lists()
         self._schedule_preview()
+        self._notify_validation()
 
     def add_components(self) -> None:
         self._add(self.available_list.selected_items())
@@ -940,6 +1118,8 @@ class MainWindow(tk.Tk):
     def _on_duplicates_reviewed(self, reviewed: set[str], applied: bool) -> None:
         self.reviewed_duplicates |= reviewed
         self._summary_key = None  # the chosen occurrences change values
+        self._grr_key = None
+        self._data_changed()
         self.set_status(
             f"Duplicate choices applied for {len(reviewed)} component name(s)." if applied
             else f"Default duplicate choices kept for {len(reviewed)} component name(s)."
@@ -987,7 +1167,57 @@ class MainWindow(tk.Tk):
         self._ensure_review_page()
         self._refresh_preview()
         self._refresh_checks()
+        self._refresh_grr()
         self._update_actions()
+
+    def _refresh_grr(self) -> None:
+        """Assess each selected test over every SN and repeat, independently of the preview row limit."""
+        result = self.scan_result
+        components = tuple(self.selected_components)
+        repeats = self._optional_int(self.repeats_var)
+        key = (id(result), components, repeats)
+        if key != self._grr_key:
+            self._grr_results = summarize_grr(result.grouped, components, repeats) if result and result.grouped else []
+            self._grr_key = key
+        rows = []
+        tags: dict[tuple[int, int], str] = {}
+        levels = {"PASS": "pass", "CAUTION": "caution", "FAIL": "fail", "NOT EVALUATED": "neutral"}
+        for index, entry in enumerate(self._grr_results):
+            cells = []
+            for column, (value, status) in enumerate((
+                (entry.percent_study_var, entry.study_status), (entry.percent_tolerance, entry.tolerance_status),
+            ), start=1):
+                cells.append(f"{value:.2f}" if value is not None else "N/A")
+                tags[index, column] = levels[status]
+            cells.append(str(entry.ndc) if entry.ndc is not None else "N/A")
+            tags[index, 3] = levels[entry.ndc_status]
+            rows.append((entry.component, *cells))
+        self.grr_grid.set_table(
+            [Column("Test", width=self.grr_grid.scaled(140), stretch=True), Column("%Study Var", "e"),
+             Column("%SV/Tol", "e"), Column("NDC", "center")],
+            rows, cell_tags=tags, empty_text="Select tests to calculate their GRR pre-check.",
+        )
+        self.grr_summary_var.set(f"{len(rows)} test item{'s' if len(rows) != 1 else ''}" if rows else "")
+        if rows:
+            selected = self.grr_grid.selected_index()
+            selected = selected if selected is not None else 0
+            self.grr_grid.select(selected, notify=False)
+            self._on_grr_select(selected)
+        else:
+            self.grr_detail_var.set("Select a test to see its Study Var and calculation notes.")
+
+    def _on_grr_select(self, index: int) -> None:
+        if not 0 <= index < len(self._grr_results):
+            return
+        entry = self._grr_results[index]
+        repeat_text = str(entry.repeats) if entry.repeats is not None else "unequal"
+        lines = [entry.component, f"{entry.parts} samples × {repeat_text} repeats"]
+        if entry.study_var is not None:
+            variation = f"{entry.study_var:.2e}" if 0 < abs(entry.study_var) < 0.01 else f"{entry.study_var:.2f}"
+            lines.append(f"Study Var (6 × SD): {variation} {entry.unit}".rstrip())
+        if entry.note:
+            lines.append(entry.note)
+        self.grr_detail_var.set("\n".join(lines))
 
     def _update_pager(self, first: int, shown: int, total: int, pages: int) -> None:
         if pages <= 1:
@@ -1056,6 +1286,7 @@ class MainWindow(tk.Tk):
         if index != self._review_row:
             self._review_row = index
             self._refresh_limits()
+        self.review_side_tabs.select(self.limits_page)
 
     def _refresh_limits(self) -> None:
         """The limits panel: every selected component with the chosen row's value, judged against its limits."""
@@ -1207,6 +1438,54 @@ class MainWindow(tk.Tk):
         self.set_status("Export failed.")
         messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
+    # ------------------------------------------------------------------ access (the owner's off switch)
+    def _start_checks(self) -> None:
+        """Runs a moment after start-up so the first paint is not competing with the network."""
+        if self._enforce_access:
+            self.verify_access(then=self._check_for_update)  # a copy that may not run is not offered an update
+            self.after(access.RECHECK_MS, self._recheck_access)
+        else:
+            self._check_for_update()
+
+    def _recheck_access(self) -> None:
+        self.verify_access()
+        self.after(access.RECHECK_MS, self._recheck_access)
+
+    def verify_access(self, then: Callable[[], None] | None = None) -> None:
+        """Read status.json in the background. ``then`` runs if the program may be used afterwards."""
+
+        def finish(block: access.Block | None, detail: str = "") -> None:
+            save_settings(self.settings)
+            self._apply_access(block, detail)
+            if block is None and then is not None:
+                then()
+
+        def on_status(status: updater.Status) -> None:
+            finish(access.record_status(self.settings, status, time.time()))
+
+        def on_error(exc: BaseException) -> None:
+            logger.info("Status check failed: %s", exc)
+            # No answer is not permission: whatever was decided before still stands, until the grace period ends.
+            finish(access.current_block(self.settings, time.time()), f"Could not check: {exc}")
+
+        self.tasks.run(lambda _report: updater.fetch_status(), on_success=on_status, on_error=on_error)
+
+    def _apply_access(self, block: access.Block | None, detail: str = "") -> None:
+        dialog = self._access_dialog
+        open_now = dialog is not None and bool(dialog.winfo_exists())
+        if block is None:
+            if open_now:
+                dialog.destroy()  # type: ignore[union-attr]
+            self._access_dialog = None
+        elif open_now:
+            dialog.show(block, detail)  # type: ignore[union-attr]
+        else:
+            logger.warning("This copy may not be used (%s)", block.kind)
+            self._access_dialog = AccessDialog(self, block, detail)
+
+    def exit_app(self) -> None:
+        self._on_close()
+
     # ------------------------------------------------------------------ updates
     def _check_for_update(self, manual: bool = False) -> None:
         if manual:
@@ -1228,7 +1507,7 @@ class MainWindow(tk.Tk):
         if info.is_mandatory_for(__version__):
             UpdateDialog(self, info, mandatory=True)
             return
-        if manual or info.version != self.settings.skipped_version:
+        if manual or (self.settings.check_updates and info.version != self.settings.skipped_version):
             self.banner_label.configure(text=f"Version {info.version} is available. You are running {__version__}.")
             self.banner.grid()
         if manual:

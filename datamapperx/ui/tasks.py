@@ -2,10 +2,15 @@
 
 Tkinter is not thread-safe, so worker threads never touch widgets or call ``after()``.
 They put messages on a queue and the main thread drains it on a short timer.
+
+While tasks run, the cyclic garbage collector is paused. Python may otherwise run it on a worker thread, and it then
+finalizes Tk objects (a ``tkinter.font.Font``) from that thread. Tk answers a call from another thread by waiting for
+the main thread; with no main loop running that wait ends only after about a second, for every such object.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 import queue
 import threading
@@ -16,6 +21,25 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _POLL_MS = 40
+_running = 0  # tasks on any runner; the collector comes back when the last one has been delivered
+_lock = threading.Lock()
+
+
+def _task_started() -> None:
+    global _running
+    with _lock:
+        _running += 1
+        if _running == 1:
+            gc.collect()  # on the main thread, before any worker starts
+            gc.disable()
+
+
+def _task_finished() -> None:
+    global _running
+    with _lock:
+        _running = max(0, _running - 1)
+        if _running == 0:
+            gc.enable()
 
 
 class TaskRunner:
@@ -51,6 +75,7 @@ class TaskRunner:
                 self._queue.put((None, ()))  # marks completion
 
         self._active += 1
+        _task_started()
         threading.Thread(target=target, daemon=True, name="dmx-task").start()
         self._ensure_polling()
 
@@ -65,6 +90,7 @@ class TaskRunner:
                 callback, args = self._queue.get_nowait()
                 if callback is None:
                     self._active -= 1
+                    _task_finished()
                     continue
                 try:
                     callback(*args)

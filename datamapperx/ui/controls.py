@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import tkinter as tk
 import tkinter.font as tkfont
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from tkinter import ttk
 
@@ -441,7 +441,8 @@ class DataGrid(ttk.Frame):
     ``ttk.Treeview`` repaints every visible cell, and the heading cells too, on every scroll step, which with the Sun
     Valley theme costs 100 ms or more. This grid draws plain text on a canvas and only for the rows and columns in view,
     so a step costs a few milliseconds. One row can be selected (click, or the arrow keys); rows can carry a tag that
-    tints them: ``invalid`` / ``out`` (red) or ``missing`` / ``gap`` (amber).
+    tints them: ``invalid`` / ``out`` (red) or ``missing`` / ``gap`` (amber). Individual cells can carry
+    ``pass``, ``caution``, ``fail`` or ``neutral`` tints, which remain visible when their row is selected.
     """
 
     ROW_HEIGHT = 28
@@ -456,6 +457,7 @@ class DataGrid(ttk.Frame):
         palette: Palette,
         *,
         on_select: Callable[[int], None] | None = None,
+        on_activate: Callable[[int], None] | None = None,
         font_size: int = 10,
         row_height: int | None = None,
         padding: int = 12,
@@ -463,6 +465,7 @@ class DataGrid(ttk.Frame):
         super().__init__(master, style="Surface.TFrame")
         self.palette = palette
         self._on_select = on_select
+        self._on_activate = on_activate
         self._scale = max(1.0, self.winfo_fpixels("1i") / 96)
         self._row_design = row_height or self.ROW_HEIGHT
         self._padding = padding  # between a cell's edge and its text
@@ -473,6 +476,7 @@ class DataGrid(ttk.Frame):
         self._widths: list[int] = []
         self._rows: list[tuple[str, ...]] = []
         self._tags: list[str] = []
+        self._cell_tags: dict[tuple[int, int], str] = {}
         self._selected: int | None = None
         self._hover: int | None = None
         self._yoff = 0
@@ -532,8 +536,13 @@ class DataGrid(ttk.Frame):
         rows: Sequence[Sequence[object]],
         tags: Sequence[str] | None = None,
         empty_text: str = "",
+        *,
+        cell_tags: Mapping[tuple[int, int], str] | None = None,
     ) -> None:
-        """Replace the whole table. ``empty_text`` fills the grid while there are no rows."""
+        """Replace the whole table. ``empty_text`` fills an empty grid.
+
+        ``cell_tags`` uses zero-based (row, column) keys; omitted cell tags are cleared.
+        """
         columns = list(columns)
         rows = [tuple("" if value is None else str(value) for value in row) for row in rows]
         if tags is not None and len(tags) != len(rows):
@@ -544,6 +553,7 @@ class DataGrid(ttk.Frame):
             self._xoff = 0
         self._columns, self._rows, self._empty_text, self._widths = columns, rows, empty_text, widths
         self._tags = list(tags) if tags is not None else [""] * len(rows)
+        self._cell_tags = dict(cell_tags) if cell_tags is not None else {}
         if self._selected is not None and self._selected >= len(rows):
             self._selected = None
         self._hover = None
@@ -556,6 +566,9 @@ class DataGrid(ttk.Frame):
 
     def tags(self) -> list[str]:
         return list(self._tags)
+
+    def cell_tags(self) -> dict[tuple[int, int], str]:
+        return dict(self._cell_tags)
 
     def headings(self) -> list[str]:
         return [column.title for column in self._columns]
@@ -730,16 +743,28 @@ class DataGrid(ttk.Frame):
         row_h = self._row_height()
         widths = self._effective_widths(width)
         columns = self._visible_columns(widths, width)
+        cell_colors = {
+            "pass": (p.ok_bg, p.ok), "caution": (p.warn_bg, p.warn),
+            "fail": (p.bad_bg, p.danger), "neutral": (p.soft, p.muted),
+        }
         for index in range(self._yoff // row_h, min(len(self._rows), (self._yoff + height) // row_h + 1)):
             top = index * row_h - self._yoff
             fill, ink = self._row_colors(index)
             if fill != p.surface:  # a plain row is just the canvas background
                 canvas.tk.call(canvas._w, "create", "rectangle", 0, top, width, top + row_h, "-fill", fill, "-outline", "")
-            canvas.tk.call(canvas._w, "create", "line", 0, top + row_h - 1, width, top + row_h - 1, "-fill", p.line)
             row, middle = self._rows[index], top + row_h / 2
             for column, left in columns:
+                cell_ink = ink
+                colors = cell_colors.get(self._cell_tags.get((index, column), ""))
+                if colors is not None:
+                    cell_fill, cell_ink = colors
+                    canvas.tk.call(
+                        canvas._w, "create", "rectangle", left, top, left + widths[column], top + row_h,
+                        "-fill", cell_fill, "-outline", "",
+                    )
                 if column < len(row) and row[column]:
-                    self._cell_text(canvas, row[column], self._columns[column], left, widths[column], middle, ink, self._font)
+                    self._cell_text(canvas, row[column], self._columns[column], left, widths[column], middle, cell_ink, self._font)
+            canvas.tk.call(canvas._w, "create", "line", 0, top + row_h - 1, width, top + row_h - 1, "-fill", p.line)
 
     def _redraw_head(self) -> None:
         canvas, p = self._head, self.palette
@@ -846,6 +871,8 @@ class DataGrid(ttk.Frame):
         index = self._row_at(event.y)
         if index is not None:
             self.select(index)
+            if self._on_activate:
+                self._on_activate(index)
         return "break"
 
     def _on_motion(self, event) -> None:

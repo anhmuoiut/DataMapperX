@@ -16,7 +16,7 @@ a = Analysis(
         ('assets/DataMapperX.png', 'assets'),
         ('assets/DataMapperX.ico', 'assets'),
         ('assets/Jabil-Logo-*.png', 'assets'),
-    ] + collect_data_files('sv_ttk'),
+    ] + collect_data_files('sv_ttk') + collect_data_files('reportlab'),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -24,7 +24,7 @@ a = Analysis(
     # Nothing the app uses. lxml is only an optional speed-up for openpyxl and would add 3.5 MB; multiprocessing is
     # only pulled in by a part of concurrent.futures that is never called.
     excludes=[
-        'pytest', 'unittest', 'pydoc', 'doctest', 'PIL', 'numpy', 'pandas', 'lxml', 'multiprocessing', 'xmlrpc',
+        'pytest', 'unittest', 'pydoc', 'doctest', 'numpy', 'pandas', 'lxml', 'multiprocessing', 'xmlrpc',
         'setuptools', 'pkg_resources', 'distutils', 'lib2to3', 'test',
     ],
     noarchive=False,

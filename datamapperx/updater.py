@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 MANIFEST_URL = f"{RELEASES_URL}/latest/download/latest.json"
+# The "is this program still allowed to run" switch: a file in the repository, so it can be changed with one commit.
+STATUS_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/status.json"
 ASSET_NAME = "DataMapperX.exe"
 
 # Downloads may only come from GitHub (release assets are served from githubusercontent.com).
@@ -174,6 +176,45 @@ def check_for_update(current: str = __version__, timeout: float = 8.0) -> Update
         return info
     logger.info("Up to date (%s)", current)
     return None
+
+
+# -----------------------------------------------------------------------------
+# Status (the owner's off switch)
+# -----------------------------------------------------------------------------
+_MAX_MESSAGE = 600
+
+
+@dataclass(frozen=True, slots=True)
+class Status:
+    disabled: bool
+    message: str
+
+
+def parse_status(data: object) -> Status:
+    """Read ``status.json``. Anything but a clear answer is an error, so a typo can never switch the program off."""
+    if not isinstance(data, dict):
+        raise UpdateError("The status file is not a JSON object.")
+    disabled = data.get("disabled")
+    if not isinstance(disabled, bool):
+        raise UpdateError('The status file is invalid: "disabled" must be true or false.')
+    message = data.get("message", "")
+    if not isinstance(message, str):
+        raise UpdateError('The status file is invalid: "message" must be text.')
+    # Shown in a plain label: keep line breaks, drop other control characters, and keep it short.
+    message = "".join(ch for ch in message if ch in "\n" or ch.isprintable()).strip()
+    return Status(disabled=disabled, message=message[:_MAX_MESSAGE])
+
+
+def fetch_status(timeout: float = 8.0) -> Status:
+    with _open(STATUS_URL, timeout) as response:
+        raw = response.read(_MAX_MANIFEST_BYTES + 1)
+    if len(raw) > _MAX_MANIFEST_BYTES:
+        raise UpdateError("The status file is unexpectedly large.")
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))  # a file saved by Notepad may start with a byte-order mark
+    except ValueError as exc:
+        raise UpdateError(f"The status file is not valid JSON: {exc}") from exc
+    return parse_status(data)
 
 
 # -----------------------------------------------------------------------------

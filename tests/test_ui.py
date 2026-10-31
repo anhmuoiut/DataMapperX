@@ -29,7 +29,7 @@ def _window(tmp_path_factory):
     from datamapperx.ui.main_window import MainWindow
 
     try:
-        window = MainWindow()
+        window = MainWindow(background_checks=False)  # a test run must never depend on the network
     except tk.TclError as exc:
         pytest.skip(f"no display available: {exc}")
     window.update()  # lets the review page build itself, as it does a moment after the real window opens
@@ -57,6 +57,9 @@ def app(_window, monkeypatch):
     # Start every test from a clean slate.
     _window.settings.component_sets.clear()
     _window.settings.skipped_version = ""
+    _window.settings.check_updates = True
+    _window.settings.deactivated, _window.settings.deactivated_message, _window.settings.verified_at = False, "", 0.0
+    _window._access_dialog = None
     _window.expected_var.set("10")
     _window.repeats_var.set("3")
     _window.dark_var.set(False)
@@ -76,7 +79,7 @@ def pump(app, until=lambda: True, timeout=15.0):
         if until():
             return
         time.sleep(0.01)
-    raise AssertionError("timed out waiting for the UI")
+    raise AssertionError(f"timed out waiting for the UI (busy={getattr(app, 'is_busy', None)}, status={getattr(app, 'status_var', None) and app.status_var.get()!r})")
 
 
 def make_logs(folder, sns=("VSE001", "VSE002", "VSE003"), repeats=2, components=("R1", "R2", "C1")):
@@ -365,6 +368,138 @@ def test_failed_update_check_is_silent_at_startup(app):
     assert app.shown == []
 
 
+def test_turning_the_notice_off_hides_the_banner_but_not_a_required_update(app, monkeypatch):
+    app.settings.check_updates = False
+    app._on_update_checked(newer_info(), manual=False)
+    app.update()
+    assert not app.banner.winfo_ismapped()
+
+    opened = []
+    monkeypatch.setattr("datamapperx.ui.main_window.UpdateDialog", lambda parent, info, mandatory: opened.append(mandatory))
+    app._on_update_checked(newer_info(min_supported="99.0.0"), manual=False)
+    assert opened == [True]
+
+
+# ----------------------------------------------------------------------------- the owner's off switch
+DAY = 24 * 60 * 60
+
+
+def answer_status(monkeypatch, outcome):
+    """Make the status check return ``outcome`` (a Status), or fail with it (an exception)."""
+
+    def fetch(timeout=8.0):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(updater, "fetch_status", fetch)
+
+
+def check_access(app, then=None):
+    """Run the background check and wait until its answer has been handled."""
+    app.verify_access(then=then)
+    pump(app, lambda: not app.tasks._active and app.tasks._queue.empty())
+    app.update()
+
+
+def test_the_window_stays_off_the_network_when_asked(app):
+    assert app._enforce_access is False  # the fixture built it with background_checks=False
+
+
+def test_a_switched_off_copy_shows_the_owners_message_and_runs_nothing_else(app, monkeypatch):
+    answer_status(monkeypatch, updater.Status(True, "Version 1.2 has a bug. Ask Man for 1.3."))
+    followed = []
+    check_access(app, then=lambda: followed.append("update check"))
+
+    dialog = app._access_dialog
+    assert dialog is not None and dialog.winfo_exists()
+    assert "switched off" in dialog.heading.cget("text")
+    assert "Ask Man for 1.3" in dialog.message.cget("text")
+    assert followed == []  # no update is offered to a copy that may not run
+    assert app.settings.deactivated
+
+
+def test_the_off_switch_dialog_can_only_check_again_or_exit(app, monkeypatch):
+    answer_status(monkeypatch, updater.Status(True, "Stopped"))
+    check_access(app)
+    dialog = app._access_dialog
+    left = []
+    monkeypatch.setattr(app, "exit_app", lambda: left.append(True))
+
+    dialog.close()  # the window's X button and Esc both end up here
+    assert left == [True]
+    dialog.exit_button.invoke()
+    assert left == [True, True]
+
+
+def test_check_again_lets_the_copy_run_once_the_owner_switches_it_back_on(app, monkeypatch):
+    answer_status(monkeypatch, updater.Status(True, "Stopped"))
+    check_access(app)
+    dialog = app._access_dialog
+    assert dialog.winfo_exists()
+
+    answer_status(monkeypatch, updater.Status(False, ""))
+    dialog.check_button.invoke()
+    pump(app, lambda: not dialog.winfo_exists())
+    assert not app.settings.deactivated
+
+
+def test_a_switched_off_copy_stays_off_when_it_cannot_reach_github(app, monkeypatch):
+    answer_status(monkeypatch, updater.Status(True, "Stopped"))
+    check_access(app)
+
+    answer_status(monkeypatch, updater.UpdateError("Could not reach GitHub: no route"))
+    followed = []
+    check_access(app, then=lambda: followed.append(True))
+    dialog = app._access_dialog
+    assert dialog.winfo_exists() and "switched off" in dialog.heading.cget("text")
+    assert "no route" in dialog.detail.cget("text")
+    assert followed == []
+
+
+def test_no_answer_is_tolerated_inside_the_grace_period(app, monkeypatch):
+    app.settings.verified_at = time.time() - 3 * DAY
+    answer_status(monkeypatch, updater.UpdateError("Could not reach GitHub: no route"))
+    followed = []
+    check_access(app, then=lambda: followed.append(True))
+    assert app._access_dialog is None
+    assert followed == [True]  # the normal update check still goes ahead
+    assert not app.settings.deactivated
+
+
+def test_no_answer_for_too_long_asks_for_a_connection(app, monkeypatch):
+    from datamapperx import access
+
+    app.settings.verified_at = time.time() - (access.OFFLINE_GRACE_DAYS + 2) * DAY
+    answer_status(monkeypatch, updater.UpdateError("Could not reach GitHub: no route"))
+    check_access(app)
+    dialog = app._access_dialog
+    assert dialog is not None and dialog.winfo_exists()
+    assert "could not be checked" in dialog.heading.cget("text")
+
+    answer_status(monkeypatch, updater.Status(False, ""))  # back on the network
+    dialog.check_button.invoke()
+    pump(app, lambda: not dialog.winfo_exists())
+    assert abs(app.settings.verified_at - time.time()) < 60
+
+
+def test_a_good_answer_saves_when_it_was_asked(app, monkeypatch):
+    from datamapperx.settings import load_settings
+
+    answer_status(monkeypatch, updater.Status(True, "Stopped"))
+    check_access(app)
+    saved = load_settings()
+    assert saved.deactivated and saved.deactivated_message == "Stopped"  # so the next start is blocked before any network
+
+
+def test_a_clear_answer_does_nothing_visible_when_all_is_well(app, monkeypatch):
+    answer_status(monkeypatch, updater.Status(False, ""))
+    followed = []
+    check_access(app, then=lambda: followed.append(True))
+    assert app._access_dialog is None and followed == [True]
+    assert app.shown == []
+
+
 # ----------------------------------------------------------------------------- the two steps
 def ready_to_review(app, folder, **kwargs):
     """Logs scanned and every component added, still on the first step."""
@@ -461,6 +596,10 @@ def test_compact_workspace_keeps_primary_controls_visible(app, tmp_path):
         assert app.selected_list._body.winfo_height() >= 2 * app.selected_list.ROW_HEIGHT
 
         app._show_step("review")
+        app.update()
+        assert inside(app, app.grr_grid)
+        assert app.grr_grid._body.winfo_height() >= 2 * app.grr_grid._row_height()
+        app.review_side_tabs.select(app.limits_page)
         app.update()
         for widget in (app.preview_grid, app.limits_grid, app.check_chips, app.back_button, app.export_button):
             assert inside(app, widget), str(widget)
@@ -830,7 +969,7 @@ def test_the_header_keeps_only_the_mode_and_help_buttons_and_no_version(app):
     labels = [app.help_button["menu"] and app.nametowidget(app.help_button["menu"]).entrycget(i, "label")
               for i in range(app.nametowidget(app.help_button["menu"]).index("end") + 1)
               if app.nametowidget(app.help_button["menu"]).type(i) != "separator"]
-    assert labels == ["Check for updates…", "Check for updates at startup", "Keyboard shortcuts", "Open data folder",
+    assert labels == ["Check for updates…", "Tell me about new versions", "Keyboard shortcuts", "Open data folder",
                       "Open log file", "About DataMapperX"]
 
 
@@ -951,7 +1090,7 @@ def test_the_smoke_test_checks_the_app_end_to_end(app, tmp_path, monkeypatch, ca
     from datamapperx.ui import main_window
 
     # reuse the already open window: the smoke test makes its own, and Tk cannot reliably host two roots
-    monkeypatch.setattr(main_window, "MainWindow", lambda: app)
+    monkeypatch.setattr(main_window, "MainWindow", lambda **_kwargs: app)
     monkeypatch.setattr(app, "destroy", lambda: None)
     sample = selftest._check_logic(tmp_path)
     assert sample.name == "VSE000SMOKE_1.xlsx"
@@ -1455,6 +1594,115 @@ def row_fills(grid):
     return {canvas.itemcget(i, "fill") for i in canvas.find_all() if canvas.type(i) == "rectangle"}
 
 
+def grr_logs(folder):
+    for part in range(3):
+        for repeat in range(3):
+            value = f"+{3 * part + repeat + 1}.0E+00"
+            sn = f"VSE{part:03d}"
+            write_ict_log(folder / f"{sn}_{repeat}.log", sn, [
+                ict_block("X", value, "+2.0E+01", "+0.0E+00"),
+                ict_block("Y", value, "+1.0E+02", "+0.0E+00"),
+            ])
+
+
+def test_grr_precheck_shows_independent_statuses_and_colors_before_export(app, tmp_path):
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    grr_logs(folder)
+    scan(app, folder, repeats=3)
+    app.add_all_shown()
+    app._show_step("review")
+    app.update()
+    assert app.review_side_tabs.select() == str(app.grr_page)
+    assert app.grr_grid.rows() == [
+        ("X", "32.16", "30.00", "4"),
+        ("Y", "32.16", "6.00", "4"),
+    ]
+    assert app.grr_grid.cell_tags() == {
+        (0, 1): "fail", (0, 2): "caution", (0, 3): "fail",
+        (1, 1): "fail", (1, 2): "pass", (1, 3): "fail",
+    }
+    assert app.grr_summary_var.get() == "2 test items"
+    assert "Study Var (6 × SD): 6.00" in app.grr_detail_var.get()
+    assert app.export_button.instate(["!disabled"])
+    app.preview_grid._body.event_generate("<Button-1>", x=10, y=app.preview_grid._row_height() // 2)
+    app.update()
+    assert app.review_side_tabs.select() == str(app.limits_page)  # row 0 was already selected
+    app.review_side_tabs.select(app.grr_page)
+    for dark in (True, False):
+        app.dark_var.set(dark)
+        app._on_theme_toggle()
+        app.grr_grid.select(1)
+        app.update()
+        assert {app.palette.bad_bg, app.palette.warn_bg, app.palette.ok_bg} <= row_fills(app.grr_grid)
+    app.preview_grid.select(1)
+    assert app.review_side_tabs.select() == str(app.limits_page)
+
+
+def test_grr_precheck_recalculates_after_duplicate_choices_counts_and_reset(app, tmp_path):
+    from dataclasses import replace
+
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    grr_logs(folder)
+    scan(app, folder, repeats=3)
+    app.add_all_shown()
+    app._show_step("review")
+    first = app.scan_result.grouped["VSE000"][0]
+    first.entries["X"] = replace(first.entries["X"], measured="PASS")
+    app._on_duplicates_reviewed({"X"}, True)
+    pump(app, lambda: app._preview_job is None)
+    assert app.grr_grid.rows()[0] == ("X", "N/A", "N/A", "N/A")
+    assert first.filename in app.grr_detail_var.get()
+    assert app._grr_results[1].percent_tolerance == pytest.approx(6)
+    app.repeats_var.set("4")
+    pump(app, lambda: app._preview_job is None)
+    assert all(row[1:] == ("N/A", "N/A", "N/A") for row in app.grr_grid.rows())
+    assert "needs 4 repeated files" in app.grr_detail_var.get()
+    app.reset_workflow()
+    assert app.grr_grid.rows() == [] and app.grr_summary_var.get() == ""
+
+
+def test_grr_precheck_ndc_colors_and_compact_legend(app, tmp_path):
+    from dataclasses import replace
+
+    folder = tmp_path / "ndc_logs"
+    folder.mkdir()
+    grr_logs(folder)
+    scan(app, folder, repeats=3)
+    for part, records in enumerate(app.scan_result.grouped.values()):
+        for record in records:
+            entry = record.entries["Y"]
+            record.entries["Y"] = replace(entry, measured=str(float(entry.measured) + part * 100))
+    app.add_all_shown()
+    app._show_step("review")
+    app.update()
+    assert [column.title for column in app.grr_grid._columns] == ["Test", "%Study Var", "%SV/Tol", "NDC"]
+    assert app._grr_results[0].ndc < 5 <= app._grr_results[1].ndc
+    assert app.grr_grid.cell_tags()[0, 3] == "fail"
+    assert app.grr_grid.cell_tags()[1, 3] == "pass"
+    assert [label.cget("text") for _, label, _, _ in app.grr_legend_tiles] == ["PASS", "CONDITION", "FAIL"]
+    assert [bounds.cget("text") for _, _, bounds, _ in app.grr_legend_tiles] == [
+        "≤10%\nNDC ≥5", ">10% to 30%\nNDC: —", ">30%\nNDC <5",
+    ]
+    previous_geometry = app.geometry()
+    app.geometry("1000x680+0+0")
+    try:
+        for dark in (True, False):
+            app.dark_var.set(dark)
+            app._on_theme_toggle()
+            app.update()
+            assert app.grr_grid._max_xoff() == 0  # all four columns fit the narrow panel
+            assert [tile.cget("bg") for tile, *_ in app.grr_legend_tiles] == [
+                app.palette.ok_bg, app.palette.warn_bg, app.palette.bad_bg,
+            ]
+            for tile, title, bounds, _ in app.grr_legend_tiles:
+                assert inside(app, tile)
+                assert title.cget("bg") == bounds.cget("bg") == tile.cget("bg")
+    finally:
+        app.geometry(previous_geometry)
+
+
 def test_the_tables_tint_rows_with_missing_values_and_wrong_file_counts(app, tmp_path):
     folder = tmp_path / "logs"
     folder.mkdir()
@@ -1469,6 +1717,7 @@ def test_the_tables_tint_rows_with_missing_values_and_wrong_file_counts(app, tmp
     assert {app.palette.warn_bg, app.palette.bad_bg} <= row_fills(grid)  # the tinted rows are drawn in the tint colours
     app.dark_var.set(True)
     app._on_theme_toggle()
+    app.review_side_tabs.select(app.limits_page)
     app.update()
     try:
         assert {app.palette.warn_bg, app.palette.bad_bg} <= row_fills(grid)  # recoloured with the theme
@@ -1895,3 +2144,602 @@ def test_the_smoke_test_can_run_again_with_a_remembered_choice_in_the_data_folde
     assert app.settings.component_sets  # the first run left its choice behind
     selftest._check_steps(app, tmp_path)  # and the second must still pass
     assert app.dark_var.get() == dark_before and app.palette.mode == ("dark" if dark_before else "light")
+
+# ----------------------------------------------------------------------------- Validation & Reports workspace
+def showing(app, widget, expected=True):
+    """Whether the widget ends up on screen (or off it, with ``expected=False``); Tk maps and unmaps a moment later."""
+    end = time.time() + 3
+    while widget.winfo_ismapped() != expected and time.time() < end:
+        app.update()
+        time.sleep(0.01)
+    return widget.winfo_ismapped() == expected
+
+
+def open_validation(app):
+    """The workspace on a clean slate (the window is shared by every test in this module), with its data ready."""
+    app._show_workspace("validation")
+    ws = app.validation
+    for variable, value in ((ws.source_var, "mapping"), (ws.method_var, "grr"), (ws.operators_var, ""), (ws.nest_var, False),
+                            (ws.assign_var, True), (ws.order_var, "Worksheet order"), (ws.index_var, "cpk"),
+                            (ws.threshold_var, "1.33"), (ws.subgroup_var, False), (ws.profile_var, "None (statistics only)"),
+                            (ws.precision_var, "3"), (ws.search_var, ""), (ws.filter_var, "All results"), (ws.gage_var, ""),
+                            (ws.judge_var, False),
+                            (ws.by_var, ""), (ws.comments_var, ""), (ws.within_var, "Automatic (from the subgroup size)"), (ws.repeats_var, "")):
+        variable.set(value)
+    for name, variable in ws.sections.items():
+        variable.set(name == "charts")
+    ws.field_mapping.clear()
+    ws.assignments.clear()
+    ws.acknowledgements = {}
+    ws.study = ws.result_set = ws.evaluated = None  # nothing left over from an earlier test
+    ws._source_key = object()
+    ws.on_show()
+    pump(app, lambda: ws.dataset is not None and not ws.busy)
+    return ws
+
+
+def run_validation(app, ws):
+    ws.run_button.invoke()
+    pump(app, lambda: not ws.running and ws.result_set is not None and not ws.stale)
+    return ws
+
+
+def test_validation_is_a_workspace_beside_data_mapping_and_leaves_the_raw_export_alone(app, tmp_path):
+    from dataclasses import asdict
+
+    folder = tmp_path / "stat_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    app._show_step("review")
+    before = {str(r.path): asdict(r) for records in app.scan_result.grouped.values() for r in records}
+    assert app.validate_button.instate(["!disabled"]) and app.export_button.instate(["!disabled"])
+    app.validate_button.invoke()
+    app.update()
+    assert app.workspace == "validation" and showing(app, app.validation_page) and showing(app, app.review_page, False)
+    assert showing(app, app.step_bar, False) and showing(app, app.mapping_switch)
+    ws = open_validation(app)
+    assert [ws.tabs.tab(t, "state") for t in (ws.data_tab, ws.setup_tab, ws.results_tab, ws.report_tab)] == [
+        "normal", "normal", "disabled", "disabled"]  # the tabs open up as the work progresses
+    assert "3 samples · 18 readings · 3 test items" in ws.dataset_var.get()
+    run_validation(app, ws)  # Quick Analysis: no trial step, no setup needed
+    assert ws.tabs.index(ws.tabs.select()) == ws.tabs.index(ws.results_tab)
+    assert len(ws.results) == 3 and all("ndc" in r.metrics for r in ws.results)
+    assert len(ws.table.get_children()) == 3 and "3 items" in ws.summary_var.get()
+    assert ws.tabs.tab(ws.report_tab, "state") == "normal" and ws.pdf_button.instate(["!disabled"])
+    assert before == {str(r.path): asdict(r) for records in app.scan_result.grouped.values() for r in records}
+    app.mapping_switch.invoke()
+    app.update()
+    assert app.workspace == "mapping" and app.step == "review", (app.workspace, app.step)
+    assert showing(app, app.review_page) and showing(app, app.step_bar)
+    assert app.export_button.instate(["!disabled"])  # Excel export never depends on validation
+
+
+def test_validation_opens_with_nothing_scanned_and_data_mapping_keeps_working(app):
+    ws = open_validation_without_data(app)
+    assert ws.dataset is None and ws.run_button.instate(["disabled"])
+    assert "No Data Mapping results" in ws.message_var.get()
+    assert [ws.tabs.tab(t, "state") for t in (ws.setup_tab, ws.results_tab, ws.report_tab)] == ["disabled"] * 3
+    app.mapping_switch.invoke()
+    app.update()
+    assert app.workspace == "mapping" and showing(app, app.select_page)
+
+
+def open_validation_without_data(app):
+    app._show_workspace("validation")
+    ws = app.validation
+    ws.source_var.set("mapping")
+    ws.on_show()
+    pump(app, lambda: not ws.busy)
+    return ws
+
+
+def test_changing_the_study_makes_results_stale_but_changing_criteria_or_decimals_does_not(app, tmp_path):
+    folder = tmp_path / "stale_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    run_validation(app, ws)
+    app.update()
+    assert showing(app, ws.stale_banner, False) and ws.pdf_button.instate(["!disabled"])
+    first = ws.result_set
+    ws.profile_var.set("Jabil")  # a different customer judges the same numbers
+    ws.precision_var.set("5")
+    app.update()
+    assert ws.result_set is first and not ws.stale and showing(app, ws.stale_banner, False)
+    assert ws.results[0].config.profile == "Jabil" or ws.evaluated.record.settings.profile == "Jabil"
+    ws.assign_var.set(False)  # numbering the repeated readings changes what is computed
+    app.update()
+    assert ws.stale and showing(app, ws.stale_banner)
+    ws.assign_var.set(True)  # back to what the results were computed from: current again
+    app.update()
+    assert not ws.stale and showing(app, ws.stale_banner, False)
+    ws.assign_var.set(False)
+    app.update()
+    assert ws.stale
+    assert ws.pdf_button.instate(["disabled"]) and ws.excel_button.instate(["disabled"])
+    assert "Update the results" in ws.report_var.get()
+    assert len(ws.table.get_children()) == 3  # the old results stay on screen, for reference
+    ws.update_button.invoke()
+    pump(app, lambda: not ws.running and not ws.stale)
+    app.update()
+    assert ws.result_set is not first and ws.result_set.id == "RS-0002" and showing(app, ws.stale_banner, False)
+    assert ws.pdf_button.instate(["!disabled"]) and ws.result_set.options.assign_trials is False
+
+
+def test_a_result_that_finishes_after_the_study_changed_is_recorded_as_stale(app, tmp_path, monkeypatch):
+    folder = tmp_path / "async_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    pending = []
+    monkeypatch.setattr(ws.tasks, "run", lambda work, **callbacks: pending.append((work, callbacks)))
+    ws.run_button.invoke()
+    assert ws.run_button.instate(["disabled"]) and len(pending) == 1
+    ws.method_var.set("capability")  # edited while the analysis is on its worker thread
+    work, callbacks = pending[0]
+    callbacks["on_success"](work(lambda *_: None))
+    assert ws.result_set is not None and ws.result_set.options.method == "grr" and ws.stale
+    assert ws.run_button.instate(["!disabled"]) and ws.pdf_button.instate(["disabled"])
+
+
+def test_results_appear_at_once_with_notes_and_without_any_confirmation(app, tmp_path, monkeypatch):
+    from datamapperx.ui import validation_workspace
+
+    folder = tmp_path / "cap_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    app.update()
+    headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
+    assert headers == ["Test Item", "N", "Cp", "Cpk", "Pp", "Ppk"]  # no criteria chosen: statistics only, no Result column
+    assert "statistics only" in ws.summary_var.get() and showing(app, ws.filter_combo, False)
+    assert all(r.metrics.get("cpk") is not None and r.status == "N/A" for r in ws.results)
+    assert ws.pdf_button.instate(["!disabled"])  # a report never waits for a verdict or a confirmation
+    assert showing(app, ws.notes_bar) and "Keep in mind" in ws.notes_var.get() and "not confirmed" not in ws.notes_var.get()
+    shown = []
+    monkeypatch.setattr(validation_workspace, "ReportDialog", lambda *args: shown.append(args[-1]))
+    ws.notes_button.invoke()
+    assert "Process stability" in shown[-1] and "Normal distribution" in shown[-1] and "do not block" in shown[-1]
+    ws.judge_var.set(True)  # judging against a limit is optional and changes no number
+    app.update()
+    cpk = [r.metrics["cpk"] for r in ws.results]
+    assert [ws.table.heading(c)["text"] for c in ws.table["columns"]][-1] == "Result"
+    assert all(ws.table.item(i, "values")[-1] in ("PASS", "FAIL") for i in ws.table.get_children())
+    assert [r.metrics["cpk"] for r in ws.results] == cpk and not ws.stale
+    ws.judge_var.set(False)
+    app.update()
+    assert [ws.table.heading(c)["text"] for c in ws.table["columns"]][-1] == "Ppk" and not ws.stale
+    ws.subgroup_var.set(True)  # a statistical input: the results go stale
+    assert ws.stale
+
+
+def test_grr_has_no_pass_or_fail_until_criteria_are_chosen(app, tmp_path):
+    folder = tmp_path / "criteria_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    assert ws.profile_var.get() == "None (statistics only)"
+    run_validation(app, ws)
+    assert [ws.table.heading(c)["text"] for c in ws.table["columns"]] == ["Test Item", "%SV/Tol", "%Study Var", "NDC"]
+    assert all(r.status == "N/A" and "ndc" in r.metrics for r in ws.results) and "statistics only" in ws.summary_var.get()
+    assert "No acceptance criteria" in ws.plan_var.get()
+    ws.profile_var.set("SolarEdge")  # criteria are a layer on top: the figures stay and PASS / FAIL appear
+    app.update()
+    assert not ws.stale and [ws.table.heading(c)["text"] for c in ws.table["columns"]][-2:] == ["Acceptance Result", "Review"]
+    assert {ws.table.item(i, "values")[-2] for i in ws.table.get_children()} <= {"PASS", "CONDITIONAL PASS", "FAIL", "N/A"}
+    assert "Customer criteria: SolarEdge" in ws.plan_var.get() and showing(app, ws.filter_combo)
+
+
+def test_within_sigma_is_chosen_from_the_subgroup_size_unless_the_user_says_otherwise(app, tmp_path):
+    folder = tmp_path / "within_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    app.update()
+    assert ws.study.options.within_method == "individuals" and "chosen from the subgroup size" in ws.plan_var.get()
+    ws.subgroup_var.set(True)  # the two files of a serial number form a subgroup
+    app.update()
+    assert ws.study.options.within_method == "pooled" and "pooled standard deviation" in ws.plan_var.get()
+    ws.within_var.set("Average moving range, length 2 (subgroup size 1)")
+    app.update()
+    assert ws.study.options.within_method == "individuals" and "chosen from the subgroup size" not in ws.plan_var.get()
+
+
+def test_the_details_tab_shows_the_tables_of_the_selected_item(app, tmp_path):
+    folder = tmp_path / "session_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    run_validation(app, ws)
+    text = ws.session.text.get("1.0", "end")
+    assert "One-Way ANOVA Table" in text and "Variance Components" in text and "%Contribution" in text and "%Tolerance" in text
+    assert "Gage Evaluation" in text and "Number of Distinct Categories" in text and "Part-To-Part" in text
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    text = ws.session.text.get("1.0", "end")
+    for expected in ("Process Data", "StDev(Within)", "Potential (Within) Capability", "Overall Capability", "Ppk", "PPM < LSL"):
+        assert expected in text
+
+
+def test_ppk_can_be_the_decision_index_and_the_table_leaves_out_what_does_not_decide(app, tmp_path):
+    folder = tmp_path / "ppk_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    ws.judge_var.set(True)
+    ws.index_var.set("ppk")
+    ws.precision_var.set("5")  # decimals only change what is shown
+    run_validation(app, ws)
+    assert {r.decision_metric for r in ws.results} == {"ppk"}
+    cp = ws.table.item(ws.table.get_children()[0], "values")[2]
+    assert len(cp.split(".")[1]) == 5
+    ws.precision_var.set("2")
+    assert len(ws.table.item(ws.table.get_children()[0], "values")[2].split(".")[1]) == 2 and not ws.stale
+    headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
+    assert headers == ["Test Item", "N", "Cp", "Cpk", "Pp", "Ppk", "Result"]  # Mean/Min/Max and an empty System are in the details
+    ws.method_var.set("grr")
+    ws.profile_var.set("SolarEdge")
+    run_validation(app, ws)
+    headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
+    assert headers == ["Test Item", "%SV/Tol", "%Study Var", "NDC", "Acceptance Result", "Review"]  # the three key metrics first
+
+
+def test_operators_make_a_crossed_study_and_a_bad_design_is_explained(app, tmp_path):
+    folder = tmp_path / "operator_logs"
+    folder.mkdir()
+    ready_to_review(app, folder, repeats=4, sns=("VSE001", "VSE002", "VSE003", "VSE004"))
+    ws = open_validation(app)
+    app.repeats_var.set("4")
+    ws.operators_var.set("Ann")
+    app.update()
+    assert "at least two operator names" in ws.setup_error and ws.run_button.instate(["disabled"])
+    ws.operators_var.set("Ann, Ann")
+    assert "must be different" in ws.setup_error
+    ws.operators_var.set("Ann, Bob")
+    ws.nest_var.set(True)
+    assert "not both" in ws.setup_error
+    ws.nest_var.set(False)
+    ws.repeats_var.set("")
+    assert ws.setup_error == "" and "Operators: Ann, Bob" in ws.plan_var.get()
+    run_validation(app, ws)
+    assert all(r.details.get("crossed") and list(r.details["operators"]) == ["Ann", "Bob"] for r in ws.results if r.valid)
+    ws.operators_var.set("Ann, Bob, Cy")  # 4 readings cannot be split between 3 operators
+    ws.update_button.invoke()
+    app.update()
+    assert "multiple of 3" in ws.message_var.get() and ws.stale
+
+
+def test_data_mapping_changes_reach_validation_when_it_is_shown_again(app, tmp_path):
+    folder = tmp_path / "change_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    run_validation(app, ws)
+    assert len(ws.results) == 3
+    app.mapping_switch.invoke()
+    app.selected_components = ["R1", "R2"]
+    app._selection_changed()
+    app.validation_switch.invoke()
+    pump(app, lambda: ws.dataset is not None and not ws.busy and len(ws.dataset.items) == 2)
+    assert "2 test items" in ws.dataset_var.get() and ws.stale and showing(app, ws.stale_banner)
+    assert len(ws.table.get_children()) == 3  # still the old results, marked as such
+    ws.update_button.invoke()
+    pump(app, lambda: not ws.running and not ws.stale)
+    assert len(ws.results) == 2
+
+
+def test_a_report_needs_no_study_information_and_can_cover_part_of_the_items(app, tmp_path, monkeypatch):
+    folder = tmp_path / "report_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    run_validation(app, ws)
+    asked = []
+    outputs = [tmp_path / "bare.xlsx", tmp_path / "partial.xlsx"]
+    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **kw: asked.append(kw) or str(outputs[len(asked) - 1]))
+    assert ws.date_var.get() == "" and "optional" in [w.cget("text") for w in ws.report_tab.winfo_children()[0].winfo_children()][0]
+    ws.excel_button.invoke()  # nothing entered: the report is made all the same
+    pump(app, lambda: not ws.export_busy)
+    assert ws.report_var.get() == f"Saved: {outputs[0]}"
+    bare = load_workbook(outputs[0])
+    assert bare.sheetnames[0] == "Summary" and len(bare.sheetnames) == 7  # a summary, then a sheet and its plot data per item
+    assert not any(str(c.value).startswith(("Gage name", "Reported by")) for ws_ in bare for row in ws_.iter_rows() for c in row)
+    bare.close()
+    ws.gage_var.set("Bench DMM 7")
+    ws.by_var.set("T. Man")
+    ws.comments_var.set("first article")
+    ws.item_list.selection_clear(0, "end")
+    ws.item_list.selection_set(0)
+    ws._update_coverage()
+    assert ws.coverage_var.get() == "Included 1 of 3 items"
+    ws.sections["observations"].set(True)
+    ws.excel_button.invoke()
+    pump(app, lambda: not ws.export_busy)
+    assert ws.report_var.get() == f"Saved: {outputs[1]}" and ws.last_report == outputs[1] and ws.open_button.instate(["!disabled"])
+    book = load_workbook(outputs[1])
+    assert len(book.sheetnames) == 3 and book.sheetnames[-1] == "Observations"  # one item: its sheet, plot data, observations
+    labels = {str(row[0].value): row[1].value for row in book[book.sheetnames[0]].iter_rows(min_col=1, max_col=2) if row[0].value}
+    assert labels["Gage name:"] == "Bench DMM 7" and labels["Reported by:"] == "T. Man" and labels["Misc:"] == "first article"
+    book.close()
+
+
+def test_about_and_calculation_details_explain_the_method_and_the_study(app, tmp_path, monkeypatch):
+    from datamapperx.ui import validation_workspace
+
+    folder = tmp_path / "about_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    shown = []
+    monkeypatch.setattr(validation_workspace, "ReportDialog", lambda *args: shown.append(args[-1]))
+    ws.method_var.set("capability")
+    ws.about_button.invoke()
+    assert "1.128" in shown[-1] and "Cpk" in shown[-1]
+    ws.method_var.set("grr")
+    ws.about_button.invoke()
+    assert "ANOVA" in shown[-1] and "NDC" in shown[-1]
+    run_validation(app, ws)
+    ws.detail_button.invoke()
+    assert "INTERMEDIATE" in shown[-1] and "FINAL METRICS" in shown[-1]
+    assert "Acceptance criteria: none" in shown[-1] and "Pending Minitab Verification" in shown[-1]
+
+
+def test_an_invalid_item_does_not_stop_the_others_and_the_table_can_be_filtered(app, tmp_path):
+    from datamapperx.models import Measurement
+
+    folder = tmp_path / "invalid_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    record = next(iter(app.scan_result.grouped.values()))[0]
+    record.entries["R1"] = Measurement("R1", "bad", "0", "9")
+    app._data_changed()  # what the duplicate choice does when it changes a value
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    assert len(ws.results) == 3 and next(r for r in ws.results if r.test_item == "R1").status == "N/A"
+    ws.search_var.set("R1")
+    assert len(ws.table.get_children()) == 1
+    ws.search_var.set("")
+    ws.judge_var.set(True)  # filtering by result needs criteria
+    app.update()
+    ws.filter_var.set("N/A")
+    assert len(ws.table.get_children()) == 1  # the invalid item
+    verdict = next(r.status for r in ws.results if r.valid)
+    ws.filter_var.set(verdict)
+    assert len(ws.table.get_children()) == len([r for r in ws.results if r.status == verdict]) == 2  # the two valid items
+    app.reset_workflow()
+    assert app.workspace == "mapping"
+
+
+def test_mapping_assignments_and_order_apply_to_the_snapshot_and_never_to_the_scan(app, tmp_path):
+    folder = tmp_path / "map_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.field_mapping = {"trial": "@trial", "tester": "=T1", "slot": "=1"}
+    ws.data_edited()
+    pump(app, lambda: not ws.busy)
+    run_validation(app, ws)
+    assert all("Slot=1" in r.system and "Tester=T1" in r.system for r in ws.results)
+    source = str(next(iter(app.scan_result.grouped.values()))[0].path)
+    ws.assignments[source] = {"sample_id": "different-sample"}
+    ws.data_edited()
+    pump(app, lambda: not ws.busy)
+    ws.update_button.invoke()
+    pump(app, lambda: not ws.running and not ws.stale)
+    assert any(not r.valid for r in ws.results)  # an identity edit makes the study unbalanced
+    ws.assignments.clear()
+    ws.field_mapping = {}
+    ws.method_var.set("capability")
+    ws.order_var.set("Timestamp order (File assignments)")
+    pump(app, lambda: not ws.busy)
+    assert "ISO 8601" in ws.message_var.get() and ws.dataset is None
+    for index, row in enumerate(r for records in app.scan_result.grouped.values() for r in records):
+        ws.assignments[str(row.path)] = {"timestamp": f"2026-10-30T10:00:{50 - index:02d}"}
+    ws.data_edited()
+    pump(app, lambda: ws.dataset is not None and not ws.busy)
+    assert ws.dataset.order_basis == "acquisition" and "rows sorted by timestamp" in ws.dataset.description
+    stamps = [o.timestamp for o in ws.dataset.observations if o.test_item == "R1"]
+    assert stamps == sorted(stamps)
+    run_validation(app, ws)
+    codes = {c.code for c in ws.evaluated.record.validation.conditions}
+    assert "acquisition_order" not in codes  # the rows are in measurement order, as the timestamps say
+
+
+def test_a_rawdata_workbook_can_be_analysed_without_scanning_anything(app, tmp_path):
+    from datamapperx.exporter import generate_excel
+    from datamapperx.profiles import DEFAULT_PROFILES
+    from datamapperx.scanner import scan_folder
+
+    from .baseline_support import write_rawdata_logs
+
+    logs = tmp_path / "raw_logs"
+    logs.mkdir()
+    write_rawdata_logs(logs)
+    import copy
+
+    result = scan_folder(logs, copy.deepcopy(DEFAULT_PROFILES["ICT_I3070 Test Log"]))
+    workbook = tmp_path / "RawData.xlsx"
+    generate_excel(result.grouped, ["R1", "Long"], workbook, expected_repeated=2)
+    ws = open_validation_without_data(app)
+    ws.open_file(workbook)
+    pump(app, lambda: ws.dataset is not None and not ws.busy and ws.source_var.get() == "file")
+    assert ws.file_var.get() == str(workbook) and "3 samples · 12 readings · 2 test items" in ws.dataset_var.get()
+    assert showing(app, ws.mapping_controls, False) and showing(app, ws.file_controls)
+    assert [ws.order_combo.cget("values")[i] for i in range(2)] == ["Worksheet order", "Rows are in measurement order (I confirm)"]
+    assert ws.preview.item(ws.preview.get_children()[0], "values")[1] == "VSE000123"  # text serial numbers, worksheet order
+    ws.assign_var.set(True)
+    run_validation(app, ws)
+    assert len(ws.results) == 2 and ws.study.mapping["source"] == "file"
+    ws.source_var.set("mapping")  # back to Data Mapping's results: nothing scanned, so no data
+    pump(app, lambda: not ws.busy)
+    assert ws.dataset is None and ws.run_button.instate(["disabled"])
+
+
+def test_importing_a_file_that_is_not_a_rawdata_workbook_says_why(app, tmp_path):
+    from openpyxl import Workbook
+
+    wrong = tmp_path / "wrong.xlsx"
+    book = Workbook()
+    book.active.append(["Name", "Value"])
+    book.save(wrong)
+    ws = open_validation_without_data(app)
+    ws.open_file(wrong)
+    pump(app, lambda: not ws.busy)
+    assert "STT and SN" in ws.message_var.get() and ws.dataset is None
+
+
+def test_file_assignment_browsing_retains_mapped_trial_order(app, tmp_path):
+    from datamapperx.ui.validation import AssignmentDialog
+
+    folder = tmp_path / "assignment_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.field_mapping = {"trial": "@trial"}
+    dialog = AssignmentDialog(ws)
+    try:
+        dialog.files.selection_set(1)  # second file of the first sample
+        dialog.select()
+        assert dialog.variables["trial"].get() == "2"
+        dialog.files.selection_clear(0, "end")
+        dialog.files.selection_set(2)
+        dialog.select()
+        assert not dialog.pending  # browsing alone does not pin overrides
+        dialog.variables["slot"].set("Nest 2")
+        dialog.apply()
+        assert list(ws.assignments.values()) == [{"slot": "Nest 2"}]
+    finally:
+        if dialog.winfo_exists():
+            dialog.close()
+    pump(app, lambda: not ws.busy)
+    assert any(o.slot == "Nest 2" for o in ws.dataset.observations)
+
+
+def test_review_notice_shows_only_for_acceptable_results_that_disagree(app, tmp_path):
+    from datamapperx.statistics import Dataset, Observation
+
+    folder = tmp_path / "review_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.profile_var.set("SolarEdge")  # the Review flag belongs to the criteria
+    wide = [Observation("Wide tolerance", f"S{part}", value, -1000, 1000, trial=str(trial), source=f"w{part}{trial}")
+            for part, values in enumerate(((0, 2), (0, 2)), 1) for trial, value in enumerate(values, 1)]
+    clean = [Observation("Clean", f"S{part}", value, 0, 100, trial=str(trial), source=f"c{part}{trial}")
+             for part, values in enumerate(((0, .1), (10, 10.1), (20, 20.2), (30, 30.1)), 1)
+             for trial, value in enumerate(values, 1)]
+    ws._dataset_ready(Dataset.from_observations(clean))
+    run_validation(app, ws)
+    app.update()
+    assert showing(app, ws.review_label, False) and ws.review_var.get() == ""
+    ws._dataset_ready(Dataset.from_observations(wide + clean))
+    ws.update_button.invoke()
+    pump(app, lambda: not ws.running and not ws.stale)
+    pump(app, lambda: ws.review_label.winfo_ismapped())  # the label's wrap width settles on the next layout pass
+    headers = [ws.table.heading(column)["text"] for column in ws.table["columns"]]
+    assert "Review" in headers and "Review needed: 1 of 2" in ws.review_var.get()
+    flagged = next(ws.table.item(i, "values") for i in ws.table.get_children() if "Wide" in ws.table.item(i, "values")[0])
+    assert "NDC" in flagged[headers.index("Review")] and flagged[headers.index("Acceptance Result")] == "PASS"
+    app.geometry("1000x680+0+0")
+    pump(app, lambda: inside(app, ws.table) and inside(app, ws.review_label))  # still visible at the supported minimum size
+    app.geometry("1360x880+0+0")
+    ws._dataset_ready(Dataset.from_observations(clean))
+    ws.update_button.invoke()
+    pump(app, lambda: not ws.running and not ws.stale)
+    app.update()
+    assert showing(app, ws.review_label, False) and ws.review_var.get() == ""
+
+
+def test_validation_layout_and_theme_fit_supported_desktop_size(app, tmp_path):
+    folder = tmp_path / "layout_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    app.geometry("1000x680+0+0")
+    ws = open_validation(app)
+    ws.tabs.select(ws.data_tab)
+    app.update()
+    for widget in (app.mapping_switch, app.validation_switch, ws.run_button, ws.tabs, ws.preview):
+        assert inside(app, widget), widget
+    ws.tabs.select(ws.setup_tab)
+    app.update()
+    for widget in (ws.operators_entry, ws.nest_check, ws.criteria_button, ws.plan_label):
+        assert inside(app, widget), widget
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    app.update()
+    for widget in (ws.table, ws.detail_button, ws.about_button, ws.notes_button):
+        assert inside(app, widget), widget
+    headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
+    assert sum(int(ws.table.column(c, "width")) for c in ws.table["columns"]) <= ws.table.winfo_width() + 4, headers  # no sideways scroll
+    ws.tabs.select(ws.report_tab)
+    app.update()
+    for widget in (ws.pdf_button, ws.excel_button, ws.item_list, ws.info_entries["Misc"]):
+        assert inside(app, widget), widget
+    app.dark_var.set(True)
+    app._on_theme_toggle()
+    assert ws.palette is app.palette
+    app.geometry("1360x880+0+0")
+
+
+def test_shortcuts_of_data_mapping_bring_it_back_first(app, tmp_path):
+    folder = tmp_path / "shortcut_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    open_validation(app)
+    assert app.workspace == "validation"
+    app._export_shortcut()  # Ctrl+E: it must not export from a screen that is not showing the data
+    assert app.workspace == "mapping" and app.step == "review"
+    app._show_workspace("validation")
+    app._show_step("select")
+    app.update()
+    assert app.workspace == "mapping" and showing(app, app.select_page)
+
+
+def test_every_new_study_starts_as_statistics_only_even_if_an_older_version_saved_a_customer(app, tmp_path):
+    from datamapperx.settings import Settings
+    from datamapperx.ui.validation_workspace import NO_CRITERIA, ValidationWorkspace
+
+    saved = Settings()
+    saved.validation_customer = "SolarEdge"  # what the previous version remembered
+    fresh = ValidationWorkspace(app, app.palette, settings=saved)
+    try:
+        assert fresh.profile_var.get() == NO_CRITERIA and not fresh.judge_var.get()
+    finally:
+        fresh.destroy()
+    folder = tmp_path / "criteria_reset_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.profile_var.set("SolarEdge")
+    ws.method_var.set("capability")
+    ws.judge_var.set(True)
+    app.update()
+    assert ws.profile_var.get() == "SolarEdge" and ws.judge_var.get()
+    ws.method_var.set("grr")
+    app.reset_workflow()  # nothing to analyse: the study is gone
+    ready_to_review(app, folder)
+    app._show_workspace("validation")
+    pump(app, lambda: ws.dataset is not None and not ws.busy)
+    assert ws.profile_var.get() == NO_CRITERIA and not ws.judge_var.get()  # the next study starts again without criteria
+    run_validation(app, ws)
+    assert all(r.status == "N/A" for r in ws.results) and "statistics only" in ws.summary_var.get()
+
+
+def test_the_within_sigma_method_is_an_advanced_option(app, tmp_path):
+    folder = tmp_path / "advanced_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    ws.tabs.select(ws.setup_tab)
+    app.update()
+    assert showing(app, ws.advanced_button) and showing(app, ws.advanced, False)
+    ws.advanced_button.invoke()
+    assert showing(app, ws.advanced) and "▾" in ws.advanced_button.cget("text")
+    ws.advanced_button.invoke()
+    assert showing(app, ws.advanced, False)

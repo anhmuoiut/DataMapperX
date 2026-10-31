@@ -23,10 +23,19 @@ class Settings:
     expected_samples: str = DEFAULT_EXPECTED_SAMPLES
     repeats: str = DEFAULT_REPEATS
     geometry: str = ""
-    check_updates: bool = True
+    check_updates: bool = True  # whether to announce an optional new version; the checks themselves always run
     skipped_version: str = ""
+    # What the last look at status.json (see access.py) left behind, so a copy that was told to stop stays stopped
+    # offline. verified_at is when it was last read (or when this copy first started), as seconds since 1970.
+    deactivated: bool = False
+    deactivated_message: str = ""
+    verified_at: float = 0.0
     # profile name -> component names the user picked last time
     component_sets: dict[str, list[str]] = field(default_factory=dict)
+    # Statistical validation: the customer whose Gage R&R acceptance rules apply, and the rules the user changed or
+    # added (customer name -> list of {metric, enabled, pass_limit, fail_limit}; see statistics/customers.py).
+    validation_customer: str = ""  # no longer used: every new study starts as statistics only
+    customer_criteria: dict = field(default_factory=dict)
 
 
 def load_settings(path: Path | None = None) -> Settings:

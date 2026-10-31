@@ -25,3 +25,11 @@ samples/
 Thumbs.db
 desktop.ini
 previews/
+
+# Local statistical verification dependencies and generated reports
+tmp/stat*/
+tmp/*deps/
+tmp/pdfs/
+
+# Confidential local statistical reference review
+tmp/reference-review/

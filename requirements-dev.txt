@@ -2,4 +2,5 @@
 pyinstaller>=6.9
 pillow>=10  # only tools/make_logo_png.py needs it
 pytest>=8
+pypdf>=5,<7  # verify generated PDF contents in automated tests
 ruff>=0.6
