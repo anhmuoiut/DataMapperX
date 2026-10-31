@@ -8,19 +8,23 @@ result computed from an earlier state of the study is shown as stale and cannot 
 from __future__ import annotations
 
 import logging
+import math
 import tkinter as tk
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from ..method_guide import method_guide
 from ..models import LogRecord
-from ..stat_charts import draw_tk_charts
+from ..stat_charts import draw_tk_charts, plain_number
 from ..stat_reports import (
     ALL_SECTIONS,
     CONDITION_TITLES,
-    METHOD_TITLES,
     display_number,
     export_statistical_report,
+    item_label,
     report_charts,
     report_context,
     review_note,
@@ -29,6 +33,7 @@ from ..stat_reports import (
 )
 from ..statistics import (
     Dataset,
+    DesignError,
     EvaluationSettings,
     ImportedData,
     ResultSet,
@@ -39,22 +44,24 @@ from ..statistics import (
     auto_within_method,
     customers_to_json,
     describe_design,
-    explain_method,
     import_rawdata_xlsx,
     merge_customers,
 )
+from ..statistics.checks import CAUTION, INFO, OK, describe_layouts, layout_of, needs_attention, result_checks
 from ..statistics.evaluation import combine_config, validate_evaluation_settings
 from ..statistics.study import validate_statistical_options
 from ..workspace_data import MappingSource, build_mapping_dataset, int_field, reorder_dataset
 from .dialogs import ReportDialog, open_path
+from .method_dialog import MethodDialog
 from .tasks import TaskRunner
 from .theme import Palette
-from .validation import AssignmentDialog, CustomersDialog, MappingDialog
+from .validation import DATE_FORMAT, AssignmentDialog, CustomersDialog, DatePickerDialog
 from .widgets import ReadOnlyText
 
 logger = logging.getLogger(__name__)
 
 PREVIEW_ROWS = 300
+WIDE_RESULTS = 1100  # pixels of the Results tab from which the table and the charts sit side by side
 _UNSET = object()
 NO_CRITERIA = "None (statistics only)"
 SHORT_NOTES = {"acquisition_order": "order of the readings", "repeated_measurements": "repeated readings",
@@ -64,10 +71,15 @@ WITHIN_CHOICES = {"auto": "Automatic (from the subgroup size)",
                   "individuals": "Average moving range, length 2 (subgroup size 1)",
                   "pooled": "Pooled standard deviation (subgroups of 2 or more)"}
 METHOD_NAMES = {"grr": "Variable Gage R&R", "capability": "Process Capability (Cp/Cpk)"}
-ORDERS = {"worksheet": "Worksheet order", "filename": "File name order", "timestamp": "Timestamp order (File assignments)",
+ORDERS = {"worksheet": "Worksheet order", "filename": "File name order",
+          "filetime": "File time order (when each log file was saved)", "timestamp": "Timestamp order (File assignments)",
           "confirmed": "Rows are in measurement order (I confirm)"}
+CHECK_MARKS = {OK: "✓", INFO: "i", CAUTION: "!"}
 FILE_ORDERS = ("worksheet", "confirmed")  # a RawData.xlsx has no files of its own to order by
-OPERATOR_ORDERS = {"by_operator": "by operator  (A, A, B, B)", "by_pass": "by pass  (A, B, A, B)"}
+STUDY_FACTORS = (1, 2, 3, 4, 5, 6)  # Study Variation = k x SD; 6 is the usual choice (+/- 3 sigma)
+PREVIEW_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "lsl", "usl", "unit", "source")  # all kept with each row
+DISPLAY_COLUMNS = ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")  # the ones the table shows
+ALL_ITEMS = "All Test Items"
 SECTION_NAMES = {"charts": "Charts", "observations": "Observations used (Excel only)"}
 
 
@@ -92,12 +104,15 @@ class ValidationWorkspace(ttk.Frame):
         self.grouped: Mapping[str, Sequence[LogRecord]] = {}
         self.components: tuple[str, ...] = ()
         self.expected_repeats: int | None = None
-        self.field_mapping: dict[str, str] = {}
         self.assignments: dict[str, dict[str, str]] = {}
+        self._checks: dict[str, tuple[list, list]] = {}  # label -> (data checks, guidelines)
+        self._ready_message = ""
         self.result_set: ResultSet | None = None
         self.evaluated = None
         self._judge_state: tuple | None = None
-        self._sash_placed = False
+        self._date_chosen = False  # the date of study stays as chosen; until then it is today
+        self._wide = False  # Results: the table beside the charts (wide window) or above them
+        self._sash_set = {False: False, True: False}
         self._auto_within_cache: tuple | None = None
         self.setup_error = ""
         self.last_report: Path | None = None
@@ -124,10 +139,10 @@ class ValidationWorkspace(ttk.Frame):
     def _make_variables(self) -> None:
         self.source_var = tk.StringVar(value="mapping")
         self.order_var = tk.StringVar(value=ORDERS["worksheet"])
+        self.item_filter_var = tk.StringVar(value=ALL_ITEMS)
+        self._filter_sync = False
         self.method_var = tk.StringVar(value="grr")
-        self.operators_var = tk.StringVar()
-        self.operator_order_var = tk.StringVar(value="by_operator")
-        self.nest_var = tk.BooleanVar(value=False)
+        self.study_factor_var = tk.StringVar(value="6")
         self.assign_var = tk.BooleanVar(value=True)
         self.repeats_var = tk.StringVar()
         self.profile_var = tk.StringVar(value=NO_CRITERIA)
@@ -141,7 +156,7 @@ class ValidationWorkspace(ttk.Frame):
         self.filter_var = tk.StringVar(value=STATUSES[0])
         self.sort_var = tk.StringVar(value="Test Item")
         self.gage_var = tk.StringVar()
-        self.date_var = tk.StringVar()
+        self.date_var = tk.StringVar(value=date.today().strftime(DATE_FORMAT))  # the date of study: today unless chosen
         self.by_var = tk.StringVar()
         self.comments_var = tk.StringVar()
         self.sections = {name: tk.BooleanVar(value=name == "charts") for name in ALL_SECTIONS}
@@ -159,7 +174,7 @@ class ValidationWorkspace(ttk.Frame):
         self.report_var = tk.StringVar()
 
     def _wire(self) -> None:
-        setup = (self.method_var, self.operators_var, self.operator_order_var, self.nest_var, self.assign_var, self.repeats_var,
+        setup = (self.method_var, self.study_factor_var, self.assign_var, self.repeats_var,
                  self.profile_var, self.within_var, self.subgroup_var, self.index_var, self.threshold_var, self.judge_var)
         for variable in setup:
             variable.trace_add("write", self._settings_changed)
@@ -167,6 +182,7 @@ class ValidationWorkspace(ttk.Frame):
         self.judge_var.trace_add("write", lambda *_: self._apply_judge_layout())
         self.source_var.trace_add("write", lambda *_: self._source_kind_changed())
         self.order_var.trace_add("write", lambda *_: self.data_edited())
+        self.item_filter_var.trace_add("write", lambda *_: None if self._filter_sync else self._refresh_data_view())
         for variable in (self.filter_var, self.search_var, self.sort_var, self.precision_var):
             variable.trace_add("write", lambda *_: self._refresh_table())
         for variable in (self.gage_var, self.date_var, self.by_var, self.comments_var):
@@ -181,7 +197,11 @@ class ValidationWorkspace(ttk.Frame):
         self.run_button.grid(row=0, column=0)
         self.message_label = ttk.Label(strip, textvariable=self.message_var, style="SurfaceHint.TLabel", wraplength=700, justify="left")
         self.message_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        strip.bind("<Configure>", lambda e: self.message_label.configure(wraplength=max(200, e.width - 160)))
+        ttk.Label(strip, text="Decimals", style="SurfaceHint.TLabel").grid(row=0, column=2, padx=(12, 4))
+        ttk.Spinbox(strip, from_=2, to=8, textvariable=self.precision_var, width=3).grid(row=0, column=3)
+        self.about_button = ttk.Button(strip, text="About the method", command=self.show_about)
+        self.about_button.grid(row=0, column=4, padx=(10, 0))
+        strip.bind("<Configure>", lambda e: self.message_label.configure(wraplength=max(200, e.width - 420)))
 
         self.stale_banner = ttk.Frame(self, style="Banner.TFrame", padding=(12, 6))
         self.stale_banner.columnconfigure(0, weight=1)
@@ -210,53 +230,56 @@ class ValidationWorkspace(ttk.Frame):
 
     def _build_data(self) -> None:
         tab = self.data_tab
-        tab.rowconfigure(5, weight=1)
-        kinds = ttk.Frame(tab, style="Surface.TFrame")
-        kinds.grid(row=0, column=0, sticky="w")
+        tab.rowconfigure(4, weight=1)
+        top = ttk.Frame(tab, style="Surface.TFrame")
+        top.grid(row=0, column=0, sticky="ew")
+        kinds = ttk.Frame(top, style="Surface.TFrame")
+        kinds.pack(side="left")
         ttk.Radiobutton(kinds, text="Use Data Mapping results", variable=self.source_var, value="mapping",
                         style="Surface.TRadiobutton").pack(side="left", padx=(0, 16))
-        ttk.Radiobutton(kinds, text="Import a RawData.xlsx", variable=self.source_var, value="file",
+        ttk.Radiobutton(kinds, text="Import RawData.xlsx", variable=self.source_var, value="file",
                         style="Surface.TRadiobutton").pack(side="left")
-
-        self.mapping_controls = ttk.Frame(tab, style="Surface.TFrame")
-        self.mapping_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.mapping_button = ttk.Button(self.mapping_controls, text="Field mapping…", command=lambda: MappingDialog(self))
-        self.mapping_button.pack(side="left")
+        self.settings_button = ttk.Menubutton(top, text="Settings ▾")
+        self.settings_button.pack(side="right")
+        self.order_menu = tk.Menu(self.settings_button, tearoff=0)  # the order of the readings; filled by _apply_source_layout
+        self.settings_button.configure(menu=self.order_menu)
+        self.mapping_controls = ttk.Frame(top, style="Surface.TFrame")
         self.assignments_button = ttk.Button(self.mapping_controls, text="File assignments…", command=lambda: AssignmentDialog(self))
-        self.assignments_button.pack(side="left", padx=6)
-        self.file_controls = ttk.Frame(tab, style="Surface.TFrame")
-        self.file_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.assignments_button.pack(side="left")
+        self.file_controls = ttk.Frame(top, style="Surface.TFrame")
         self.file_button = ttk.Button(self.file_controls, text="Choose file…", command=self.choose_file)
         self.file_button.pack(side="left")
         ttk.Label(self.file_controls, textvariable=self.file_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
-        order = ttk.Frame(tab, style="Surface.TFrame")
-        order.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(order, text="Order of the readings", style="SurfaceHint.TLabel").pack(side="left")
-        self.order_combo = ttk.Combobox(order, textvariable=self.order_var, state="readonly", width=38,
-                                        values=[ORDERS[key] for key in ORDERS])
-        self.order_combo.pack(side="left", padx=8)
-        ttk.Label(tab, textvariable=self.dataset_var, style="Section.TLabel").grid(row=3, column=0, sticky="w", pady=(12, 0))
-        self.hint_label = ttk.Label(tab, textvariable=self.hint_var, style="SurfaceHint.TLabel", wraplength=800, justify="left")
-        self.hint_label.grid(row=4, column=0, sticky="w")
+        ttk.Label(tab, textvariable=self.dataset_var, style="Section.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.hint_label = ttk.Label(tab, textvariable=self.hint_var, style="SurfaceHint.TLabel", foreground=self.palette.warn,
+                                    wraplength=800, justify="left")
+        self.hint_label.grid(row=2, column=0, sticky="w")
         self.hint_label.grid_remove()
         tab.bind("<Configure>", lambda e: self.hint_label.configure(wraplength=max(200, e.width - 40)))
+        chooser = ttk.Frame(tab, style="Surface.TFrame")
+        chooser.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(chooser, text="Test Item", style="SurfaceHint.TLabel").pack(side="left")
+        self.item_filter = ttk.Combobox(chooser, textvariable=self.item_filter_var, state="readonly", width=42, values=[ALL_ITEMS])
+        self.item_filter.pack(side="left", padx=8)
 
         frame = ttk.Frame(tab, style="Surface.TFrame")
-        frame.grid(row=5, column=0, sticky="nsew", pady=(6, 0))
+        frame.grid(row=4, column=0, sticky="nsew", pady=(6, 0))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        columns = ("test_item", "sample", "value", "lsl", "usl", "unit", "source")
-        self.preview = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
-        for column, (title, width, anchor) in zip(columns, (("Test Item", 200, "w"), ("Sample ID", 130, "w"), ("Value", 115, "e"),
-                                                             ("LSL", 80, "e"), ("USL", 80, "e"), ("Unit", 60, "w"), ("Source", 260, "w")),
-                                                  strict=True):
-            self.preview.heading(column, text=title)
-            self.preview.column(column, width=width, minwidth=50, anchor=anchor, stretch=column in ("test_item", "source"))
+        self.preview = ttk.Treeview(frame, columns=PREVIEW_COLUMNS, displaycolumns=DISPLAY_COLUMNS, show="headings", selectmode="browse")
+        for column, (title, width, anchor) in {"test_item": ("Test Item", 220, "w"), "sample": ("Sample ID", 140, "w"),
+                                               "operator": ("Operator", 80, "w"), "trial": ("Trial", 60, "center"),
+                                               "value": ("Value", 120, "e"), "lsl": ("LSL", 100, "e"), "usl": ("USL", 100, "e"),
+                                               "unit": ("Unit", 60, "center"), "source": ("Source", 200, "w")}.items():
+            self.preview.heading(column, text=title, anchor=anchor)
+            self.preview.column(column, width=width, minwidth=50, anchor=anchor, stretch=column == "test_item")
+        self.preview.tag_configure("inferred", foreground=self.palette.muted)  # a Trial counted from the row order, not read from the data
         self.preview.grid(row=0, column=0, sticky="nsew")
         ys = ttk.Scrollbar(frame, orient="vertical", command=self.preview.yview)
         ys.grid(row=0, column=1, sticky="ns")
         self.preview.configure(yscrollcommand=ys.set)
-        ttk.Label(tab, textvariable=self.preview_note_var, style="SurfaceHint.TLabel").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(tab, textvariable=self.preview_note_var, style="SurfaceHint.TLabel", wraplength=800, justify="left").grid(
+            row=5, column=0, sticky="w", pady=(4, 0))
 
     def _build_setup(self) -> None:
         tab = self.setup_tab
@@ -282,21 +305,13 @@ class ValidationWorkspace(ttk.Frame):
             return label
 
         grr = self.grr_setup
-        ttk.Label(grr, text="Operators", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
-        operators = ttk.Frame(grr, style="Surface.TFrame")
-        operators.grid(row=0, column=1, sticky="w", pady=3)
-        self.operators_entry = ttk.Entry(operators, textvariable=self.operators_var, width=34)
-        self.operators_entry.pack(side="left")
-        ttk.Label(operators, text="empty = one appraiser (repeatability only); or names separated by commas",
-                  style="SurfaceHint.TLabel").pack(side="left", padx=8)
-        ttk.Label(grr, text="Readings of a sample", style="Surface.TLabel").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 12))
-        self.operator_order_combo = ttk.Combobox(grr, state="readonly", width=26, values=list(OPERATOR_ORDERS.values()))
-        self.operator_order_combo.set(OPERATOR_ORDERS["by_operator"])
-        self.operator_order_combo.grid(row=1, column=1, sticky="w", pady=3)
-        self.nest_check = ttk.Checkbutton(grr, text="Nest as Operator (each Slot is treated as an operator)", variable=self.nest_var,
-                                          style="Surface.TCheckbutton")
-        self.nest_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        hint(grr, "Reproducibility then reflects differences between nests, not people. Recorded in the report.", 3)
+        ttk.Label(grr, text="Study variation (k)", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
+        factor = ttk.Frame(grr, style="Surface.TFrame")
+        factor.grid(row=0, column=1, sticky="w", pady=3)
+        self.study_factor_combo = ttk.Combobox(factor, textvariable=self.study_factor_var, state="readonly", width=4,
+                                               values=[str(k) for k in STUDY_FACTORS])
+        self.study_factor_combo.pack(side="left")
+        ttk.Label(factor, text="Study Var = k × SD. The usual choice is 6 (±3σ).", style="SurfaceHint.TLabel").pack(side="left", padx=8)
         ttk.Checkbutton(grr, text="Label the repeated readings of a sample as trials 1, 2, 3… when the data have no Trial",
                         variable=self.assign_var, style="Surface.TCheckbutton").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         hint(grr, "Only to organise the data in rows. It is not taken as the order of measurement.", 5)
@@ -339,59 +354,70 @@ class ValidationWorkspace(ttk.Frame):
         ttk.Combobox(self.advanced, textvariable=self.within_var, values=list(WITHIN_CHOICES.values()), state="readonly",
                      width=48).pack(side="left")
         self.advanced.grid_remove()
-        self.operator_order_combo.bind("<<ComboboxSelected>>", self._operator_order_picked)
 
     def _build_results(self) -> None:
         tab = self.results_tab
-        tab.rowconfigure(2, weight=1)
-        self.notes_bar = ttk.Frame(tab, style="Surface.TFrame")
-        self.notes_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        self.notes_bar.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        head = ttk.Frame(tab, style="Surface.TFrame")
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        head.columnconfigure(1, weight=1)
+        ttk.Label(head, textvariable=self.summary_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.notes_bar = ttk.Frame(head, style="Surface.TFrame")  # what to keep in mind, beside the summary, only when there is something
+        self.notes_bar.grid(row=0, column=1, sticky="w", padx=(16, 0))
         self.notes_label = ttk.Label(self.notes_bar, textvariable=self.notes_var, style="Surface.TLabel",
-                                     foreground=self.palette.warn, wraplength=700, justify="left")
+                                     foreground=self.palette.warn, wraplength=500, justify="left")
         self.notes_label.grid(row=0, column=0, sticky="w")
         self.notes_button = ttk.Button(self.notes_bar, text="Read the notes…", command=self.show_notes)
-        self.notes_button.grid(row=0, column=1, padx=(12, 0))
-        self.notes_bar.bind("<Configure>", lambda e: self.notes_label.configure(wraplength=max(200, e.width - 200)))
+        self.notes_button.grid(row=0, column=1, padx=(10, 0))
+        head.bind("<Configure>", lambda e: self.notes_label.configure(wraplength=max(200, e.width - 560)))
         self.notes_bar.grid_remove()
 
-        head = ttk.Frame(tab, style="Surface.TFrame")
-        head.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        head.columnconfigure(0, weight=1)
-        ttk.Label(head, textvariable=self.summary_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        filters = ttk.Frame(head, style="Surface.TFrame")
-        filters.grid(row=0, column=1, sticky="e")
-        ttk.Label(filters, text="Search", style="SurfaceHint.TLabel").pack(side="left", padx=(0, 4))
-        ttk.Entry(filters, textvariable=self.search_var, width=14).pack(side="left")
-        self.filter_combo = ttk.Combobox(filters, textvariable=self.filter_var, values=STATUSES, state="readonly", width=17)
-        self.filter_combo.pack(side="left", padx=6)
-        self.sort_combo = ttk.Combobox(filters, textvariable=self.sort_var, state="readonly", width=11,
-                                       values=("Test Item", "%SV/Tol", "%Study Var", "NDC", "Cpk"))
-        self.sort_combo.pack(side="left")
-
-        split = self.split = ttk.PanedWindow(tab, orient="vertical")
-        split.grid(row=2, column=0, sticky="nsew")
-        split.bind("<Configure>", self._place_sash)
-        table_page = ttk.Frame(split, style="Surface.TFrame")
+        # Two panes, in one of two paned windows: above each other, or side by side when the window is wide enough
+        self.split_rows = ttk.PanedWindow(tab, orient="vertical")
+        self.split_cols = ttk.PanedWindow(tab, orient="horizontal")
+        self.split = self.split_rows
+        self.split.grid(row=1, column=0, sticky="nsew")
+        for paned in (self.split_rows, self.split_cols):  # the divider is placed once the paned window has its real size
+            paned.bind("<Configure>", lambda _e: None if self._sash_set[self._wide] else self._place_sash())
+        tab.bind("<Configure>", self._arrange_results)
+        table_page = self.table_page = ttk.Frame(tab, style="Surface.TFrame")
         table_page.columnconfigure(0, weight=1)
-        table_page.rowconfigure(0, weight=1)
-        split.add(table_page, weight=1)
+        table_page.rowconfigure(1, weight=1)
+        filters = ttk.Frame(table_page, style="Surface.TFrame")
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        filters.columnconfigure(1, weight=1)
+        ttk.Label(filters, text="Search", style="SurfaceHint.TLabel").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(filters, textvariable=self.search_var, width=8).grid(row=0, column=1, sticky="ew")
+        self.filter_combo = ttk.Combobox(filters, textvariable=self.filter_var, values=STATUSES, state="readonly", width=15)
+        self.sort_combo = ttk.Combobox(filters, textvariable=self.sort_var, state="readonly", width=10,
+                                       values=("Test Item", "%SV/Tol", "%Study Var", "NDC", "Cpk"))
+        self.sort_combo.grid(row=0, column=3, padx=(6, 0))
+        self.filters = filters
         self.table = ttk.Treeview(table_page, show="headings", selectmode="browse", height=3)
-        self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.grid(row=1, column=0, sticky="nsew")
         ys = ttk.Scrollbar(table_page, orient="vertical", command=self.table.yview)
-        ys.grid(row=0, column=1, sticky="ns")
+        ys.grid(row=1, column=1, sticky="ns")
         xs = ttk.Scrollbar(table_page, orient="horizontal", command=self.table.xview)
-        xs.grid(row=1, column=0, sticky="ew")
-        self.table.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        xs.grid(row=2, column=0, sticky="ew")
+        self.table_bars = (ys, xs)
+        self.table.configure(yscrollcommand=lambda lo, hi: self._scrolled(ys, lo, hi), xscrollcommand=lambda lo, hi: self._scrolled(xs, lo, hi))
         self.table.bind("<<TreeviewSelect>>", self._select_result)
-        self.table.bind("<Double-1>", lambda _e: self.show_details())
         self.review_label = ttk.Label(table_page, textvariable=self.review_var, style="SurfaceHint.TLabel", wraplength=700, justify="left")
-        self.review_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.review_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.review_label.grid_remove()
         table_page.bind("<Configure>", lambda e: self.review_label.configure(wraplength=max(200, e.width - 24)))
 
-        self.result_tabs = ttk.Notebook(split)
-        split.add(self.result_tabs, weight=3)
+        right = self.right_pane = ttk.Frame(tab, style="Surface.TFrame")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        self.selected_var = tk.StringVar()
+        self.selected_label = ttk.Label(right, textvariable=self.selected_var, style="Section.TLabel")  # which item the charts are of
+        self.selected_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.selected_label.grid_remove()
+        self.result_tabs = ttk.Notebook(right)
+        self.result_tabs.grid(row=1, column=0, sticky="nsew")
+        self.split.add(table_page, weight=1)
+        self.split.add(right, weight=3)
         chart_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
         chart_page.columnconfigure(0, weight=1)
         chart_page.rowconfigure(0, weight=1)
@@ -400,7 +426,7 @@ class ValidationWorkspace(ttk.Frame):
         self.chart_canvas.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(chart_page, orient="vertical", command=self.chart_canvas.yview)
         scroll.grid(row=0, column=1, sticky="ns")
-        self.chart_canvas.configure(yscrollcommand=scroll.set)
+        self.chart_canvas.configure(yscrollcommand=lambda lo, hi: self._scrolled(scroll, lo, hi))
         self.chart_canvas.bind("<Configure>", lambda _e: self._draw_chart())
         self.chart_canvas.bind("<MouseWheel>", lambda e: self.chart_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
 
@@ -412,22 +438,53 @@ class ValidationWorkspace(ttk.Frame):
         self.session.text.configure(font=("Consolas", 10), wrap="none")
         self.session.grid(row=0, column=0, sticky="nsew")
 
-        foot = ttk.Frame(tab, style="Surface.TFrame")
-        foot.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.detail_button = ttk.Button(foot, text="Calculation details", command=self.show_details, state="disabled")
-        self.detail_button.pack(side="left")
-        self.about_button = ttk.Button(foot, text="About the method", command=self.show_about)
-        self.about_button.pack(side="left", padx=6)
-        self.issues_button = ttk.Button(foot, text="Data messages", command=self.show_issues, state="disabled")
-        self.issues_button.pack(side="left")
-        ttk.Spinbox(foot, from_=2, to=8, textvariable=self.precision_var, width=3).pack(side="right")
-        ttk.Label(foot, text="Decimals shown", style="SurfaceHint.TLabel").pack(side="right", padx=(0, 6))
+        checks_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
+        checks_page.columnconfigure(0, weight=1)
+        checks_page.rowconfigure(0, weight=1)
+        self.result_tabs.add(checks_page, text="Checks")
+        self.checks_view = ReadOnlyText(checks_page, self.palette, height=8, width=60)
+        self.checks_view.grid(row=0, column=0, sticky="nsew")
 
-    def _place_sash(self, event) -> None:
-        """The table keeps a few rows and the charts get the rest; the user can drag the divider afterwards."""
-        if not self._sash_placed and event.height > 260:
-            self._sash_placed = True
-            self.split.sashpos(0, 150 if event.height > 380 else 120)
+    @staticmethod
+    def _scrolled(bar: ttk.Scrollbar, low: str, high: str) -> None:
+        """A scrollbar that is there only while there is something to scroll: the room goes to the data."""
+        if float(low) <= 0.0 and float(high) >= 1.0:
+            bar.grid_remove()
+        else:
+            bar.grid()
+        bar.set(low, high)
+
+    def _arrange_results(self, event=None) -> None:
+        """Wide window: the table beside the charts, each with the full height. Narrower: the table above, with a few rows."""
+        width, height = self.results_tab.winfo_width(), self.results_tab.winfo_height()
+        if width < 200 or height < 200:
+            return
+        wide = width >= WIDE_RESULTS
+        if wide != self._wide or self.split.winfo_manager() == "":
+            old, new = (self.split_rows, self.split_cols) if wide else (self.split_cols, self.split_rows)
+            for pane in (self.table_page, self.right_pane):
+                if str(pane) in old.panes():
+                    old.forget(pane)
+            old.grid_remove()
+            new.add(self.table_page, weight=1)
+            new.add(self.right_pane, weight=2 if wide else 3)
+            new.grid(row=1, column=0, sticky="nsew")
+            self.split, self._wide = new, wide
+            self._sash_set[wide] = False
+            (self.selected_label.grid if wide else self.selected_label.grid_remove)()
+            self.update_idletasks()  # a divider can only be placed once the panes have been laid out
+        if not self._sash_set[wide]:
+            self._place_sash()
+
+    def _place_sash(self) -> None:
+        """The table gets a third of a wide window (but not less than its columns need), or a few rows of a narrow one; the user can drag."""
+        wide = self._wide
+        size = self.split.winfo_width() if wide else self.split.winfo_height()
+        if size < (400 if wide else 260):
+            return
+        target = max(380, min(560, size * 36 // 100)) if wide else 170 if size > 380 else 140
+        self.split.sashpos(0, target)
+        self._sash_set[wide] = abs(self.split.sashpos(0) - target) <= 3  # not placed yet: the next resize tries again
 
     def _build_report(self) -> None:
         tab = self.report_tab
@@ -440,10 +497,20 @@ class ValidationWorkspace(ttk.Frame):
         fields = (("Gage name", self.gage_var), ("Date of study", self.date_var), ("Reported by", self.by_var), ("Misc", self.comments_var))
         for row, (label, variable) in enumerate(fields, start=1):
             ttk.Label(left, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=3, padx=(0, 10))
-            entry = ttk.Entry(left, textvariable=variable, width=40)
-            entry.grid(row=row, column=1, sticky="w", pady=3)
+            if variable is self.date_var:  # chosen from a calendar, never typed
+                field = ttk.Frame(left, style="Surface.TFrame")
+                field.grid(row=row, column=1, sticky="w", pady=3)
+                entry = ttk.Entry(field, textvariable=variable, width=14, state="readonly")
+                entry.pack(side="left")
+                entry.bind("<Button-1>", lambda _e: self.choose_date())
+                self.date_button = ttk.Button(field, text="Choose date…", command=self.choose_date)
+                self.date_button.pack(side="left", padx=8)
+            else:
+                entry = ttk.Entry(left, textvariable=variable, width=40)
+                entry.grid(row=row, column=1, sticky="w", pady=3)
             self.info_entries[label] = entry
-        ttk.Label(left, text="Shown with each item when entered. The report records the day it was made.", style="SurfaceHint.TLabel",
+        ttk.Label(left, text="Shown with each item when entered. The date of study is today unless you choose another day "
+                  "(DD-MM-YYYY).", style="SurfaceHint.TLabel",
                   wraplength=360, justify="left").grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         right = ttk.Frame(tab, style="Surface.TFrame")
@@ -502,10 +569,6 @@ class ValidationWorkspace(ttk.Frame):
         label = self.order_var.get()
         return next((key for key, text in ORDERS.items() if text == label), "worksheet")
 
-    def _operator_order_picked(self, _event=None) -> None:
-        picked = self.operator_order_combo.get()
-        self.operator_order_var.set(next((key for key, text in OPERATOR_ORDERS.items() if text == picked), "by_operator"))
-
     def set_customers(self, customers, selected=None) -> None:
         """Adopt the customers edited in the dialog and keep them for next time."""
         self.customers = dict(customers)
@@ -522,11 +585,16 @@ class ValidationWorkspace(ttk.Frame):
     def set_palette(self, palette: Palette) -> None:
         self.palette = palette
         self.notes_label.configure(foreground=palette.warn)
+        self.hint_label.configure(foreground=palette.warn)
+        self.preview.tag_configure("inferred", foreground=palette.muted)
         self.review_label.configure(foreground=palette.warn)
         for status, color in (("PASS", palette.ok), ("CONDITIONAL PASS", palette.warn), ("FAIL", palette.danger), ("N/A", palette.muted)):
             self.table.tag_configure(status, foreground=color)
-        self.session.text.configure(bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
-                                    highlightbackground=palette.line, highlightcolor=palette.accent)
+        for view in (self.session, self.checks_view):
+            view.text.configure(bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
+                                highlightbackground=palette.line, highlightcolor=palette.accent)
+        for tag, color in ((OK, palette.ok), (CAUTION, palette.warn), (INFO, palette.muted)):
+            self.checks_view.text.tag_configure(tag, foreground=color)
         self.item_list.configure(bg=palette.surface, fg=palette.fg, selectbackground=palette.accent,
                                  selectforeground=palette.on_accent, highlightbackground=palette.line, highlightcolor=palette.accent)
 
@@ -552,11 +620,18 @@ class ValidationWorkspace(ttk.Frame):
             widget.configure(state="normal" if self.judge_var.get() else "disabled")
 
     def _apply_source_layout(self) -> None:
+        """What belongs to the chosen source: File assignments only for Data Mapping results that exist; the choice file for an import."""
         mapping = self.source_var.get() == "mapping"
-        (self.mapping_controls.grid if mapping else self.mapping_controls.grid_remove)()
-        (self.file_controls.grid_remove if mapping else self.file_controls.grid)()
+        for frame, shown in ((self.mapping_controls, mapping and bool(self.grouped)), (self.file_controls, not mapping)):
+            if shown:
+                frame.pack(side="left", padx=(16, 0))
+            else:
+                frame.pack_forget()
         keys = list(ORDERS) if mapping else list(FILE_ORDERS)
-        self.order_combo.configure(values=[ORDERS[key] for key in keys])
+        self.order_menu.delete(0, "end")
+        self.order_menu.add_command(label="Order of the readings", state="disabled")
+        for key in keys:
+            self.order_menu.add_radiobutton(label=ORDERS[key], variable=self.order_var, value=ORDERS[key])
         if self._order_key() not in keys:
             self.order_var.set(ORDERS["worksheet"])
 
@@ -572,6 +647,8 @@ class ValidationWorkspace(ttk.Frame):
 
     def on_show(self) -> None:
         """Compare Data Mapping's current results with the snapshot (cheap) and take a new one only if they differ."""
+        if not self._date_chosen:
+            self.date_var.set(date.today().strftime(DATE_FORMAT))  # the date of study is today, also when the program stays open overnight
         source = self._provider()
         key = source.key if source else None
         if key == self._source_key:
@@ -582,9 +659,9 @@ class ValidationWorkspace(ttk.Frame):
             self.grouped, self.components, self.expected_repeats = {}, (), None
         else:
             self.grouped, self.components, self.expected_repeats = source.grouped, source.components, source.expected_repeats
+            self._apply_source_layout()
             if source.scan != self._scan:  # a new scan is a new study: nothing of the old files carries over
                 self._scan = source.scan
-                self.field_mapping.clear()
                 self.assignments.clear()
                 self.repeats_var.set(str(source.expected_repeats) if source.expected_repeats else "")
                 self.study = self.result_set = self.evaluated = None
@@ -623,7 +700,7 @@ class ValidationWorkspace(ttk.Frame):
         self.tasks.run(lambda _report: import_rawdata_xlsx(path), on_success=loaded, on_error=failed)
 
     def data_edited(self) -> None:
-        """Field mapping, file assignments or the order changed: take a new snapshot."""
+        """File assignments or the order changed: take a new snapshot."""
         if self.mapping_source is not None or self.imported is not None:
             self._prepare_dataset()
 
@@ -635,10 +712,10 @@ class ValidationWorkspace(ttk.Frame):
             if source is None or not source.components:
                 self._clear_dataset("No Data Mapping results yet. Scan logs and choose test items in Data Mapping, or import a RawData.xlsx.")
                 return
-            field_mapping, assignments = dict(self.field_mapping), {k: dict(v) for k, v in self.assignments.items()}
+            assignments = {k: dict(v) for k, v in self.assignments.items()}
 
             def work(_report):
-                return build_mapping_dataset(source, field_mapping, assignments, order)
+                return build_mapping_dataset(source, assignments, order)
         else:
             imported = self.imported
             if imported is None:
@@ -670,7 +747,9 @@ class ValidationWorkspace(ttk.Frame):
         self.hint_var.set("")
         self.hint_label.grid_remove()
         self.preview.delete(*self.preview.get_children())
+        self._fill_item_filter([])
         self.preview_note_var.set("")
+        self._apply_source_layout()
         self.setup_error = ""
         self.message_var.set(message)
         self._refresh_table()
@@ -679,7 +758,7 @@ class ValidationWorkspace(ttk.Frame):
 
     def _mapping_record(self) -> dict:
         return {"source": self.source_var.get(), "components": list(self.components) if self.source_var.get() == "mapping" else [],
-                "field_mapping": dict(self.field_mapping), "assignments": {k: dict(v) for k, v in self.assignments.items()},
+                "assignments": {k: dict(v) for k, v in self.assignments.items()},
                 "order": self._order_key(), "file": self.file_var.get() if self.source_var.get() == "file" else ""}
 
     def _dataset_ready(self, dataset: Dataset) -> None:
@@ -692,26 +771,92 @@ class ValidationWorkspace(ttk.Frame):
             self.study.dataset = dataset
         self.study.mapping = self._mapping_record()
         self._info_changed()  # the information typed on the Report tab belongs to whichever study is current
-        samples = len({o.sample_id for o in dataset.observations})
-        order = {"worksheet": "worksheet order", "acquisition": "measurement order", "custom": "custom order"}[dataset.order_basis]
-        self.dataset_var.set(f"{samples} samples · {len(dataset)} readings · {len(dataset.items)} test items · {order}")
-        notes = list(self.imported.warnings) if self.source_var.get() == "file" and self.imported else []
-        if dataset.order_basis == "worksheet":
-            notes.append("Worksheet order is the order of the rows, not a verified order of measurement.")
-        notes.append(f"Data fingerprint {dataset.fingerprint[:19]}")
-        self.hint_var.set("  ".join(notes))
-        self.hint_label.grid()
+        self.message_var.set(self._ready_message or "Ready. Press Run analysis, or set up the study first.")
+        self._ready_message = ""
+        self._settings_changed()  # shows the data as they will be analysed, with the design applied
+
+    def _refresh_data_view(self) -> None:
+        """The data tab: a four-figure summary, warnings only when there is something to fix, and the readings as the analysis sees them."""
+        dataset, study = self.dataset, self.study
+        if dataset is None or study is None:
+            return
+        rows, warnings = dataset.observations, list(self.imported.warnings) if self.source_var.get() == "file" and self.imported else []
+        try:
+            rows = study.analysis_observations()
+        except DesignError as exc:
+            warnings.append(f"The study design cannot be applied to these data: {exc}")
+        else:
+            if study.options.method == "grr":
+                warnings += describe_layouts(rows, only_unbalanced=True)
+                if not study.options.assign_trials and any(not str(row.trial).strip() for row in rows):
+                    warnings.append("These readings have no Trial. Turn on trial labelling in the Analysis tab, or give each file its "
+                                    "trial in File assignments.")
+            elif dataset.order_basis == "worksheet":
+                warnings.append("The readings are in worksheet order, which is not a verified order of measurement. Capability depends "
+                                "on that order: choose another in Settings.")
+        self.dataset_var.set(self._summary(rows))
+        self.hint_var.set("  ".join(warnings))
+        (self.hint_label.grid if warnings else self.hint_label.grid_remove)()
+        items = list(dict.fromkeys(str(row.test_item) for row in rows))
+        self._fill_item_filter(items)
+        chosen = self.item_filter_var.get()
+        listed = [entry for entry in self._with_trials(rows) if chosen == ALL_ITEMS or str(entry[0].test_item) == chosen]
         self.preview.delete(*self.preview.get_children())
-        for index, row in enumerate(dataset.observations[:PREVIEW_ROWS]):
-            self.preview.insert("", "end", iid=str(index), values=(
-                row.test_item, row.sample_id, display_number(row.value) if isinstance(row.value, float) else row.value,
-                display_number(row.lsl) if isinstance(row.lsl, float) else row.lsl,
-                display_number(row.usl) if isinstance(row.usl, float) else row.usl, row.unit, row.source))
-        shown = min(PREVIEW_ROWS, len(dataset))
-        self.preview_note_var.set(f"Showing the first {shown} of {len(dataset)} readings." if shown < len(dataset)
-                                  else f"{len(dataset)} readings.")
-        self.message_var.set("Ready. Press Run analysis, or set up the study first.")
-        self._settings_changed()
+        for index, (row, trial, inferred) in enumerate(listed[:PREVIEW_ROWS]):
+            self.preview.insert("", "end", iid=str(index), tags=("inferred",) if inferred else (), values=(
+                row.test_item, row.sample_id, row.operator, trial, self._cell(row.value), self._cell(row.lsl), self._cell(row.usl),
+                row.unit, row.source))
+        shown = min(PREVIEW_ROWS, len(listed))
+        note = f"Showing the first {shown} of {len(listed)} readings." if shown < len(listed) else f"{len(listed)} readings."
+        if any(inferred for _, _, inferred in listed[:shown]):
+            note += " Trial numbers in grey are counted from the row order of each sample; they are not the order of measurement."
+        self.preview_note_var.set(note)
+
+    @staticmethod
+    def _cell(value) -> str:
+        """A reading as the table shows it: at least six significant digits, written out in full. The data keep their own value."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            whole = len(str(int(abs(number)))) if math.isfinite(number) else 0  # a large reading keeps its integer digits and 3 more
+            return plain_number(number, max(6, whole + 3))
+        return "" if value is None else str(value)
+
+    @staticmethod
+    def _summary(rows: Sequence) -> str:
+        systems: dict = defaultdict(list)
+        for row in rows:
+            systems[(row.test_item, row.tester, row.slot)].append(row)
+        layouts = [layout_of(group) for group in systems.values()]
+        fewest, most = min((one.fewest for one in layouts), default=0), max((one.most for one in layouts), default=0)
+        trials = str(most) if fewest == most else f"{fewest}–{most}"
+        return (f"Test Items {len({row.test_item for row in rows})}  ·  Samples {len({row.sample_id for row in rows})}  ·  "
+                f"Total Readings {len(rows)}  ·  Trials per Sample {trials}")
+
+    def _fill_item_filter(self, items: Sequence[str]) -> None:
+        self.item_filter.configure(values=[ALL_ITEMS, *items])
+        if self.item_filter_var.get() not in (ALL_ITEMS, *items):
+            self._filter_sync = True  # going back to all items is not a choice to redraw for: the table is being redrawn anyway
+            self.item_filter_var.set(ALL_ITEMS)
+            self._filter_sync = False
+
+    def _with_trials(self, rows: Sequence) -> list[tuple]:
+        """(row, Trial to show, whether it is inferred). Where the data have no Trial the analysis counts the readings of a sample
+        in row order; the worksheet shows those counts too, marked as inferred: they are not the order of measurement."""
+        study = self.study
+        if study is None or study.options.method != "grr" or not study.options.assign_trials:
+            return [(row, row.trial, False) for row in rows]
+        with_trial = {(row.test_item, row.tester, row.slot) for row in rows if str(row.trial).strip()}
+        counts: dict = defaultdict(int)
+        shown = []
+        for row in rows:
+            system = (row.test_item, row.tester, row.slot)
+            if system in with_trial:
+                shown.append((row, row.trial, False))
+                continue
+            key = (system, str(row.sample_id).strip(), str(row.operator).strip())
+            counts[key] += 1
+            shown.append((row, str(counts[key]), True))
+        return shown
 
     # ------------------------------------------------------------------ the study
     def _within_key(self) -> str:
@@ -731,15 +876,15 @@ class ValidationWorkspace(ttk.Frame):
         method = self.method_var.get()
         evaluation, judge = self._evaluation_for(method), self._judge_for(method)
         if method == "grr":
-            names = [name.strip() for name in self.operators_var.get().split(",") if name.strip()]
-            if len(names) == 1:
-                raise ValueError("Enter at least two operator names, or leave Operators empty for one appraiser.")
-            if len({name.casefold() for name in names}) != len(names):
-                raise ValueError("Operator names must be different.")
-            if names and self.nest_var.get():
-                raise ValueError("Choose either named operators or Nest as Operator, not both.")
-            design = {"operators": names, "operator_order": self.operator_order_var.get(), "nest_as_operator": self.nest_var.get()}
-            options = StatisticalOptions(method="grr", expected_repeats=int_field(self.repeats_var.get(), "Readings per sample", 2),
+            try:
+                factor = int(self.study_factor_var.get())
+            except ValueError:
+                factor = 0
+            if factor not in STUDY_FACTORS:
+                raise ValueError("Study variation (k) must be a whole number from 1 to 6.")
+            design = {}  # one tester: the study estimates repeatability only
+            options = StatisticalOptions(method="grr", study_factor=float(factor),
+                                         expected_repeats=int_field(self.repeats_var.get(), "Readings per sample", 2),
                                          assign_trials=self.assign_var.get())
         else:
             design = {"subgroup_from_sample": self.subgroup_var.get()}
@@ -776,6 +921,7 @@ class ValidationWorkspace(ttk.Frame):
             options, design, evaluation, judge = self._read_setup()
         except ValueError as exc:
             self.setup_error = str(exc)
+            self._refresh_data_view()
             self._refresh_state()
             return
         self.setup_error = ""
@@ -783,9 +929,21 @@ class ValidationWorkspace(ttk.Frame):
         study.options, study.design, study.evaluation = options, design, evaluation
         self._judge_state = judge
         study.mapping = self._mapping_record()
+        self._refresh_data_view()
         if self.result_set is not None and changed:
             self._evaluate()  # new criteria for the same numbers
         self._refresh_state()
+
+    def choose_date(self) -> None:
+        try:
+            current = datetime.strptime(self.date_var.get(), DATE_FORMAT).date()
+        except ValueError:
+            current = date.today()
+        DatePickerDialog(self._dialog_parent(), current, self._date_picked)
+
+    def _date_picked(self, day: date) -> None:
+        self._date_chosen = True
+        self.date_var.set(day.strftime(DATE_FORMAT))
 
     def _info_changed(self) -> None:
         if self.study is not None:
@@ -804,6 +962,8 @@ class ValidationWorkspace(ttk.Frame):
             if self._within_key() == "auto":
                 within += " (chosen from the subgroup size)"
             design += f" Within sigma: {within}."
+        else:
+            design += f" Study variation: {study.options.study_factor:g} × SD."
         if not self._judge_for(study.options.method):
             judged = "No acceptance criteria: statistics only."
         elif capability:
@@ -860,16 +1020,41 @@ class ValidationWorkspace(ttk.Frame):
         except ValueError:
             settings, judge = EvaluationSettings(decision_metric="cpk") if method == "capability" else EvaluationSettings(), False
         self.evaluated = study.evaluate(result_set, settings, judge=judge)
+        self._checks = self._compute_checks()
         self._fill_items()
         self._refresh_table()
+
+    def _compute_checks(self) -> dict[str, tuple[list, list]]:
+        """The data checks and guidelines of every result (screening aids: they change no figure and are not reported)."""
+        if self.evaluated is None or self.study is None:
+            return {}
+        dataset = self.study.dataset
+        known, note = dataset.order_basis == "acquisition", self._order_note(dataset)
+        return {result.label: result_checks(result, order_known=known, order_note=note) for result in self.evaluated.results}
+
+    @staticmethod
+    def _order_note(dataset) -> str:
+        if dataset.order_basis != "acquisition":
+            return " On the Data tab, choose File time order, or confirm that the rows are in measurement order."
+        if "log file was saved" in dataset.description:
+            return " Order of the readings: the time each log file was saved, taken as the order of measurement."
+        if "sorted by timestamp" in dataset.description:
+            return " Order of the readings: the timestamps you assigned."
+        return " Order of the readings: as you confirmed."
 
     def show_notes(self) -> None:
         if self.evaluated is None:
             return
         lines = []
+        for label, message in self._problems():
+            lines += [f"Not analysed: {label}", message, ""]
         for condition in self.evaluated.record.validation.conditions:
             kind = "Warning" if condition.severity.value == "warning" else "Information"
             lines += [f"{CONDITION_TITLES.get(condition.code, condition.code)} ({kind})", condition.message, ""]
+        if self.evaluated.record.method == "capability":
+            lines += ["Screening in this program", "The Checks tab (Results) does screen stability (I and MR chart tests) and normality "
+                      "(Anderson-Darling) on the readings. Those checks are an aid: they are not printed in the report, so the "
+                      "notes above stand in the report as they are.", ""]
         lines.append("These notes do not block a result or a report; the report prints them.")
         ReportDialog(self._dialog_parent(), "Notes on this analysis", "What to keep in mind when reading the results", "\n".join(lines))
 
@@ -894,15 +1079,26 @@ class ValidationWorkspace(ttk.Frame):
         reportable = has_result and not stale and not self.busy
         for button in (self.pdf_button, self.excel_button):
             button.configure(state="normal" if reportable else "disabled")
-        self.issues_button.configure(state="normal" if has_result else "disabled")
         self._refresh_notes()
         if has_result and stale and not self.report_var.get().startswith("Saved"):
             self.report_var.set("Update the results before generating a report.")
         elif has_result and not stale and self.report_var.get().startswith("Update the results"):
             self.report_var.set("")
 
+    def _problems(self) -> list[tuple[str, str]]:
+        """(test item, message) for every item that could not be analysed: what has to be fixed in the data or the settings."""
+        if self.result_set is None:
+            return []
+        return [(stat.label, issue.message) for stat in self.result_set.statistics for issue in stat.issues if issue.severity == "error"]
+
     def _refresh_notes(self) -> None:
         conditions = self.evaluated.record.validation.conditions if self.evaluated else ()
+        failed = {label for label, _ in self._problems()}
+        if failed:
+            self.notes_var.set(f"{len(failed)} item{'s' if len(failed) != 1 else ''} could not be analysed. Read the notes to see what to fix.")
+            self.notes_label.configure(foreground=self.palette.warn)
+            self.notes_bar.grid()
+            return
         if not conditions:
             self.notes_bar.grid_remove()
             return
@@ -923,11 +1119,12 @@ class ValidationWorkspace(ttk.Frame):
         if not results:
             self._visible, self._charts = [], []
             self.summary_var.set("")
+            self.selected_var.set("")
             self.review_var.set("")
             self.review_label.grid_remove()
-            self.detail_button.configure(state="disabled")
             self.chart_canvas.delete("all")
             self.session.set_text("")
+            self.checks_view.set_parts([])
             return
         judged = evaluated.record.judged
         if judged:
@@ -937,10 +1134,13 @@ class ValidationWorkspace(ttk.Frame):
             self.summary_var.set(f"{len(results)} items · " + " · ".join(f"{n} {status}" for status, n in counts.items()))
         else:
             self.summary_var.set(f"{len(results)} items · statistics only")
+        attention = sum(1 for result in results if needs_attention(self._checks.get(result.label, ([], []))[0]))
+        if attention:
+            self.summary_var.set(f"{self.summary_var.get()} · {attention} with data checks to review (Checks tab)")
         if judged and not self.filter_combo.winfo_manager():
-            self.filter_combo.pack(side="left", padx=6, before=self.sort_combo)  # filtering by result needs criteria
+            self.filter_combo.grid(row=0, column=2, padx=(6, 0))  # filtering by result needs criteria
         elif not judged:
-            self.filter_combo.pack_forget()
+            self.filter_combo.grid_remove()
         flagged = [r for r in results if r.details.get("acceptance_conflicts")]
         if flagged:
             names = ", ".join(dict.fromkeys(review_note(r) for r in flagged))
@@ -958,7 +1158,6 @@ class ValidationWorkspace(ttk.Frame):
         self._visible.sort(key=lambda r: (r.metrics.get(metric) is None, r.metrics.get(metric) or 0) if metric else (r.test_item, r.system))
         if not self._visible:
             self._charts = []
-            self.detail_button.configure(state="disabled")
             self.chart_canvas.delete("all")
             return
         all_headers, all_rows = summary_rows(self._visible, judged)
@@ -970,7 +1169,7 @@ class ValidationWorkspace(ttk.Frame):
         precision = self._precision()
         for i, heading in enumerate(headers):
             self.table.heading(str(i), text=heading)
-            wide = 220 if i == 0 else 150 if heading in ("Review", "Acceptance Result", "Result") else 95
+            wide = 180 if i == 0 else 140 if heading in ("Review", "Acceptance Result", "Result") else 80
             self.table.column(str(i), width=wide, minwidth=70, stretch=i == 0, anchor="w" if i == 0 or heading == "Review" else "e")
         for i, row in enumerate(all_rows):
             values = [display_number(row[k], 2 if "%" in all_headers[k] else precision) for k in keep]
@@ -995,10 +1194,27 @@ class ValidationWorkspace(ttk.Frame):
 
     def _select_result(self, *_) -> None:
         result = self.selected_result()
-        self.detail_button.configure(state="normal" if result else "disabled")
         self._charts = report_charts(result, titled=True) if result else []
         self._draw_chart()
+        self.selected_var.set(item_label(result) if result else "")
         self.session.set_text(session_text(result, self._precision()) if result else "")
+        self._show_checks(result)
+
+    def _show_checks(self, result) -> None:
+        """What to look at before trusting this result, and the published guidelines for its figures."""
+        if result is None:
+            self.checks_view.set_parts([])
+            return
+        checks, guidelines = self._checks.get(result.label, ([], []))
+        parts: list[tuple[str, str | None]] = [("Data checks\n", "heading")]
+        for check in checks:
+            parts += [(f"{CHECK_MARKS[check.status]}  {check.topic}: ", check.status), (f"{check.message}\n", None)]
+        if guidelines:
+            parts.append(("\nGuidelines (AIAG, as Minitab quotes them). They help a judgement; they are not a verdict.\n", "heading"))
+            for guideline in guidelines:
+                parts += [(f"•  {guideline.topic}: ", INFO), (f"{guideline.message}\n", None)]
+        parts.append(("\nThese checks change no figure and are not printed in the report.", INFO))
+        self.checks_view.set_parts(parts)
 
     def _draw_chart(self) -> None:
         draw_tk_charts(self.chart_canvas, self._charts, columns=1 if len(self._charts) == 1 else 2)
@@ -1013,42 +1229,8 @@ class ValidationWorkspace(ttk.Frame):
         from ..statistics import AnalysisConfig
 
         config = self._config() or AnalysisConfig(method=self.method_var.get())
-        ReportDialog(self._dialog_parent(), "About the method", METHOD_NAMES[config.method], explain_method(config))
-
-    def show_details(self) -> None:
-        result = self.selected_result()
-        if result is None:
-            return
-        lines = [f"Test Item: {result.test_item}", f"Measurement system: {result.system}",
-                 f"Measurements: {result.n}; samples: {result.parts}; repetitions: {result.repeats}",
-                 f"Mean: {result.mean!r}; Min: {result.minimum!r}; Max: {result.maximum!r}",
-                 f"LSL: {result.lsl!r}; USL: {result.usl!r}", "", "INTERMEDIATE CALCULATIONS (full stored precision)"]
-        lines.extend(f"{key}: {value!r}" for key, value in result.details.items())
-        lines.extend(["", "FINAL METRICS"] + [f"{k}: {v!r}" for k, v in result.metrics.items()])
-        if self.evaluated is not None and self.evaluated.record.judged:
-            lines.extend(["", f"Decision metric: {result.decision_metric}; result: {result.status}"])
-        lines.extend(["", f"Applied settings: {result.config!r}"])
-        if self.study is not None and self.result_set is not None and self.evaluated is not None:
-            record = self.evaluated.record
-            lines.extend(["", "STUDY", f"Data: {self.study.dataset.description or 'not recorded'}",
-                          f"Order of the readings: {self.study.dataset.order_basis}",
-                          f"Design: {' '.join(describe_design(self.study.design, self.study.options.method))}",
-                          "Acceptance criteria: " + (f"version {record.criteria_version}" if record.judged else "none (statistics only)")])
-            lines.extend(f"Note: {CONDITION_TITLES.get(c.code, c.code)}: {c.message}" for c in record.validation.conditions)
-            lines.extend(f"Method verification: {METHOD_TITLES.get(key, key)}: {status}" for key, status in self.result_set.method_verification)
-        lines.extend(["", "DATASET MESSAGES"] + [i.message for i in result.issues])
-        lines.extend(["", explain_method(result.config)])
-        ReportDialog(self._dialog_parent(), "Calculation Details", result.test_item, "\n".join(lines))
-
-    def show_issues(self) -> None:
-        if not self.result_set:
-            return
-        lines = []
-        for stat in self.result_set.statistics:
-            lines.append(stat.label)
-            lines.extend([f"{i.severity.upper()}: {i.message}" for i in stat.issues] or ["No dataset issues."])
-            lines.append("")
-        ReportDialog(self._dialog_parent(), "Data messages", "What the analysis found in the data", "\n".join(lines))
+        result = self.selected_result()  # the values of the selected item end the guide
+        MethodDialog(self._dialog_parent(), method_guide(config, result if result is not None and result.method == config.method else None))
 
     # ------------------------------------------------------------------ report
     def _fill_items(self) -> None:

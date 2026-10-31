@@ -185,10 +185,35 @@ def test_timestamp_order_needs_a_valid_timestamp_for_every_row():
         reorder_dataset(broken, "timestamp")
 
 
+def test_file_time_order_sorts_by_save_time_and_says_which_files_share_one(tmp_path):
+    import os
+    from pathlib import Path
+
+    paths = []
+    for name, seconds in (("a.log", 30), ("b.log", 10), ("c.log", 20), ("d.log", 20)):
+        path = tmp_path / name
+        path.write_text("x")
+        os.utime(path, ns=(seconds * 10**9,) * 2)
+        paths.append(path)
+    dataset = Dataset.from_observations(
+        [Observation("X", f"S{i}", float(i), 0, 20, source=str(path)) for i, path in enumerate(paths)], description="scan")
+    ordered = reorder_dataset(dataset, "filetime")
+    assert [Path(o.source).name for o in ordered.observations] == ["b.log", "c.log", "d.log", "a.log"]  # ties by file name
+    assert ordered.order_basis == "acquisition"
+    assert "the time each log file was saved" in ordered.description and "1 file(s) share a save time" in ordered.description
+    assert [o.value for o in dataset.observations] == [0.0, 1.0, 2.0, 3.0]  # the dataset it came from is untouched
+
+
+def test_file_time_order_needs_files_that_can_be_read(tmp_path):
+    dataset = Dataset.from_observations([Observation("X", "S1", 1.0, 0, 20, source=str(tmp_path / "missing.log"))])
+    with pytest.raises(ValueError, match="missing.log cannot be read"):
+        reorder_dataset(dataset, "filetime")
+
+
 def test_the_mapping_dataset_is_the_scan_copied_without_changing_it(scanned):
     source = MappingSource(scanned.grouped, ("R1", "R2"), 2, serial=1, description="Data Mapping scan")
     assert source.key == (1, ("R1", "R2"), 2)
-    dataset = build_mapping_dataset(source, {}, {}, "worksheet")
-    assert dataset == snapshot_from_records(scanned.grouped, ["R1", "R2"], {}, assignments={}, description="Data Mapping scan")
+    dataset = build_mapping_dataset(source, {}, "worksheet")
+    assert dataset == snapshot_from_records(scanned.grouped, ["R1", "R2"], assignments={}, description="Data Mapping scan")
     assert len(dataset.observations) == 8  # 4 files x 2 components; a missing reading stays, as an empty value
     assert [o.test_item for o in dataset.observations if o.value in ("", None)] == ["R2"]

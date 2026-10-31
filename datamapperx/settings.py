@@ -36,6 +36,8 @@ class Settings:
     # added (customer name -> list of {metric, enabled, pass_limit, fail_limit}; see statistics/customers.py).
     validation_customer: str = ""  # no longer used: every new study starts as statistics only
     customer_criteria: dict = field(default_factory=dict)
+    # The GRR Quick Check on the review page: its criteria per metric ({metric, enabled, pass_limit, fail_limit}); empty = defaults.
+    quick_check_criteria: list = field(default_factory=list)
 
 
 def load_settings(path: Path | None = None) -> Settings:

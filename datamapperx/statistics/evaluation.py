@@ -257,10 +257,6 @@ def detect_conditions(statistics: Sequence[StatisticsResult], method: str, order
                                "Nest as Operator: each slot is treated as an operator. Reproducibility then reflects "
                                "differences between nests, not between people, and the conclusion applies to the fixture as a "
                                "whole, not to each nest."))
-    elif valid and not any(stat.facts.get("crossed") for stat in valid):
-        found.append(Condition("one_appraiser", Severity.INFORMATION,
-                               "One appraiser: a one-way ANOVA estimates repeatability. Reproducibility between operators is not "
-                               "estimated."))
     if valid and any(stat.facts.get("trial_assignment") for stat in valid):
         found.append(Condition("trial_inferred", Severity.INFORMATION,
                                "Where the data carry no Trial, the repeated readings of a sample are numbered 1, 2, 3… in row "

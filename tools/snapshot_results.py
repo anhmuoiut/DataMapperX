@@ -28,7 +28,6 @@ sys.path.insert(0, str(ROOT))
 from tests.baseline_support import first_difference, result_signature  # noqa: E402
 
 GAGE = "SNAPSHOT"
-CREATED = "2000-01-01"  # reports record the day they were made; pin it so two runs print the same text
 
 
 def _excel_cells(path: Path) -> dict:
@@ -57,7 +56,7 @@ def _study_reports(observations, method: str, repeats: int | None, out: Path, ta
     study = Study(dataset, options=options, info=StudyInfo(gage_name=GAGE))
     result_set = study.run_statistics()
     evaluated = study.evaluate(result_set, judge=False)
-    context = report_context(study, result_set, created=CREATED)
+    context = report_context(study, result_set)
     results = list(evaluated.results)
     pdf = export_statistical_report(out / f"{tag}_report.pdf", results, context=context)
     xlsx = export_statistical_report(out / f"{tag}_report.xlsx", results, context=context)

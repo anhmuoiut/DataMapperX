@@ -103,7 +103,7 @@ class AnalysisPage(QWidget):
                                      expected_repeats=source.expected_repeats if method == "grr" else None)
 
         def work(_report):
-            study = Study(build_mapping_dataset(source, {}, {}, "worksheet"), options=options)
+            study = Study(build_mapping_dataset(source, {}, "worksheet"), options=options)
             return study, study.plan_statistics().execute()
 
         def done(outcome):

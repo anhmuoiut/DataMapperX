@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 
 import pytest
 from openpyxl import load_workbook
 
-from datamapperx.stat_charts import chart_primitives, charts_for_result, draw_tk_chart
+from datamapperx.stat_charts import ChartSeries, ChartSpec, chart_primitives, charts_for_result, draw_tk_chart
 from datamapperx.stat_reports import (
     ReportContext,
     capability_indices,
@@ -25,7 +26,7 @@ from datamapperx.stat_reports import (
 from datamapperx.statistics import AnalysisConfig, Observation, analyze
 
 INFO = ReportContext(info=(("Gage name", "FIXTURE-1163"), ("Date of study", "10-22-2026"), ("Reported by", "Thao Le")),
-                     included=1, total=1, created="2026-10-31")
+                     included=1, total=1)
 
 
 def capability(name="C3", count=40, low=0, high=6):
@@ -184,7 +185,10 @@ def test_pdf_has_the_results_and_none_of_the_internal_audit_content(tmp_path, fa
     original = copy.deepcopy(result)
     path = export_statistical_report(tmp_path / "analysis.pdf", [result], context=INFO)
     text = " ".join(text_of(path).split())
-    assert result.test_item in text and "not an official Minitab report" in text and "Created 2026-10-31" in text
+    assert result.test_item in text
+    # the report is the Minitab report: no footer, no page numbers, nothing printed along the bottom of a page
+    for footer in ("not an official", "Created", "DataMapperX", "Page 1"):
+        assert footer not in text, footer
     for banned in ("PASS", "FAIL", "CAUTION", "Customer", "Decision", "Criteria", "Validation", "acknowledg", "Fingerprint", "stale",
                    "Methodology", "assumption", "Acceptance"):
         assert banned not in text, banned
@@ -216,7 +220,7 @@ def test_a_partial_report_says_so_in_one_line_and_charts_can_be_left_out(tmp_pat
     pytest.importorskip("reportlab")
     pypdf = pytest.importorskip("pypdf")
     result = grr()
-    partial = ReportContext(included=1, total=3, sections=(), created="2026-10-31")
+    partial = ReportContext(included=1, total=3, sections=())
     path = export_statistical_report(tmp_path / "partial.pdf", [result], context=partial)
     text = " ".join(text_of(path).split())
     assert "Included 1 of 3 test items." in text and "Gage R&R (ANOVA) Report" not in text
@@ -390,6 +394,73 @@ def test_sheet_names_are_valid_and_unique(tmp_path):
 def test_an_item_with_a_tester_or_slot_is_named_without_the_operator_list():
     result = crossed_grr()
     assert "Operators=" in result.system and item_label(result) == "Crossed item"
+
+
+# ----------------------------------------------------------------------------- numbers are written out, as in Minitab's reports
+SCIENTIFIC = re.compile(r"\d[eE][-+]?\d")  # 1.84897E-06, 5e-08
+
+
+def tiny_grr():
+    """Readings of a few millivolts that differ by nanovolts: every variance is far below 1e-5, the tolerance is 0.00005."""
+    rows = [Observation("Tiny", f"S{part}", 0.0068 + part * 1e-8 + delta, 0.00678, 0.00683, trial=str(trial))
+            for part in range(1, 11) for trial, delta in enumerate((-1e-9, 4e-10, 1.3e-9), 1)]
+    result, = analyze(rows, AnalysisConfig(method="grr"))
+    assert result.valid and 0 < result.metrics["variance_grr"] < 1e-12
+    return result
+
+
+def test_tables_are_in_fixed_decimals_however_small_the_numbers():
+    assert format_value(1.84897e-06, "var") == "0.0000018" and format_value(0.0, "var") == "0.0000000"
+    assert format_value(1.84897e-06, "var", 4) == "0.000001849"  # the report precision still sets the digits
+    assert format_value(7.99423e-11, "sig") == "7.99423E-11"  # the capability Process Data keeps Minitab's own notation
+    text = session_text(tiny_grr())
+    assert not SCIENTIFIC.search(text) and "0.0000000" in text
+    assert not SCIENTIFIC.search(session_text(tiny_grr(), 4))
+
+
+def test_pdf_and_excel_of_tiny_numbers_have_no_scientific_notation_and_keep_the_full_values(tmp_path):
+    pytest.importorskip("reportlab")
+    result = tiny_grr()
+    pdf = text_of(export_statistical_report(tmp_path / "tiny.pdf", [result], context=INFO))
+    assert not SCIENTIFIC.search(pdf.replace("FIXTURE-1163", "")) and "Tolerance: 0.00005" in " ".join(pdf.split())
+    sheet = load_workbook(export_statistical_report(tmp_path / "tiny.xlsx", [result], context=INFO))[result.test_item]
+    floats = [cell for row in sheet.iter_rows() for cell in row if isinstance(cell.value, float)]
+    assert floats and not any("E" in cell.number_format.upper() for cell in floats)
+    total = next(row[1].value for row in sheet.iter_rows(min_col=1, max_col=2) if str(row[0].value).strip() == "Total Gage R&R")
+    assert total == pytest.approx(result.metrics["variance_grr"], rel=1e-12)  # the cell holds the whole value; only its display is fixed
+
+
+def limit_labels(title, lower, centre, upper, width=650, height=280):
+    series = tuple(ChartSeries(name, ((1, value), (10, value))) for name, value in (("UCL", upper), ("CENTER", centre), ("LCL", lower)))
+    spec = ChartSpec(title, "Part", "Sample Range", series)
+    return [style["text"] for kind, _, style in chart_primitives(spec, width, height) if kind == "text" and "=" in style["text"]]
+
+
+def test_control_limits_are_written_with_six_decimals_like_minitabs_charts():
+    assert limit_labels("R Chart", 0, 0.001250, 0.003217) == ["UCL=0.003217", "Rbar=0.001250", "LCL=0"]
+    assert limit_labels("Xbar Chart", 1.840833, 1.842112, 1.843390) == ["UCL=1.843390", "Mean=1.842112", "LCL=1.840833"]
+
+
+def test_control_limits_that_are_tiny_or_close_together_get_more_decimals_instead_of_scientific_notation():
+    assert limit_labels("R Chart", 0, 2.3e-08, 5.92077e-08) == ["UCL=0.0000000592", "Rbar=0.0000000230", "LCL=0"]
+    close = limit_labels("Xbar Chart", 0.00684498, 0.006845, 0.00684503)
+    assert len(set(close)) == 3 and not any(SCIENTIFIC.search(label) for label in close)
+
+
+def test_charts_of_tiny_numbers_have_no_scientific_notation_and_the_scale_labels_fit():
+    from datamapperx.stat_charts import _text_units
+
+    for result in (tiny_grr(), capability(low=0, high=6)):
+        for spec in charts_for_result(result):
+            for _, (x, _), style in (p for p in chart_primitives(spec, 375, 218) if p[0] == "text"):
+                assert not SCIENTIFIC.search(style["text"]), style["text"]
+                if style["anchor"] == "e" and not style.get("category"):  # a label of the vertical scale
+                    assert 8 * _text_units(style["text"]) <= x, style["text"]
+    tiny = analyze([Observation("C3", str(i), 8e-11 + (i % 7) * 1e-13, -1e-4, 1e-10, source=f"log{i}.txt") for i in range(30)], AnalysisConfig())[0]
+    texts = [style["text"] for kind, _, style in chart_primitives(charts_for_result(tiny)[0]) if kind == "text"]
+    assert not any(SCIENTIFIC.search(text) for text in texts)
+    ticks = [text for text in texts if re.fullmatch(r"\d+\.\d+", text)]  # the scale of the histogram, around 6E-11
+    assert len(ticks) >= 2 and len(ticks) == len(set(ticks))  # neighbouring ticks are told apart, not rounded into one
 
 
 # ----------------------------------------------------------------------------- the application's own tables and plumbing

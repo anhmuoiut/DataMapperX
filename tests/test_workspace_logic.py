@@ -58,7 +58,7 @@ def test_one_appraiser_is_the_default_and_changes_nothing():
     assert apply_design(data, {}, "grr") == tuple(data)
     assert apply_design(data, {"operators": ["only one"]}, "grr") == tuple(data)
     assert operator_names({"operators": ["only one"]}) == ()
-    assert "One appraiser" in describe_design({}, "grr")[0]
+    assert describe_design({}, "grr") == ("Single-tester repeatability study.",)
 
 
 def test_a_design_that_does_not_fit_the_data_says_what_to_change():
@@ -234,13 +234,13 @@ def test_grr_notes_are_information_and_follow_minitabs_design_advice():
     study = Study(Dataset.from_observations(rows(samples=5, repeats=4)), options=StatisticalOptions(method="grr", assign_trials=True))
     evaluated = study.evaluate(study.run_statistics())
     found = codes(evaluated)
-    assert set(found) == {"one_appraiser", "trial_inferred", "design_samples"} and set(found.values()) == {Severity.INFORMATION}
+    assert set(found) == {"trial_inferred", "design_samples"} and set(found.values()) == {Severity.INFORMATION}  # one tester: no warning
     messages = {c.code: c.message for c in evaluated.record.validation.conditions}
     assert "not the order of measurement" in messages["trial_inferred"] and "Minitab advises at least 10" in messages["design_samples"]
     assert not any("work instruction" in m.lower() for m in messages.values())
     study.design["operators"] = ["A", "B"]
     crossed = codes(study.evaluate(study.run_statistics()))
-    assert "one_appraiser" not in crossed and crossed["design_operators"] is Severity.INFORMATION
+    assert crossed["design_operators"] is Severity.INFORMATION
 
 
 def test_the_notes_of_a_capability_study_never_cite_a_work_instruction():

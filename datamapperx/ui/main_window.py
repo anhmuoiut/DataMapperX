@@ -21,7 +21,19 @@ from ..config import (
     DEFAULT_OUTPUT_FILE,
 )
 from ..exporter import ExportRow, generate_excel, summarize_limits
-from ..grr import GrrResult, summarize_grr
+from ..grr import (
+    CAUTION,
+    FAIL,
+    NOT_APPLIED,
+    NOT_EVALUATED,
+    PASS,
+    QUICK_LABELS,
+    GrrResult,
+    quick_check,
+    quick_criteria_from_json,
+    quick_criteria_to_json,
+    summarize_grr,
+)
 from ..models import ScanResult
 from ..paths import is_frozen, log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
@@ -45,7 +57,7 @@ from ..workflow import (
 )
 from .access_dialog import AccessDialog
 from .controls import ActionList, ChipRow, Column, DataGrid, StepBar
-from .dialogs import AboutDialog, ExportDoneDialog, ReportDialog, open_path, set_window_icon
+from .dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog, open_path, set_window_icon
 from .duplicate_dialog import DuplicateDialog
 from .profile_dialog import ProfileManager
 from .tasks import TaskRunner
@@ -103,6 +115,7 @@ class MainWindow(tk.Tk):
         self._summary_key: tuple | None = None
         self._grr_results: list[GrrResult] = []
         self._grr_key: tuple | None = None
+        self.grr_criteria = quick_criteria_from_json(self.settings.quick_check_criteria)
         self._preview_job: str | None = None
         self._preview_page = 0
         self._progress_determinate = False
@@ -573,41 +586,33 @@ class MainWindow(tk.Tk):
 
     def _build_grr_review(self, page: ttk.Frame) -> None:
         page.columnconfigure(0, weight=1)
-        page.rowconfigure(3, weight=1)
-        ttk.Label(page, text="Total Gage R&R", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        method = ttk.Label(
-            page, style="SurfaceHint.TLabel", justify="left", wraplength=430,
-            text="A quick check before you export: one-way ANOVA by SN, 6 × SD, each file a repeat, one operator/fixture.\n"
-                 "The colours compare the figures with reference thresholds. They are not a statistical conclusion; "
-                 "Minitab reports the figures without a verdict.",
-        )
-        method.grid(row=1, column=0, sticky="w", pady=(6, 8))
+        page.rowconfigure(2, weight=1)
+        head = ttk.Frame(page, style="Surface.TFrame")
+        head.grid(row=0, column=0, sticky="ew")
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, text="Total Gage R&R", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.grr_criteria_button = ttk.Button(head, text="Criteria…", command=self._edit_grr_criteria)
+        self.grr_criteria_button.grid(row=0, column=1, sticky="e")
         legend = ttk.Frame(page, style="Surface.TFrame")
-        legend.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self.grr_legend_tiles = []
-        for column, (level, title, bounds) in enumerate((
-            ("pass", "PASS", "≤10%\nNDC ≥5"),
-            ("caution", "CONDITION", ">10% to 30%\nNDC: —"),
-            ("fail", "FAIL", ">30%\nNDC <5"),
-        )):
+        legend.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        self.grr_legend_tiles = []  # three colour keys on one row: what a colour in the table means
+        for column, (level, title) in enumerate((("pass", "PASS"), ("caution", "CONDITION"), ("fail", "FAIL"))):
             legend.columnconfigure(column, weight=1, uniform="grr_status")
-            tile = tk.Frame(legend, highlightthickness=1, padx=4, pady=5)
+            tile = tk.Frame(legend, highlightthickness=1, padx=4, pady=4)
             tile.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0))
             title_label = tk.Label(tile, text=title, font=("Segoe UI Semibold", 9))
             title_label.pack(fill="x")
-            bounds_label = tk.Label(tile, text=bounds, font=("Segoe UI", 9), justify="center")
-            bounds_label.pack(fill="x")
-            self.grr_legend_tiles.append((tile, title_label, bounds_label, level))
+            self.grr_legend_tiles.append((tile, title_label, level))
         self.grr_grid = DataGrid(page, self.palette, font_size=9, row_height=30, padding=8, on_select=self._on_grr_select)
-        self.grr_grid.grid(row=3, column=0, sticky="nsew")
+        self.grr_grid.grid(row=2, column=0, sticky="nsew")
         self.grr_summary_var = tk.StringVar()
         summary = ttk.Label(page, textvariable=self.grr_summary_var, style="SurfaceHint.TLabel", justify="left", wraplength=430)
-        summary.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        summary.grid(row=3, column=0, sticky="w", pady=(8, 0))
         self.grr_detail_var = tk.StringVar(value="Select a test to see its Study Var and calculation notes.")
         detail = ttk.Label(page, textvariable=self.grr_detail_var, style="SurfaceHint.TLabel", justify="left", wraplength=430)
-        detail.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        detail.grid(row=4, column=0, sticky="w", pady=(8, 0))
         page.bind("<Configure>", lambda event: [
-            label.configure(wraplength=max(180, event.width - 32)) for label in (method, summary, detail)
+            label.configure(wraplength=max(180, event.width - 32)) for label in (summary, detail)
         ])
 
     def _ensure_review_page(self) -> None:
@@ -770,11 +775,10 @@ class MainWindow(tk.Tk):
             "pass": (p.ok_bg, p.ok_line, p.ok), "caution": (p.warn_bg, p.warn_line, p.warn),
             "fail": (p.bad_bg, p.bad_line, p.danger),
         }
-        for tile, title, bounds, level in self.grr_legend_tiles:
+        for tile, title, level in self.grr_legend_tiles:
             fill, line, ink = legend_colors[level]
             tile.configure(bg=fill, highlightbackground=line)
-            for label in (title, bounds):
-                label.configure(bg=fill, fg=ink)
+            title.configure(bg=fill, fg=ink)
         for swatch, level in self._swatches:
             fill, line = (p.warn_bg, p.warn_line) if level == "warn" else (p.bad_bg, p.bad_line)
             swatch.configure(bg=fill, highlightbackground=line)
@@ -1157,6 +1161,16 @@ class MainWindow(tk.Tk):
         self._refresh_grr()
         self._update_actions()
 
+    def _edit_grr_criteria(self) -> None:
+        GrrCriteriaDialog(self, self.grr_criteria, self._set_grr_criteria)
+
+    def _set_grr_criteria(self, criteria) -> None:
+        """New criteria: the statuses and colours are worked out again from the same figures, nothing is recalculated."""
+        self.grr_criteria = criteria
+        self.settings.quick_check_criteria = quick_criteria_to_json(criteria)
+        save_settings(self.settings)
+        self._refresh_grr()
+
     def _refresh_grr(self) -> None:
         """Assess each selected test over every SN and repeat, independently of the preview row limit."""
         result = self.scan_result
@@ -1168,23 +1182,23 @@ class MainWindow(tk.Tk):
             self._grr_key = key
         rows = []
         tags: dict[tuple[int, int], str] = {}
-        levels = {"PASS": "pass", "CAUTION": "caution", "FAIL": "fail", "NOT EVALUATED": "neutral"}
+        levels = {PASS: "pass", CAUTION: "caution", FAIL: "fail", NOT_EVALUATED: "neutral", NOT_APPLIED: "neutral"}
+        words = {PASS: "PASS", CAUTION: "CONDITION", FAIL: "FAIL", NOT_EVALUATED: "N/A", NOT_APPLIED: "—"}
         for index, entry in enumerate(self._grr_results):
-            cells = []
-            for column, (value, status) in enumerate((
-                (entry.percent_study_var, entry.study_status), (entry.percent_tolerance, entry.tolerance_status),
-            ), start=1):
-                cells.append(f"{value:.2f}" if value is not None else "N/A")
-                tags[index, column] = levels[status]
+            status = quick_check(entry, self.grr_criteria)
+            cells = [f"{value:.2f}" if value is not None else "N/A" for value in (entry.percent_study_var, entry.percent_tolerance)]
             cells.append(str(entry.ndc) if entry.ndc is not None else "N/A")
-            tags[index, 3] = levels[entry.ndc_status]
-            rows.append((entry.component, *cells))
+            for column, each in enumerate((status.study, status.tolerance, status.ndc, status.overall), start=1):
+                tags[index, column] = levels[each]
+            rows.append((entry.component, *cells, words[status.overall]))
         self.grr_grid.set_table(
-            [Column("Test", width=self.grr_grid.scaled(140), stretch=True), Column("%Study Var", "e"),
-             Column("%SV/Tol", "e"), Column("NDC", "center")],
+            [Column("Test", width=self.grr_grid.scaled(120), stretch=True), Column("%Study Var", "e"),
+             Column("%SV/Tol", "e"), Column("NDC", "center"), Column("Result", "center")],
             rows, cell_tags=tags, empty_text="Select tests to calculate their GRR pre-check.",
         )
-        self.grr_summary_var.set(f"{len(rows)} test item{'s' if len(rows) != 1 else ''}" if rows else "")
+        left_out = [QUICK_LABELS[c.metric] for c in self.grr_criteria if not c.enabled]
+        count = f"{len(rows)} test item{'s' if len(rows) != 1 else ''}"
+        self.grr_summary_var.set(count + (f" · not applied: {', '.join(left_out)}" if left_out else "") if rows else "")
         if rows:
             selected = self.grr_grid.selected_index()
             selected = selected if selected is not None else 0

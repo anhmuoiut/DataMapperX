@@ -15,6 +15,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .models import LogRecord, Measurement
+from .statistics.customers import criteria_to_json
+from .statistics.models import Criterion
 from .statistics.numeric import ndc_from_variances
 from .utils import to_number
 
@@ -22,6 +24,16 @@ PASS = "PASS"
 CAUTION = "CAUTION"
 FAIL = "FAIL"
 NOT_EVALUATED = "NOT EVALUATED"
+NOT_APPLIED = "NOT APPLIED"  # a metric the criteria leave out of the decision (it stays visible)
+
+# The Quick Check criteria, one per metric, in the order of its columns. Percentages (lower is better): PASS up to the PASS limit,
+# CAUTION up to the FAIL limit, FAIL beyond. NDC (higher is better): one minimum, kept as both limits: PASS at or above it, FAIL below.
+QUICK_METRICS = ("percent_study_var", "percent_tolerance", "ndc")
+QUICK_LABELS = {"percent_study_var": "%Study Var", "percent_tolerance": "%SV/Tol", "ndc": "NDC"}
+DEFAULT_QUICK_CRITERIA = (Criterion("percent_study_var", True, 10.0, 30.0), Criterion("percent_tolerance", False, 10.0, 30.0),
+                          Criterion("ndc", True, 5.0, 5.0))
+PERCENT_MAXIMUM = {"percent_study_var": 100.0, "percent_tolerance": 1000.0}  # %Study Var cannot exceed 100; %SV/Tol can
+NDC_MAXIMUM = 100
 
 
 def grr_status(value: float | None) -> str:
@@ -31,6 +43,85 @@ def grr_status(value: float | None) -> str:
     if value <= 10:
         return PASS
     return CAUTION if value <= 30 else FAIL
+
+
+def validate_quick_criteria(criteria: Sequence[Criterion]) -> None:
+    """Every metric once, with limits in range and in order. A ValueError says what to change."""
+    if [c.metric for c in criteria] != list(QUICK_METRICS):
+        raise ValueError("The criteria must cover %Study Var, %SV/Tol and NDC, once each.")
+    for c in criteria:
+        label = QUICK_LABELS[c.metric]
+        numbers = (c.pass_limit, c.fail_limit)
+        if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) for n in numbers):
+            raise ValueError(f"{label}: enter numbers.")
+        if c.metric == "ndc":
+            if c.pass_limit != c.fail_limit or c.pass_limit != int(c.pass_limit) or not 1 <= c.pass_limit <= NDC_MAXIMUM:
+                raise ValueError(f"NDC: the minimum must be a whole number from 1 to {NDC_MAXIMUM}.")
+            continue
+        highest = PERCENT_MAXIMUM[c.metric]
+        if not all(0 < n <= highest for n in numbers):
+            raise ValueError(f"{label}: the limits must be above 0 and at most {highest:g}%.")
+        if c.pass_limit > c.fail_limit:
+            raise ValueError(f"{label}: the PASS limit cannot be above the FAIL limit.")
+
+
+def quick_criteria_from_json(raw: object) -> tuple[Criterion, ...]:
+    """The criteria saved in the settings; anything missing, damaged or out of range gives the defaults."""
+    if isinstance(raw, list):
+        found = {item.get("metric"): item for item in raw if isinstance(item, dict)}
+        try:
+            criteria = tuple(
+                Criterion(c.metric, found[c.metric].get("enabled") is True, found[c.metric]["pass_limit"], found[c.metric]["fail_limit"])
+                if c.metric in found else c for c in DEFAULT_QUICK_CRITERIA)
+            validate_quick_criteria(criteria)
+            return criteria
+        except (KeyError, TypeError, ValueError):
+            pass
+    return DEFAULT_QUICK_CRITERIA
+
+
+def quick_criteria_to_json(criteria: Sequence[Criterion]) -> list[dict]:
+    """What to save: nothing while the criteria are the defaults, so a later change of the defaults still reaches the user."""
+    return [] if tuple(criteria) == DEFAULT_QUICK_CRITERIA else criteria_to_json(criteria)
+
+
+def metric_status(value: float | None, criterion: Criterion) -> str:
+    """One figure against its criterion. A figure that is missing, not finite or negative is NOT EVALUATED, never PASS."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return NOT_EVALUATED
+    if criterion.metric == "ndc":
+        return PASS if value >= criterion.pass_limit else FAIL
+    if value <= criterion.pass_limit:
+        return PASS
+    return CAUTION if value <= criterion.fail_limit else FAIL
+
+
+def combine_quick_statuses(statuses: Sequence[str]) -> str:
+    """Worst of the statuses of the metrics that decide: any FAIL fails; a figure that cannot be judged blocks a PASS or CAUTION
+    (it is never counted as a pass); otherwise any CAUTION, else PASS. With no metric deciding there is no result."""
+    if not statuses:
+        return NOT_APPLIED
+    if FAIL in statuses:
+        return FAIL
+    if NOT_EVALUATED in statuses:
+        return NOT_EVALUATED
+    return CAUTION if CAUTION in statuses else PASS
+
+
+@dataclass(frozen=True, slots=True)
+class QuickStatus:
+    study: str
+    tolerance: str
+    ndc: str
+    overall: str
+
+
+def quick_check(result: GrrResult, criteria: Sequence[Criterion]) -> QuickStatus:
+    """Statuses of one test from its figures and the criteria: the figures are not recalculated."""
+    values = {"percent_study_var": result.percent_study_var, "percent_tolerance": result.percent_tolerance, "ndc": result.ndc}
+    each = {c.metric: metric_status(values[c.metric], c) if c.enabled else NOT_APPLIED for c in criteria}
+    deciding = [each[c.metric] for c in criteria if c.enabled]
+    return QuickStatus(each["percent_study_var"], each["percent_tolerance"], each["ndc"], combine_quick_statuses(deciding))
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,18 +14,16 @@ import os
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import date
 from functools import cache
 from html import escape
 from pathlib import Path
 
 from .exporter import set_text
-from .stat_charts import ChartSpec, charts_for_result, reportlab_chart
+from .stat_charts import ChartSpec, charts_for_result, plain_number, reportlab_chart
 from .statistics.acceptance import metric_label
 
 ALL_SECTIONS = ("charts", "observations")
 DEFAULT_SECTIONS = ("charts",)
-FOOTER = "DataMapperX · not an official Minitab report"
 BLUE = "#0B5CAD"
 
 METRIC_LABELS = {
@@ -44,7 +42,7 @@ METRIC_LABELS = {
 CONDITION_TITLES = {
     "acquisition_order": "Order of the readings", "repeated_measurements": "Repeated readings of one unit",
     "sample_size": "Number of observations", "process_stability": "Process stability", "normality": "Normal distribution",
-    "nest_as_operator": "Nest as Operator", "one_appraiser": "One appraiser", "design_samples": "Number of parts",
+    "nest_as_operator": "Nest as Operator", "design_samples": "Number of parts",
     "design_operators": "Number of operators", "trial_inferred": "Trial numbers",
 }
 METHOD_TITLES = {
@@ -64,15 +62,14 @@ class ReportContext:
     included: int = 0
     total: int = 0
     sections: tuple[str, ...] = DEFAULT_SECTIONS
-    created: str = ""  # the day the report was made
 
     @property
     def partial(self) -> bool:
         return 0 < self.included < self.total
 
 
-def report_context(study, result_set, *, included: Sequence[str] | None = None, sections: Sequence[str] = DEFAULT_SECTIONS,
-                   created: str | None = None) -> ReportContext:
+def report_context(study, result_set, *, included: Sequence[str] | None = None,
+                   sections: Sequence[str] = DEFAULT_SECTIONS) -> ReportContext:
     """Collect what a report prints. Refuses a stale result set: a report presents results as current."""
     study.require_current(result_set)
     info = study.info
@@ -81,8 +78,7 @@ def report_context(study, result_set, *, included: Sequence[str] | None = None, 
     names = [stat.label for stat in result_set.statistics]
     chosen = set(names if included is None else included)
     return ReportContext(info=tuple((label, value) for label, value in labelled if value), included=sum(n in chosen for n in names),
-                         total=len(names), sections=tuple(s for s in ALL_SECTIONS if s in sections),
-                         created=created or date.today().isoformat())
+                         total=len(names), sections=tuple(s for s in ALL_SECTIONS if s in sections))
 
 
 def _sections(context: ReportContext | None) -> tuple[str, ...]:
@@ -121,8 +117,8 @@ def format_value(value, kind: str, decimals: int = 2) -> str:
         return str(int(value))
     if kind == "sig":
         return sig6(value) if not isinstance(value, str) else value
-    if kind == "var":  # variance-sized numbers: 7 decimals at the default of 2, significant digits for tiny values
-        return sig6(value) if value != 0 and abs(value) < 1e-5 else f"{value:.{decimals + 5}f}"
+    if kind == "var":  # variance-sized numbers: 7 decimals at the default of 2, as Minitab prints them, however small
+        return f"{value:.{decimals + 5}f}"
     if kind in ("pct", "ppm"):
         return f"{value:.2f}"
     if kind == "p":
@@ -132,7 +128,7 @@ def format_value(value, kind: str, decimals: int = 2) -> str:
 
 def _excel_format(value, kind: str, decimals: int) -> str:
     if kind == "var":
-        return "0.000000E+00" if value != 0 and abs(value) < 1e-5 else "0." + "0" * (decimals + 5)
+        return "0." + "0" * (decimals + 5)
     if kind == "sig":
         return "General"
     fixed = {"pct": "0.00", "ppm": "0.00", "p": "0.000", "int": "0"}
@@ -311,7 +307,7 @@ def info_rows(result, context: ReportContext | None) -> list[tuple[str, str]]:
     rows = [(f"{label}:", entered[label]) for label in ("Gage name", "Date of study", "Reported by") if label in entered]
     tolerance = tolerance_of(result) if result.method == "grr" else None
     if tolerance is not None:
-        rows.append(("Tolerance:", sig6(tolerance)))
+        rows.append(("Tolerance:", plain_number(tolerance)))
     if "Misc" in entered:
         rows.append(("Misc:", entered["Misc"]))
     return rows
@@ -798,7 +794,6 @@ def _capability_story(result, context, decimals, fonts, styles, width, charts):
 
 
 def _export_pdf(path: Path, results: Sequence, decimals: int, title: str, context: ReportContext | None):
-    from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.platypus import BaseDocTemplate, Frame, PageBreak, PageTemplate, Paragraph, SimpleDocTemplate
 
@@ -807,7 +802,7 @@ def _export_pdf(path: Path, results: Sequence, decimals: int, title: str, contex
     margin = 36
     doc_class = SimpleDocTemplate if capability else BaseDocTemplate
     document = doc_class(str(path), pagesize=pagesize, rightMargin=margin, leftMargin=margin, topMargin=margin,
-                         bottomMargin=40, title=title, author="DataMapperX")
+                         bottomMargin=margin, title=title, author="DataMapperX")
     fonts = _pdf_fonts()
     styles = _pdf_styles(fonts)
     width = pagesize[0] - 2 * margin
@@ -816,7 +811,7 @@ def _export_pdf(path: Path, results: Sequence, decimals: int, title: str, contex
     if context is not None and context.partial:
         story.append(Paragraph(f"Included {context.included} of {context.total} test items.", styles["small"]))
     chart_pagesize = landscape(A4)
-    chart_size = (chart_pagesize[0] - 2 * margin - 12, chart_pagesize[1] - margin - 40 - 12)
+    chart_size = (chart_pagesize[0] - 2 * margin - 12, chart_pagesize[1] - 2 * margin - 12)
     for index, result in enumerate(results):
         if index:
             story.append(PageBreak())
@@ -824,23 +819,12 @@ def _export_pdf(path: Path, results: Sequence, decimals: int, title: str, contex
             story += _capability_story(result, context, decimals, fonts, styles, width, charts)
         else:
             story += _grr_story(result, context, decimals, fonts, styles, width, charts, chart_size)
-    created = context.created if context and context.created else date.today().isoformat()
-
-    def footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(fonts[0], 7.5)
-        canvas.setFillColor(colors.HexColor("#6B6B6B"))
-        canvas.drawString(margin, 20, FOOTER)
-        page_width = pagesize[0] if capability else doc.pageTemplate.pagesize[0]
-        canvas.drawRightString(page_width - margin, 20, f"Created {created} · Page {doc.page}")
-        canvas.restoreState()
-
     if capability:
-        document.build(story, onFirstPage=footer, onLaterPages=footer)
+        document.build(story)
     else:
         for name, size in (("grr-tables", A4), ("grr-charts", chart_pagesize)):
-            frame = Frame(margin, 40, size[0] - 2 * margin, size[1] - margin - 40, id=name)
-            document.addPageTemplates(PageTemplate(id=name, frames=[frame], pagesize=size, onPage=footer))
+            frame = Frame(margin, margin, size[0] - 2 * margin, size[1] - 2 * margin, id=name)
+            document.addPageTemplates(PageTemplate(id=name, frames=[frame], pagesize=size))
         document.build(story)
 
 

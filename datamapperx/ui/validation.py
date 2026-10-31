@@ -1,8 +1,10 @@
-"""Dialogs of the Validation & Reports workspace: field mapping, file assignments and customer criteria."""
+"""Dialogs of the Validation & Reports workspace: file assignments and customer criteria."""
 
 from __future__ import annotations
 
+import calendar
 import tkinter as tk
+from datetime import date
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING
 
@@ -22,32 +24,6 @@ if TYPE_CHECKING:
     from .validation_workspace import ValidationWorkspace
 
 
-class MappingDialog(Dialog):
-    def __init__(self, panel: ValidationWorkspace):
-        super().__init__(panel._dialog_parent(), "Statistical field mapping")
-        self.panel = panel
-        self.variables = {}
-        body = ttk.Frame(self, padding=16)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Map log fields or enter =constant. Blank optional fields describe one system.", wraplength=620).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        defaults = {"test_item": "@test_item", "sample_id": "@sample", "value": "@measurement", "lsl": "@lsl", "usl": "@usl", "unit": "@unit"}
-        fields = ("test_item", "sample_id", "value", "lsl", "usl", "trial", "tester", "operator", "slot", "timestamp", "subgroup", "unit")
-        options = ("", "@sample", "@filename", "@trial", "@test_item", "@measurement", "@lsl", "@usl", "@unit", *sorted({c for records in panel.grouped.values() for r in records for c in r.entries}))
-        for row, field in enumerate(fields, start=1):
-            ttk.Label(body, text=field.replace("_", " ").title()).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 14))
-            var = tk.StringVar(value=panel.field_mapping.get(field, defaults.get(field, "")))
-            self.variables[field] = var
-            ttk.Combobox(body, textvariable=var, values=options, width=53).grid(row=row, column=1, sticky="ew", pady=3)
-        ttk.Label(body, text="@trial explicitly assigns file order within each sample. For pooled capability, map Subgroup to a rational subgroup ID.\nTester and Slot partition separate studies. Two or more Operators who measured the same samples are analyzed together as a crossed Gage R&R (reproducibility included); with one operator, only repeatability is estimated.", wraplength=620, style="Hint.TLabel").grid(row=13, column=0, columnspan=2, sticky="w", pady=10)
-        ttk.Button(body, text="Apply mapping", command=self.apply, style="Accent.TButton").grid(row=14, column=1, sticky="e")
-        self.present(width=680, height=650)
-
-    def apply(self):
-        self.panel.field_mapping = {k: v.get().strip() for k, v in self.variables.items()}
-        self.panel.data_edited()
-        self.close()
-
-
 class AssignmentDialog(Dialog):
     """Explicit file-level study identities, without editing parsed/raw data."""
 
@@ -59,7 +35,7 @@ class AssignmentDialog(Dialog):
         self.pending = {source: dict(values) for source, values in panel.assignments.items()}
         self.records = [r for records in panel.grouped.values() for r in records]
         self.defaults = {str(row.source): row for row in normalize_records(
-            panel.grouped, panel.components[:1], field_mapping=panel.field_mapping,
+            panel.grouped, panel.components[:1],
         )}
         self.variables = {field: tk.StringVar() for field in self.FIELDS}
         self.current = None
@@ -103,7 +79,7 @@ class AssignmentDialog(Dialog):
         self.save_current()
         self.current = selected[0]
         record = self.records[self.current]
-        # Show the active field mapping so untouched identities are retained.
+        # Show the identities the logs give, so that untouched ones are retained.
         mapped = self.defaults.get(str(record.path))
         saved = self.pending.get(str(record.path), {})
         for field, variable in self.variables.items():
@@ -113,6 +89,56 @@ class AssignmentDialog(Dialog):
         self.save_current()
         self.panel.assignments = self.pending
         self.panel.data_edited()
+        self.close()
+
+
+DATE_FORMAT = "%d-%m-%Y"  # DD-MM-YYYY, as the date of study is printed
+
+
+class DatePickerDialog(Dialog):
+    """A month calendar to choose a day from; ``on_pick`` receives the chosen date."""
+
+    def __init__(self, parent: tk.Misc, current: date, on_pick):
+        super().__init__(parent, "Choose a date")
+        self.on_pick, self.selected = on_pick, current
+        self.shown = current.replace(day=1)
+        body = ttk.Frame(self, padding=12)
+        body.pack()
+        header = ttk.Frame(body)
+        header.grid(row=0, column=0, columnspan=7, sticky="ew", pady=(0, 6))
+        for text, step, side in (("«", -12, "left"), ("‹", -1, "left"), ("»", 12, "right"), ("›", 1, "right")):
+            ttk.Button(header, text=text, width=3, command=lambda step=step: self._move(step)).pack(side=side, padx=1)
+        self.month_label = ttk.Label(header, anchor="center", font=("Segoe UI Semibold", 11))
+        self.month_label.pack(side="left", fill="x", expand=True)
+        for column, name in enumerate(calendar.day_abbr):
+            ttk.Label(body, text=name[:2], style="Muted.TLabel", anchor="center").grid(row=1, column=column, padx=1)
+        self.days = ttk.Frame(body)
+        self.days.grid(row=2, column=0, columnspan=7)
+        footer = ttk.Frame(body)
+        footer.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(8, 0))
+        ttk.Button(footer, text="Today", command=lambda: self.pick(date.today())).pack(side="left")
+        ttk.Button(footer, text="Cancel", command=self.close).pack(side="right")
+        self._render()
+        self.present()
+
+    def _move(self, months: int) -> None:
+        index = self.shown.year * 12 + self.shown.month - 1 + months
+        self.shown = date(index // 12, index % 12 + 1, 1) if 1 <= index // 12 <= 9998 else self.shown
+        self._render()
+
+    def _render(self) -> None:
+        self.month_label.configure(text=f"{calendar.month_name[self.shown.month]} {self.shown.year}")
+        for widget in self.days.winfo_children():
+            widget.destroy()
+        for row, week in enumerate(calendar.Calendar().monthdayscalendar(self.shown.year, self.shown.month)):
+            for column, number in enumerate(week):
+                if number:
+                    day = self.shown.replace(day=number)
+                    ttk.Button(self.days, text=str(number), width=3, command=lambda day=day: self.pick(day),
+                               style="Accent.TButton" if day == self.selected else "TButton").grid(row=row, column=column, padx=1, pady=1)
+
+    def pick(self, day: date) -> None:
+        self.on_pick(day)
         self.close()
 
 

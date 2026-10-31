@@ -43,6 +43,19 @@ def reorder_dataset(dataset: Dataset, order: str) -> Dataset:
     elif order == "filename":
         rows.sort(key=lambda row: (Path(str(row.source)).name.casefold(), str(row.source)))
         basis, note = "custom", "rows sorted by file name"
+    elif order == "filetime":
+        saved = {}
+        for source in {str(row.source) for row in rows}:
+            try:
+                saved[source] = Path(source).stat().st_mtime_ns
+            except OSError as exc:
+                raise ValueError(f"File time order needs the time each log file was saved, and {Path(source).name or 'a file'} "
+                                 "cannot be read where it was scanned. Choose another order.") from exc
+        rows.sort(key=lambda row: (saved[str(row.source)], Path(str(row.source)).name.casefold(), str(row.source)))
+        shared = len(saved) - len(set(saved.values()))
+        basis, note = "acquisition", "rows sorted by the time each log file was saved"
+        if shared:
+            note += f" ({shared} file(s) share a save time with another file; those are kept in file name order)"
     else:
         try:
             rows.sort(key=lambda row: datetime.fromisoformat(str(row.timestamp).strip().replace("Z", "+00:00")))
@@ -54,9 +67,8 @@ def reorder_dataset(dataset: Dataset, order: str) -> Dataset:
     return Dataset.from_observations(rows, order_basis=basis, description=description)
 
 
-def build_mapping_dataset(source: MappingSource, field_mapping: Mapping[str, str],
-                          assignments: Mapping[str, Mapping[str, str]], order: str) -> Dataset:
-    dataset = snapshot_from_records(source.grouped, source.components, field_mapping, assignments=assignments,
+def build_mapping_dataset(source: MappingSource, assignments: Mapping[str, Mapping[str, str]], order: str) -> Dataset:
+    dataset = snapshot_from_records(source.grouped, source.components, assignments=assignments,
                                     description=source.description)
     return reorder_dataset(dataset, order)
 

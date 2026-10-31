@@ -57,7 +57,7 @@ def describe_design(design: Mapping[str, Any], method: str) -> tuple[str, ...]:
         order = "by pass" if design.get("operator_order") == "by_pass" else "by operator"
         return (f"Operators: {', '.join(names)} (a sample's readings assigned {order}, in row order). "
                 "Crossed study: repeatability and reproducibility are estimated.",)
-    return ("One appraiser: repeatability only. Reproducibility between operators is not estimated.",)
+    return ("Single-tester repeatability study.",)
 
 
 def auto_within_method(observations: Sequence[Observation]) -> str:

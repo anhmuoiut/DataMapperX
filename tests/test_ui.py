@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 import tkinter as tk
+from datetime import date
 from tkinter import filedialog, messagebox
 
 import pytest
@@ -12,6 +13,7 @@ from openpyxl import load_workbook
 
 from datamapperx import updater
 from datamapperx._version import __version__
+from datamapperx.stat_reports import item_label
 
 from .conftest import ict_block, write_ict_log
 
@@ -1615,28 +1617,40 @@ def test_grr_precheck_shows_independent_statuses_and_colors_before_export(app, t
     app.update()
     assert app.review_side_tabs.select() == str(app.grr_page)
     assert app.grr_grid.rows() == [
-        ("X", "32.16", "30.00", "4"),
-        ("Y", "32.16", "6.00", "4"),
+        ("X", "32.16", "30.00", "4", "FAIL"),
+        ("Y", "32.16", "6.00", "4", "FAIL"),
     ]
-    assert app.grr_grid.cell_tags() == {
-        (0, 1): "fail", (0, 2): "caution", (0, 3): "fail",
-        (1, 1): "fail", (1, 2): "pass", (1, 3): "fail",
+    assert app.grr_grid.cell_tags() == {  # %SV/Tol is shown but does not decide, nor is it coloured, by default
+        (0, 1): "fail", (0, 2): "neutral", (0, 3): "fail", (0, 4): "fail",
+        (1, 1): "fail", (1, 2): "neutral", (1, 3): "fail", (1, 4): "fail",
     }
-    assert app.grr_summary_var.get() == "2 test items"
-    assert "Study Var (6 × SD): 6.00" in app.grr_detail_var.get()
-    assert app.export_button.instate(["!disabled"])
-    app.preview_grid._body.event_generate("<Button-1>", x=10, y=app.preview_grid._row_height() // 2)
-    app.update()
-    assert app.review_side_tabs.select() == str(app.limits_page)  # row 0 was already selected
-    app.review_side_tabs.select(app.grr_page)
-    for dark in (True, False):
-        app.dark_var.set(dark)
-        app._on_theme_toggle()
-        app.grr_grid.select(1)
+    assert app.grr_summary_var.get() == "2 test items · not applied: %SV/Tol"
+    from dataclasses import replace as replace_criterion
+
+    defaults = app.grr_criteria
+    app._set_grr_criteria(tuple(replace_criterion(c, enabled=True) for c in defaults))
+    try:
+        assert app.grr_grid.cell_tags() == {
+            (0, 1): "fail", (0, 2): "caution", (0, 3): "fail", (0, 4): "fail",
+            (1, 1): "fail", (1, 2): "pass", (1, 3): "fail", (1, 4): "fail",
+        }
+        assert app.grr_summary_var.get() == "2 test items"
+        assert "Study Var (6 × SD): 6.00" in app.grr_detail_var.get()
+        assert app.export_button.instate(["!disabled"])
+        app.preview_grid._body.event_generate("<Button-1>", x=10, y=app.preview_grid._row_height() // 2)
         app.update()
-        assert {app.palette.bad_bg, app.palette.warn_bg, app.palette.ok_bg} <= row_fills(app.grr_grid)
-    app.preview_grid.select(1)
-    assert app.review_side_tabs.select() == str(app.limits_page)
+        assert app.review_side_tabs.select() == str(app.limits_page)  # row 0 was already selected
+        app.review_side_tabs.select(app.grr_page)
+        for dark in (True, False):
+            app.dark_var.set(dark)
+            app._on_theme_toggle()
+            app.grr_grid.select(1)
+            app.update()
+            assert {app.palette.bad_bg, app.palette.warn_bg, app.palette.ok_bg} <= row_fills(app.grr_grid)
+        app.preview_grid.select(1)
+        assert app.review_side_tabs.select() == str(app.limits_page)
+    finally:
+        app._set_grr_criteria(defaults)  # the window is shared by the other tests
 
 
 def test_grr_precheck_recalculates_after_duplicate_choices_counts_and_reset(app, tmp_path):
@@ -1652,12 +1666,12 @@ def test_grr_precheck_recalculates_after_duplicate_choices_counts_and_reset(app,
     first.entries["X"] = replace(first.entries["X"], measured="PASS")
     app._on_duplicates_reviewed({"X"}, True)
     pump(app, lambda: app._preview_job is None)
-    assert app.grr_grid.rows()[0] == ("X", "N/A", "N/A", "N/A")
+    assert app.grr_grid.rows()[0] == ("X", "N/A", "N/A", "N/A", "N/A")  # nothing to judge: the result is N/A, not a pass
     assert first.filename in app.grr_detail_var.get()
     assert app._grr_results[1].percent_tolerance == pytest.approx(6)
     app.repeats_var.set("4")
     pump(app, lambda: app._preview_job is None)
-    assert all(row[1:] == ("N/A", "N/A", "N/A") for row in app.grr_grid.rows())
+    assert all(row[1:] == ("N/A", "N/A", "N/A", "N/A") for row in app.grr_grid.rows())
     assert "needs 4 repeated files" in app.grr_detail_var.get()
     app.reset_workflow()
     assert app.grr_grid.rows() == [] and app.grr_summary_var.get() == ""
@@ -1677,14 +1691,12 @@ def test_grr_precheck_ndc_colors_and_compact_legend(app, tmp_path):
     app.add_all_shown()
     app._show_step("review")
     app.update()
-    assert [column.title for column in app.grr_grid._columns] == ["Test", "%Study Var", "%SV/Tol", "NDC"]
+    assert [column.title for column in app.grr_grid._columns] == ["Test", "%Study Var", "%SV/Tol", "NDC", "Result"]
     assert app._grr_results[0].ndc < 5 <= app._grr_results[1].ndc
     assert app.grr_grid.cell_tags()[0, 3] == "fail"
     assert app.grr_grid.cell_tags()[1, 3] == "pass"
-    assert [label.cget("text") for _, label, _, _ in app.grr_legend_tiles] == ["PASS", "CONDITION", "FAIL"]
-    assert [bounds.cget("text") for _, _, bounds, _ in app.grr_legend_tiles] == [
-        "≤10%\nNDC ≥5", ">10% to 30%\nNDC: —", ">30%\nNDC <5",
-    ]
+    assert [label.cget("text") for _, label, _ in app.grr_legend_tiles] == ["PASS", "CONDITION", "FAIL"]
+    assert not hasattr(app, "_grr_legend_text") and len({tile.grid_info()["row"] for tile, *_ in app.grr_legend_tiles}) == 1  # one row
     previous_geometry = app.geometry()
     app.geometry("1000x680+0+0")
     try:
@@ -1692,13 +1704,13 @@ def test_grr_precheck_ndc_colors_and_compact_legend(app, tmp_path):
             app.dark_var.set(dark)
             app._on_theme_toggle()
             app.update()
-            assert app.grr_grid._max_xoff() == 0  # all four columns fit the narrow panel
+            assert app.grr_grid._max_xoff() == 0  # all five columns fit the narrow panel
             assert [tile.cget("bg") for tile, *_ in app.grr_legend_tiles] == [
                 app.palette.ok_bg, app.palette.warn_bg, app.palette.bad_bg,
             ]
-            for tile, title, bounds, _ in app.grr_legend_tiles:
+            for tile, title, _ in app.grr_legend_tiles:
                 assert inside(app, tile)
-                assert title.cget("bg") == bounds.cget("bg") == tile.cget("bg")
+                assert title.cget("bg") == tile.cget("bg")
     finally:
         app.geometry(previous_geometry)
 
@@ -2159,7 +2171,7 @@ def open_validation(app):
     """The workspace on a clean slate (the window is shared by every test in this module), with its data ready."""
     app._show_workspace("validation")
     ws = app.validation
-    for variable, value in ((ws.source_var, "mapping"), (ws.method_var, "grr"), (ws.operators_var, ""), (ws.nest_var, False),
+    for variable, value in ((ws.source_var, "mapping"), (ws.method_var, "grr"), (ws.study_factor_var, "6"),
                             (ws.assign_var, True), (ws.order_var, "Worksheet order"), (ws.index_var, "cpk"),
                             (ws.threshold_var, "1.33"), (ws.subgroup_var, False), (ws.profile_var, "None (statistics only)"),
                             (ws.precision_var, "3"), (ws.search_var, ""), (ws.filter_var, "All results"), (ws.gage_var, ""),
@@ -2168,7 +2180,6 @@ def open_validation(app):
         variable.set(value)
     for name, variable in ws.sections.items():
         variable.set(name == "charts")
-    ws.field_mapping.clear()
     ws.assignments.clear()
     ws.acknowledgements = {}
     ws.study = ws.result_set = ws.evaluated = None  # nothing left over from an earlier test
@@ -2200,7 +2211,7 @@ def test_validation_is_a_workspace_beside_data_mapping_and_leaves_the_raw_export
     ws = open_validation(app)
     assert [ws.tabs.tab(t, "state") for t in (ws.data_tab, ws.setup_tab, ws.results_tab, ws.report_tab)] == [
         "normal", "normal", "disabled", "disabled"]  # the tabs open up as the work progresses
-    assert "3 samples · 18 readings · 3 test items" in ws.dataset_var.get()
+    assert all(part in ws.dataset_var.get() for part in ("Test Items 3", "Samples 3", "Total Readings 18", "Trials per Sample 2"))
     run_validation(app, ws)  # Quick Analysis: no trial step, no setup needed
     assert ws.tabs.index(ws.tabs.select()) == ws.tabs.index(ws.results_tab)
     assert len(ws.results) == 3 and all("ndc" in r.metrics for r in ws.results)
@@ -2388,31 +2399,6 @@ def test_ppk_can_be_the_decision_index_and_the_table_leaves_out_what_does_not_de
     assert headers == ["Test Item", "%SV/Tol", "%Study Var", "NDC", "Acceptance Result", "Review"]  # the three key metrics first
 
 
-def test_operators_make_a_crossed_study_and_a_bad_design_is_explained(app, tmp_path):
-    folder = tmp_path / "operator_logs"
-    folder.mkdir()
-    ready_to_review(app, folder, repeats=4, sns=("VSE001", "VSE002", "VSE003", "VSE004"))
-    ws = open_validation(app)
-    app.repeats_var.set("4")
-    ws.operators_var.set("Ann")
-    app.update()
-    assert "at least two operator names" in ws.setup_error and ws.run_button.instate(["disabled"])
-    ws.operators_var.set("Ann, Ann")
-    assert "must be different" in ws.setup_error
-    ws.operators_var.set("Ann, Bob")
-    ws.nest_var.set(True)
-    assert "not both" in ws.setup_error
-    ws.nest_var.set(False)
-    ws.repeats_var.set("")
-    assert ws.setup_error == "" and "Operators: Ann, Bob" in ws.plan_var.get()
-    run_validation(app, ws)
-    assert all(r.details.get("crossed") and list(r.details["operators"]) == ["Ann", "Bob"] for r in ws.results if r.valid)
-    ws.operators_var.set("Ann, Bob, Cy")  # 4 readings cannot be split between 3 operators
-    ws.update_button.invoke()
-    app.update()
-    assert "multiple of 3" in ws.message_var.get() and ws.stale
-
-
 def test_data_mapping_changes_reach_validation_when_it_is_shown_again(app, tmp_path):
     folder = tmp_path / "change_logs"
     folder.mkdir()
@@ -2425,7 +2411,7 @@ def test_data_mapping_changes_reach_validation_when_it_is_shown_again(app, tmp_p
     app._selection_changed()
     app.validation_switch.invoke()
     pump(app, lambda: ws.dataset is not None and not ws.busy and len(ws.dataset.items) == 2)
-    assert "2 test items" in ws.dataset_var.get() and ws.stale and showing(app, ws.stale_banner)
+    assert "Test Items 2" in ws.dataset_var.get() and ws.stale and showing(app, ws.stale_banner)
     assert len(ws.table.get_children()) == 3  # still the old results, marked as such
     ws.update_button.invoke()
     pump(app, lambda: not ws.running and not ws.stale)
@@ -2441,13 +2427,15 @@ def test_a_report_needs_no_study_information_and_can_cover_part_of_the_items(app
     asked = []
     outputs = [tmp_path / "bare.xlsx", tmp_path / "partial.xlsx"]
     monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **kw: asked.append(kw) or str(outputs[len(asked) - 1]))
-    assert ws.date_var.get() == "" and "optional" in [w.cget("text") for w in ws.report_tab.winfo_children()[0].winfo_children()][0]
+    today = date.today().strftime("%d-%m-%Y")
+    assert ws.date_var.get() == today and "optional" in ws.report_tab.winfo_children()[0].winfo_children()[0].cget("text")
     ws.excel_button.invoke()  # nothing entered: the report is made all the same
     pump(app, lambda: not ws.export_busy)
     assert ws.report_var.get() == f"Saved: {outputs[0]}"
     bare = load_workbook(outputs[0])
     assert bare.sheetnames[0] == "Summary" and len(bare.sheetnames) == 7  # a summary, then a sheet and its plot data per item
     assert not any(str(c.value).startswith(("Gage name", "Reported by")) for ws_ in bare for row in ws_.iter_rows() for c in row)
+    assert any(c.value == f"Date of study: {today}" for row in bare["Summary"].iter_rows() for c in row)  # today unless chosen
     bare.close()
     ws.gage_var.set("Bench DMM 7")
     ws.by_var.set("T. Man")
@@ -2467,25 +2455,52 @@ def test_a_report_needs_no_study_information_and_can_cover_part_of_the_items(app
     book.close()
 
 
-def test_about_and_calculation_details_explain_the_method_and_the_study(app, tmp_path, monkeypatch):
+def test_about_the_method_is_the_only_explanation_and_follows_the_analysis_and_the_selected_item(app, tmp_path, monkeypatch):
+    from datamapperx.method_guide import guide_text
     from datamapperx.ui import validation_workspace
 
     folder = tmp_path / "about_logs"
     folder.mkdir()
     ready_to_review(app, folder)
     ws = open_validation(app)
+    assert not any(hasattr(ws, name) for name in ("detail_button", "issues_button", "show_details", "show_issues"))
     shown = []
-    monkeypatch.setattr(validation_workspace, "ReportDialog", lambda *args: shown.append(args[-1]))
+    monkeypatch.setattr(validation_workspace, "MethodDialog", lambda parent, guide: shown.append(guide))
     ws.method_var.set("capability")
     ws.about_button.invoke()
-    assert "1.128" in shown[-1] and "Cpk" in shown[-1]
+    assert shown[-1].title.startswith("Process Capability") and "1.128" in guide_text(shown[-1])
+    assert "Values for the selected item" not in [s.title for s in shown[-1].sections]  # nothing analysed yet
     ws.method_var.set("grr")
     ws.about_button.invoke()
-    assert "ANOVA" in shown[-1] and "NDC" in shown[-1]
+    assert shown[-1].title == "Variable Gage R&R" and shown[-1].method == "One-way ANOVA (Single Tester)"
     run_validation(app, ws)
-    ws.detail_button.invoke()
-    assert "INTERMEDIATE" in shown[-1] and "FINAL METRICS" in shown[-1]
-    assert "Acceptance criteria: none" in shown[-1] and "Pending Minitab Verification" in shown[-1]
+    ws.table.selection_set(ws.table.get_children()[0])
+    ws.about_button.invoke()
+    assert shown[-1].sections[-2].title == "Values for the selected item" and shown[-1].sections[-2].values
+
+
+def test_the_about_dialog_draws_the_groups_of_formulas_and_they_can_be_closed(app):
+    from datamapperx.method_guide import method_guide
+    from datamapperx.statistics import AnalysisConfig
+    from datamapperx.ui.math_view import MathView
+    from datamapperx.ui.method_dialog import MethodDialog
+
+    guide = method_guide(AnalysisConfig(method="grr"))
+    dialog = MethodDialog(app, guide)
+    app.update()
+    titles = [section.title for section in guide.sections]
+    assert titles[:3] == ["ANOVA calculations", "Variance components", "Key metrics"] and set(dialog.sections) == set(titles)
+    body, _ = dialog.sections["Key metrics"]
+    formulas = [w for w in body.winfo_children()[0].winfo_children() if isinstance(w, MathView)]
+    assert formulas and all(w.winfo_reqwidth() > 10 and w.winfo_reqheight() > 10 for w in formulas)
+    # tkinter finds the widget of an event with nametowidget(), which calls the widget's _root(); no attribute may hide it
+    assert all(w.nametowidget(str(dialog.canvas)) is dialog.canvas for w in formulas)
+    assert body.winfo_ismapped() and not dialog.sections["Known limits"][0].winfo_ismapped()
+    dialog.toggle("Key metrics")
+    dialog.toggle("Known limits")
+    app.update()
+    assert not body.winfo_ismapped() and dialog.sections["Known limits"][0].winfo_ismapped()
+    dialog.close()
 
 
 def test_an_invalid_item_does_not_stop_the_others_and_the_table_can_be_filtered(app, tmp_path):
@@ -2501,6 +2516,7 @@ def test_an_invalid_item_does_not_stop_the_others_and_the_table_can_be_filtered(
     ws.method_var.set("capability")
     run_validation(app, ws)
     assert len(ws.results) == 3 and next(r for r in ws.results if r.test_item == "R1").status == "N/A"
+    assert "1 item could not be analysed" in ws.notes_var.get() and ws.notes_bar.winfo_manager()  # said where it matters
     ws.search_var.set("R1")
     assert len(ws.table.get_children()) == 1
     ws.search_var.set("")
@@ -2520,20 +2536,21 @@ def test_mapping_assignments_and_order_apply_to_the_snapshot_and_never_to_the_sc
     folder.mkdir()
     ready_to_review(app, folder)
     ws = open_validation(app)
-    ws.field_mapping = {"trial": "@trial", "tester": "=T1", "slot": "=1"}
+    for records in app.scan_result.grouped.values():  # a tester and a slot for every file
+        for record in records:
+            ws.assignments[str(record.path)] = {"tester": "T1", "slot": "1"}
     ws.data_edited()
     pump(app, lambda: not ws.busy)
     run_validation(app, ws)
     assert all("Slot=1" in r.system and "Tester=T1" in r.system for r in ws.results)
     source = str(next(iter(app.scan_result.grouped.values()))[0].path)
-    ws.assignments[source] = {"sample_id": "different-sample"}
+    ws.assignments[source] = {**ws.assignments[source], "sample_id": "different-sample"}
     ws.data_edited()
     pump(app, lambda: not ws.busy)
     ws.update_button.invoke()
     pump(app, lambda: not ws.running and not ws.stale)
     assert any(not r.valid for r in ws.results)  # an identity edit makes the study unbalanced
     ws.assignments.clear()
-    ws.field_mapping = {}
     ws.method_var.set("capability")
     ws.order_var.set("Timestamp order (File assignments)")
     pump(app, lambda: not ws.busy)
@@ -2568,9 +2585,11 @@ def test_a_rawdata_workbook_can_be_analysed_without_scanning_anything(app, tmp_p
     ws = open_validation_without_data(app)
     ws.open_file(workbook)
     pump(app, lambda: ws.dataset is not None and not ws.busy and ws.source_var.get() == "file")
-    assert ws.file_var.get() == str(workbook) and "3 samples · 12 readings · 2 test items" in ws.dataset_var.get()
+    assert ws.file_var.get() == str(workbook)
+    assert all(part in ws.dataset_var.get() for part in ("Test Items 2", "Samples 3", "Total Readings 12", "Trials per Sample 2"))
     assert showing(app, ws.mapping_controls, False) and showing(app, ws.file_controls)
-    assert [ws.order_combo.cget("values")[i] for i in range(2)] == ["Worksheet order", "Rows are in measurement order (I confirm)"]
+    assert [ws.order_menu.entrycget(i, "label") for i in (1, 2)] == ["Worksheet order", "Rows are in measurement order (I confirm)"]
+    assert ws.order_menu.index("end") == 2  # a file has no files of its own to order by: the header and two choices
     assert ws.preview.item(ws.preview.get_children()[0], "values")[1] == "VSE000123"  # text serial numbers, worksheet order
     ws.assign_var.set(True)
     run_validation(app, ws)
@@ -2593,19 +2612,18 @@ def test_importing_a_file_that_is_not_a_rawdata_workbook_says_why(app, tmp_path)
     assert "STT and SN" in ws.message_var.get() and ws.dataset is None
 
 
-def test_file_assignment_browsing_retains_mapped_trial_order(app, tmp_path):
+def test_file_assignment_browsing_shows_the_logs_own_identities_and_pins_nothing(app, tmp_path):
     from datamapperx.ui.validation import AssignmentDialog
 
     folder = tmp_path / "assignment_logs"
     folder.mkdir()
     ready_to_review(app, folder)
     ws = open_validation(app)
-    ws.field_mapping = {"trial": "@trial"}
     dialog = AssignmentDialog(ws)
     try:
         dialog.files.selection_set(1)  # second file of the first sample
         dialog.select()
-        assert dialog.variables["trial"].get() == "2"
+        assert dialog.variables["sample_id"].get() == dialog.records[1].sn and dialog.variables["trial"].get() == ""
         dialog.files.selection_clear(0, "end")
         dialog.files.selection_set(2)
         dialog.select()
@@ -2667,12 +2685,12 @@ def test_validation_layout_and_theme_fit_supported_desktop_size(app, tmp_path):
         assert inside(app, widget), widget
     ws.tabs.select(ws.setup_tab)
     app.update()
-    for widget in (ws.operators_entry, ws.nest_check, ws.criteria_button, ws.plan_label):
+    for widget in (ws.study_factor_combo, ws.criteria_button, ws.plan_label):
         assert inside(app, widget), widget
     ws.method_var.set("capability")
     run_validation(app, ws)
     app.update()
-    for widget in (ws.table, ws.detail_button, ws.about_button, ws.notes_button):
+    for widget in (ws.table, ws.about_button, ws.notes_button):
         assert inside(app, widget), widget
     headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
     assert sum(int(ws.table.column(c, "width")) for c in ws.table["columns"]) <= ws.table.winfo_width() + 4, headers  # no sideways scroll
@@ -2743,3 +2761,287 @@ def test_the_within_sigma_method_is_an_advanced_option(app, tmp_path):
     assert showing(app, ws.advanced) and "▾" in ws.advanced_button.cget("text")
     ws.advanced_button.invoke()
     assert showing(app, ws.advanced, False)
+
+
+# ----------------------------------------------------------------------------- the worksheet, the checks and the order of the readings
+def write_study_logs(folder, *, parts=10, operators=("Ann", "Bob", "Cy"), readings=3, by_folder=True, skip=()):
+    """One log per part, operator and reading, with some spread; in a folder per operator, or all in one folder."""
+    for k, operator in enumerate(operators):
+        target = folder / operator if by_folder else folder
+        target.mkdir(exist_ok=True)
+        for part in range(1, parts + 1):
+            for reading in range(readings):
+                if (part, operator) in skip:
+                    continue
+                value = 10 + part + 0.1 * ((part * 3 + reading * 5 + k * 7) % 4)
+                write_ict_log(target / f"P{part:02d}_{operator}_{reading + 1}.log", f"VSE{part:03d}",
+                              [ict_block("R1", f"{value:+.5E}", "+4.0E+01", "+0.0E+00")])
+
+
+def scanned_study(app, folder, *, parts=10, operators=("Ann", "Bob", "Cy"), readings=3, **kwargs):
+    write_study_logs(folder, parts=parts, operators=operators, readings=readings, **kwargs)
+    scan(app, folder, expected=parts, repeats=len(operators) * readings)
+    app.add_all_shown()
+    return open_validation(app)
+
+
+def worksheet(ws, column):
+    return [ws.preview.item(item, "values")[column] for item in ws.preview.get_children()]
+
+
+def test_a_single_tester_study_needs_no_operators_and_the_worksheet_says_how_it_looks(app, tmp_path):
+    folder = tmp_path / "one_tester"
+    folder.mkdir()
+    ws = scanned_study(app, folder, operators=("T1",), by_folder=False)
+    ws.tabs.select(ws.setup_tab)
+    app.update()
+    assert not any(hasattr(ws, name) for name in ("operators_entry", "nest_check", "operator_order_combo", "folders_button"))
+    assert "operator" not in ws.preview["displaycolumns"]  # nobody is named: the worksheet has no Operator column
+    assert worksheet(ws, 3)[:6] == ["1", "2", "3"] * 2  # the trial each reading will get, counted per part
+    assert all(part in ws.dataset_var.get() for part in ("Test Items 1", "Samples 10", "Total Readings 30", "Trials per Sample 3"))
+    assert ws.hint_var.get() == "" and showing(app, ws.hint_label, False)  # balanced and complete: nothing to warn about
+    run_validation(app, ws)
+    assert ws.results[0].valid and not ws.results[0].details.get("crossed") and "Single-tester" in ws.plan_var.get()
+    assert not any(c.code == "one_appraiser" for c in ws.evaluated.record.validation.conditions)
+    assert "Operators:" not in ws.checks_view.text.get("1.0", "end")
+
+
+def test_the_study_variation_factor_scales_study_var_and_tolerance_only(app, tmp_path):
+    from datamapperx.method_guide import guide_text, method_guide
+    from datamapperx.stat_reports import session_text
+
+    folder = tmp_path / "factor"
+    folder.mkdir()
+    ws = scanned_study(app, folder, operators=("T1",), by_folder=False)
+    assert ws.study_factor_var.get() == "6" and tuple(map(str, ws.study_factor_combo["values"])) == ("1", "2", "3", "4", "5", "6")
+    run_validation(app, ws)
+    six = dict(ws.results[0].metrics)
+    assert "6 × SD" in session_text(ws.results[0])
+    ws.study_factor_var.set("4")
+    assert ws.stale  # the factor decides the numbers
+    run_validation(app, ws)
+    four = ws.results[0].metrics
+    assert four["study_var"] == pytest.approx(six["study_var"] * 4 / 6) and four["percent_tolerance"] == pytest.approx(six["percent_tolerance"] * 4 / 6)
+    for unchanged in ("percent_study_var", "ndc", "sigma_grr", "sigma_part", "variance_grr", "variance_part"):
+        assert four[unchanged] == six[unchanged], unchanged
+    assert "4 × SD" in session_text(ws.results[0]) and "Study variation: 4 × SD." in ws.plan_var.get()
+    note = guide_text(method_guide(ws._config()))
+    assert "uses k = 4" in note and "±3σ" in note and "Gage R&R is the repeatability" in note
+    ws.study_factor_var.set("7")
+    assert "from 1 to 6" in ws.setup_error and ws.run_button.instate(["disabled"])
+    ws.study_factor_var.set("6")
+    assert ws.setup_error == ""
+
+
+def test_the_checks_tab_gives_amount_of_data_and_the_guidelines_for_gage_rr(app, tmp_path):
+    folder = tmp_path / "checks_grr"
+    folder.mkdir()
+    ws = scanned_study(app, folder, parts=8, operators=("T1",), by_folder=False)
+    run_validation(app, ws)
+    shown = ws.checks_view.text.get("1.0", "end")
+    assert "!  Parts: Only 8 parts" in shown and "Operators:" not in shown  # fewer than 10 parts
+    assert "Guidelines (AIAG, as Minitab quotes them)" in shown and "%Study Var:" in shown and "%Contribution:" in shown
+    assert "not printed in the report" in shown
+    assert "with data checks to review" in ws.summary_var.get()
+    folder2 = tmp_path / "checks_grr_ok"
+    folder2.mkdir()
+    ws = scanned_study(app, folder2, parts=12, operators=("T1",), by_folder=False)
+    run_validation(app, ws)
+    assert "i  Parts: 12 parts meets the usual minimum" in ws.checks_view.text.get("1.0", "end")
+    assert "with data checks to review" not in ws.summary_var.get()
+
+
+def test_file_time_order_sorts_by_when_each_log_was_saved_and_is_taken_as_the_order_of_measurement(app, tmp_path):
+    import os
+
+    from datamapperx.ui.validation_workspace import ORDERS
+
+    folder = tmp_path / "timed"
+    folder.mkdir()
+    ws = scanned_study(app, folder, by_folder=False, operators=("Ann",), readings=9)
+    paths = sorted(str(r.path) for records in app.scan_result.grouped.values() for r in records)
+    for position, path in enumerate(paths):  # saved in the reverse of the name order
+        os.utime(path, ns=(10**18 + (len(paths) - position) * 10**9,) * 2)
+    ws.method_var.set("capability")
+    assert "worksheet order" in ws.hint_var.get() and "Settings" in ws.hint_var.get()  # capability depends on the order: said once
+    ws.order_var.set(ORDERS["filetime"])
+    pump(app, lambda: ws.dataset is not None and not ws.busy and ws.dataset.order_basis == "acquisition")
+    assert "the time each log file was saved" in ws.dataset.description
+    first_files = [ws.preview.item(item, "values")[-1] for item in ws.preview.get_children()][:2]
+    assert first_files[0].endswith("P10_Ann_9.log") and first_files[1].endswith("P10_Ann_8.log")  # the last name was saved first
+    run_validation(app, ws)
+    shown = ws.checks_view.text.get("1.0", "end")
+    assert "Stability:" in shown and "Normality:" in shown and "Amount of data:" in shown
+    assert "taken as the order of measurement" in shown and ws.hint_var.get() == ""  # an order was chosen: nothing to warn about
+    ws.method_var.set("grr")
+    assert ws.hint_var.get() == ""
+    ws.method_var.set("capability")
+    ws.order_var.set(ORDERS["worksheet"])
+    pump(app, lambda: ws.dataset is not None and not ws.busy and ws.dataset.order_basis == "worksheet")
+    run_validation(app, ws)
+    assert "choose File time order" in ws.checks_view.text.get("1.0", "end")
+
+
+def test_the_notes_of_a_capability_analysis_point_to_the_checks_tab_without_changing_the_noted_text(app, tmp_path, monkeypatch):
+    from datamapperx.ui import validation_workspace
+
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    ws = scanned_study(app, folder, by_folder=False, operators=("Ann",), readings=9)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    shown = []
+    monkeypatch.setattr(validation_workspace, "ReportDialog", lambda parent, title, heading, text: shown.append(text))
+    ws.show_notes()
+    assert "Stability is not tested here" in shown[0]  # the note that the report prints is unchanged
+    assert "Screening in this program" in shown[0] and "not printed in the report" in shown[0]
+    ws.method_var.set("grr")
+    run_validation(app, ws)
+    ws.show_notes()
+    assert "Screening in this program" not in shown[1]
+
+
+def test_the_date_of_study_is_today_and_is_chosen_from_a_calendar_in_dd_mm_yyyy(app, tmp_path):
+    from datamapperx.ui.validation import DatePickerDialog
+
+    folder = tmp_path / "date_logs"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    assert ws.date_var.get() == date.today().strftime("%d-%m-%Y") and str(ws.info_entries["Date of study"].cget("state")) == "readonly"
+    assert ws.study.info.date_of_study == ws.date_var.get()
+    picked = []
+    dialog = DatePickerDialog(app, date(2026, 2, 27), picked.append)
+    assert dialog.month_label.cget("text") == "February 2026"
+    dialog._move(1)
+    assert dialog.month_label.cget("text") == "March 2026"
+    next(b for b in dialog.days.winfo_children() if b.cget("text") == "15").invoke()
+    assert picked == [date(2026, 3, 15)] and not dialog.winfo_exists()
+    ws.choose_date()  # opens the calendar on the date shown
+    (dialog,) = [w for w in app.winfo_children() if isinstance(w, DatePickerDialog)]
+    dialog.pick(date(2026, 1, 5))
+    assert ws.date_var.get() == "05-01-2026" and ws.study.info.date_of_study == "05-01-2026"
+    ws.on_show()
+    assert ws.date_var.get() == "05-01-2026"  # a chosen date is kept
+    ws._date_chosen = False  # the window is shared by the other tests
+    ws.on_show()
+    assert ws.date_var.get() == date.today().strftime("%d-%m-%Y")  # until then it is today
+
+
+def test_the_data_tab_has_a_compact_summary_seven_columns_a_test_item_filter_and_marks_inferred_trials(app, tmp_path):
+    folder = tmp_path / "data_tab"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    shown = tuple(ws.preview["displaycolumns"])
+    assert shown == ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")
+    assert [ws.preview.heading(c)["text"] for c in shown] == ["Test Item", "Sample ID", "Trial", "Value", "LSL", "USL", "Unit"]
+    first = ws.preview.get_children()[0]
+    assert ws.preview.item(first, "values")[-1] and "ingerprint" not in ws.dataset_var.get() + ws.hint_var.get() + ws.preview_note_var.get()
+    assert ws.hint_var.get() == "" and showing(app, ws.hint_label, False)  # nothing to fix, nothing said
+    assert "inferred" in ws.preview.item(first, "tags") and "not the order of measurement" in ws.preview_note_var.get()
+    ws.assign_var.set(False)  # without the labelling the readings have no Trial at all: that is a problem to fix
+    assert "no Trial" in ws.hint_var.get() and ws.preview.item(first, "tags") == "" and showing(app, ws.hint_label)
+    ws.assign_var.set(True)
+    # the filter
+    items = list(ws.item_filter["values"])
+    rows = len(ws.preview.get_children())
+    assert items[0] == "All Test Items" and ws.item_filter_var.get() == "All Test Items" and len(items) == 4 and rows == 18
+    ws.item_filter_var.set(items[1])
+    shown_items = {ws.preview.item(i, "values")[0] for i in ws.preview.get_children()}
+    assert shown_items == {items[1]} and len(ws.preview.get_children()) == 6
+    ws.item_filter_var.set("All Test Items")
+    assert len(ws.preview.get_children()) == 18
+    # what belongs to the source, and the order of the readings in Settings
+    assert showing(app, ws.mapping_controls) and ws.order_menu.index("end") == 5 and not hasattr(ws, "order_combo")
+    ws.source_var.set("file")
+    assert showing(app, ws.mapping_controls, False) and showing(app, ws.file_controls)
+    ws.source_var.set("mapping")
+    assert showing(app, ws.mapping_controls) and showing(app, ws.file_controls, False)
+
+
+def test_readings_are_shown_with_reasonable_precision_and_the_data_keep_their_own_values(app):
+    ws = open_validation_without_data(app)
+    assert ws._cell(0.269585132598877) == "0.269585" and ws._cell(1.5) == "1.5" and ws._cell(40) == "40"
+    assert ws._cell(1e-8) == "0.00000001" and ws._cell("bad") == "bad" and ws._cell(None) == "" and ws._cell(1234567.891) == "1234567.891" and ws._cell(0.0) == "0"
+
+
+def test_the_quick_check_criteria_are_set_in_a_dialog_and_applied_at_once_without_recalculating(app, tmp_path):
+    from datamapperx.grr import DEFAULT_QUICK_CRITERIA
+    from datamapperx.ui.dialogs import GrrCriteriaDialog
+
+    folder = tmp_path / "criteria_logs"
+    folder.mkdir()
+    grr_logs(folder)
+    scan(app, folder, repeats=3)
+    app.add_all_shown()
+    app._show_step("review")
+    app.update()
+    app._set_grr_criteria(DEFAULT_QUICK_CRITERIA)
+    assert app.grr_criteria == DEFAULT_QUICK_CRITERIA and app.settings.quick_check_criteria == []  # the defaults are not saved
+    assert [label.cget("text") for _, label, _ in app.grr_legend_tiles] == ["PASS", "CONDITION", "FAIL"]  # colour keys only
+    figures = app._grr_results
+    app._edit_grr_criteria()
+    (dialog,) = [w for w in app.winfo_children() if isinstance(w, GrrCriteriaDialog)]
+    enabled, low, high = dialog.vars["percent_tolerance"]
+    enabled.set(True)  # %SV/Tol now decides too, and the percentages get their own limits
+    low.set("5")
+    high.set("20")
+    dialog.vars["percent_study_var"][1].set("40")
+    dialog.vars["percent_study_var"][2].set("20")  # PASS limit above the FAIL limit: refused, and said why
+    dialog.apply()
+    assert "PASS limit cannot be above" in dialog.error_var.get() and dialog.winfo_exists() and app.grr_criteria == DEFAULT_QUICK_CRITERIA
+    dialog.vars["percent_study_var"][1].set("40")
+    dialog.vars["percent_study_var"][2].set("60")
+    dialog.vars["ndc"][1].set("2.5")
+    dialog.apply()
+    assert "whole number" in dialog.error_var.get()
+    dialog.vars["ndc"][1].set("3")
+    dialog.apply()
+    assert not dialog.winfo_exists() and app._grr_results is figures  # applied at once, the figures are the same objects
+    try:
+        assert app.grr_grid.cell_tags() == {
+            (0, 1): "pass", (0, 2): "fail", (0, 3): "pass", (0, 4): "fail",  # X: SV 32.16 under 40, Tol 30 above 20, NDC 4 from 3
+            (1, 1): "pass", (1, 2): "caution", (1, 3): "pass", (1, 4): "caution",  # Y: Tol 6 is above 5 and up to 20
+        }
+        assert [row[-1] for row in app.grr_grid.rows()] == ["FAIL", "CONDITION"]
+        assert [c["metric"] for c in app.settings.quick_check_criteria] == ["percent_study_var", "percent_tolerance", "ndc"]
+        from datamapperx.grr import quick_criteria_from_json
+        assert quick_criteria_from_json(app.settings.quick_check_criteria) == app.grr_criteria  # what is saved is what is read back
+    finally:
+        app._set_grr_criteria(DEFAULT_QUICK_CRITERIA)
+
+
+def test_results_put_the_table_beside_the_charts_in_a_wide_window_and_above_them_in_a_narrow_one(app, tmp_path):
+    folder = tmp_path / "results_layout"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    app.geometry("1360x880+0+0")
+    ws = open_validation(app)
+    run_validation(app, ws)
+    app.update()
+    app.update()
+    table, charts = ws.table_page, ws.right_pane
+    assert ws._wide and ws.split is ws.split_cols and ws.split_rows.winfo_manager() == ""
+    assert table.winfo_rootx() < charts.winfo_rootx() and abs(table.winfo_rooty() - charts.winfo_rooty()) <= 2  # side by side
+    assert abs(table.winfo_height() - charts.winfo_height()) <= 2 and table.winfo_height() > 400  # each with the whole height
+    assert table.winfo_width() >= 380 and charts.winfo_width() > table.winfo_width()
+    for widget in (ws.table, ws.chart_canvas, ws.about_button, ws.selected_label, ws.run_button):
+        assert inside(app, widget), widget
+    assert ws.selected_var.get() == item_label(ws.selected_result()) and ws.chart_canvas.winfo_height() > 450
+    assert not any(bar.winfo_ismapped() for bar in ws.table_bars)  # nothing to scroll: the room goes to the data
+    summary = ws.notes_bar.master.winfo_children()[0]
+    assert str(summary.cget("textvariable")) == str(ws.summary_var) and ws.notes_bar.winfo_ismapped()  # the notes sit beside the summary
+    assert abs(summary.winfo_rooty() - ws.notes_bar.winfo_rooty()) <= 12 and ws.filters.master is ws.table_page  # search and sort: above the table
+    app.geometry("1000x680+0+0")
+    ws.tabs.select(ws.data_tab)
+    app.update()
+    ws.tabs.select(ws.results_tab)
+    app.update()
+    app.update()
+    assert not ws._wide and ws.split is ws.split_rows and ws.split_cols.winfo_manager() == ""
+    assert table.winfo_rooty() < charts.winfo_rooty() and abs(table.winfo_rootx() - charts.winfo_rootx()) <= 2  # above each other
+    assert table.winfo_height() >= 120 and not ws.selected_label.winfo_ismapped()
+    for widget in (ws.table, ws.chart_canvas, ws.about_button):
+        assert inside(app, widget), widget
+    app.geometry("1360x880+0+0")

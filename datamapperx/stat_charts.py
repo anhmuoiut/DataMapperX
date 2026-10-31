@@ -9,6 +9,7 @@ import math
 import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 
@@ -206,6 +207,7 @@ def _bounds(spec: ChartSpec):
     return xmin - 0.06 * dx, xmax + 0.06 * dx, (max(0.0, low) if non_negative else low), ymax + 0.12 * dy
 
 
+MAX_DECIMALS = 15  # chart numbers are written out in full; this is where even a tiny scale stops getting more digits
 LEGEND_HIDDEN = {"Observed", "LCL", "UCL", "CENTER", "Measurements"}
 CENTER_NAMES = {"R Chart": "Rbar", "Xbar Chart": "Mean"}
 
@@ -263,7 +265,12 @@ def _ticks(low: float, high: float) -> tuple[list[float], float]:
     fraction = raw / 10 ** exponent
     step = (1 if fraction < 1.5 else 2 if fraction < 3.5 else 5 if fraction < 7.5 else 10) * 10 ** exponent
     first, last = math.ceil(low / step - 1e-9), math.floor(high / step + 1e-9)
-    return [round(k * step, 12) for k in range(first, last + 1)], step
+    return [float(f"{k * step:.12g}") for k in range(first, last + 1)], step  # 12 digits drop float noise, not tiny steps
+
+
+def plain_number(value: float, digits: int = 6) -> str:
+    """Significant digits written out in full (0.00005, not 5E-05), as Minitab's reports print numbers."""
+    return format(Decimal(f"{value:.{digits}g}"), "f") if math.isfinite(value) else str(value)
 
 
 def _tick(value: float, step: float) -> str:
@@ -271,9 +278,20 @@ def _tick(value: float, step: float) -> str:
     if value == 0:
         return "0"
     if step <= 0 or not math.isfinite(step):
-        return f"{value:.4g}"
-    decimals = max(0, min(10, 1 - math.floor(math.log10(step))))
-    return f"{value:.{decimals}f}" if abs(value) >= 1e-4 or decimals <= 6 else f"{value:.3g}"
+        return plain_number(value, 4)
+    return f"{value:.{max(0, min(MAX_DECIMALS, 1 - math.floor(math.log10(step))))}f}"
+
+
+def _limit_decimals(values: Sequence[float]) -> int:
+    """Decimals for the control limits of one chart: Minitab's 6, or more when the limits are close together or tiny."""
+    distinct = sorted({v for v in values if math.isfinite(v)})
+    gaps = [b - a for a, b in zip(distinct, distinct[1:], strict=False)]
+    return min(MAX_DECIMALS, max(6, 2 - math.floor(math.log10(min(gaps))))) if gaps else 6
+
+
+def _limit_text(name: str, value: float, decimals: int) -> str:
+    """``UCL=0.003217``, ``LCL=0``: a limit as Minitab writes it beside the chart, never in scientific notation."""
+    return f"{name}={0 if value == 0 else f'{value:.{decimals}f}'}"
 
 
 def chart_primitives(spec: ChartSpec, width: float = 650, height: float = 280):
@@ -281,20 +299,25 @@ def chart_primitives(spec: ChartSpec, width: float = 650, height: float = 280):
     limits = [s for s in spec.series if s.label in ("LCL", "CENTER", "UCL") and s.points]
     entries = [s for s in spec.series if s.label not in LEGEND_HIDDEN]
     margins = [18.0]
+    limit_decimals = _limit_decimals([s.points[0][1] for s in limits])
     if limits:
-        margins.append(12 + 7.5 * max(_text_units(f"UCL={s.points[0][1]:.6g}") for s in limits))
+        margins.append(12 + 7.5 * max(_text_units(_limit_text("UCL", s.points[0][1], limit_decimals)) for s in limits))
     if entries:
         margins.append(32 + 7.5 * max(_text_units(s.label) for s in entries))
     margin = max(margins)
-    left, top, right = (58.0 if spec.show_y else 14.0), 36.0, width - margin
+    xmin, xmax, ymin, ymax = _bounds(spec)
+    yticks, ystep = _ticks(ymin, ymax)
+    # The vertical scale gets room for its labels, which are long when the values are tiny and written out in full.
+    left_edge = max(58.0, 10 + 8 * max((_text_units(_tick(y, ystep)) for y in yticks), default=0)) if spec.show_y else 14.0
+    left, top, right = left_edge, 36.0, width - margin
     note_lines = textwrap.wrap(spec.note, max(30, int((right - left) / 3.4)))
     note_height = len(note_lines) * 9 + (8 if note_lines else 0)
     left, bottom, category_size, category_angle, rows = _category_layout(
         spec, width, height, left, right, note_height,
     )
+    left = max(left, left_edge)
     # A very long identifier must not invert a small plot's horizontal scale.
     right = max(left + 25, right)
-    xmin, xmax, ymin, ymax = _bounds(spec)
 
     def px(x):
         return left + (x - xmin) / (xmax - xmin) * (right - left)
@@ -305,7 +328,6 @@ def chart_primitives(spec: ChartSpec, width: float = 650, height: float = 280):
               ("line", (left, bottom, right, bottom), {"color": "#748391"})]
     if spec.title:
         output.insert(0, ("text", (left, 14), {"text": spec.title, "bold": True, "size": 11, "anchor": "w"}))
-    yticks, ystep = _ticks(ymin, ymax)
     for y in yticks:
         output.append(("line", (left, py(y), right, py(y)), {"color": "#E5EAF0"}))
         if spec.show_y:
@@ -344,7 +366,8 @@ def chart_primitives(spec: ChartSpec, width: float = 650, height: float = 280):
         name = CENTER_NAMES.get(spec.title, "CL") if series.label == "CENTER" else series.label
         y = max(py(value), placed + 9)
         placed = y
-        output.append(("text", (right + 4, y), {"text": f"{name}={value:.6g}", "size": 7.5, "anchor": "w", "color": series.color}))
+        output.append(("text", (right + 4, y), {"text": _limit_text(name, value, limit_decimals), "size": 7.5, "anchor": "w",
+                                                  "color": series.color}))
     for label, value in spec.markers:
         if xmin <= value <= xmax:
             output.append(("line", (px(value), top, px(value), bottom), {"color": "#BD3434", "width": 1.2, "dash": True}))

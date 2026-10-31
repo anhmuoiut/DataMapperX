@@ -103,6 +103,14 @@ class ReadOnlyText(ttk.Frame):
         self.text.insert("1.0", content)
         self.text.configure(state="disabled")
 
+    def set_parts(self, parts) -> None:
+        """Show (text, tag) pieces one after the other; the caller configures the tags with ``text.tag_configure``."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", tk.END)
+        for content, tag in parts:
+            self.text.insert(tk.END, content, tag or ())
+        self.text.configure(state="disabled")
+
     def set_markdown(self, content: str) -> None:
         """Show the small Markdown subset used in release notes: headings, bullets, **bold**, `code`."""
         self.text.configure(state="normal")
