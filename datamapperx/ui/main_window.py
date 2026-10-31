@@ -10,7 +10,6 @@ import time
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
-from itertools import islice
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -20,21 +19,30 @@ from ..config import (
     APP_CREDIT,
     APP_TITLE,
     DEFAULT_OUTPUT_FILE,
-    MISSING_TEXT,
-    PREVIEW_COLUMNS_PER_PAGE,
-    PREVIEW_ROW_LIMIT,
 )
-from ..exporter import ExportRow, generate_excel, iter_export_rows, summarize_limits
+from ..exporter import ExportRow, generate_excel, summarize_limits
 from ..grr import GrrResult, summarize_grr
 from ..models import ScanResult
 from ..paths import is_frozen, log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
 from ..reporting import describe_empty_scan, full_report, summarize_scan
-from ..review import HIGH, LOW, MISSING, ReviewSummary, limit_rows, summarize_review
+from ..review import ReviewSummary, summarize_review
 from ..sampling import suggest_profile
 from ..scanner import scan_folder
 from ..settings import Settings, load_settings, save_settings
 from ..utils import parse_positive_int
+from ..workflow import (
+    NO_ROW_CHOSEN_TEXT,
+    SELECTED_EMPTY_TEXT,
+    available_view,
+    check_chips,
+    limit_overview,
+    limit_panel,
+    limit_texts,
+    move_items,
+    preview_table,
+    selected_info,
+)
 from .access_dialog import AccessDialog
 from .controls import ActionList, ChipRow, Column, DataGrid, StepBar
 from .dialogs import AboutDialog, ExportDoneDialog, ReportDialog, open_path, set_window_icon
@@ -1030,42 +1038,24 @@ class MainWindow(tk.Tk):
 
     # ------------------------------------------------------------------ component lists
     def _limit_texts(self, component: str) -> tuple[str, str]:
-        info = self.limits.get(component, {})
-        return info.get("min") or "–", info.get("max") or "–"
+        return limit_texts(self.limits, component)
 
     def _refresh_available(self, *, reset_view: bool = False) -> None:
         components = self.scan_result.components if self.scan_result else []
-        chosen = set(self.selected_components)
-        keyword = self.search_var.get().strip().lower()
-        remaining = [c for c in components if c not in chosen]
-        shown = [c for c in remaining if keyword in c.lower()] if keyword else remaining
-        if not components:
-            empty = "Scan a folder to list\nits components here."
-        elif not remaining:
-            empty = "Every component is selected."
-        else:
-            empty = "No component matches the filter."
-        self.available_list.set_items(shown, empty_text=empty, values=[self._limit_texts(c) for c in shown])
+        view = available_view(components, self.selected_components, self.search_var.get())
+        self.available_list.set_items(view.items, empty_text=view.empty_text, values=[self._limit_texts(c) for c in view.items])
         if reset_view:
             self.available_list.reset_view()
-        if keyword:
+        if view.filtering:
             self.search_hint.place_forget()
         else:
             self.search_hint.place(x=10, rely=0.5, anchor="w")
-        if not components:
-            self.available_info_var.set("")
-        elif keyword:
-            self.available_info_var.set(f"{len(shown)} of {len(remaining)} shown")
-        else:
-            self.available_info_var.set(f"{len(remaining)} available")
+        self.available_info_var.set(view.info)
         self._update_actions()
 
     def _refresh_selected(self) -> None:
-        self.selected_list.set_items(
-            self.selected_components, empty_text="Press + on a component on the left,\nor double-click it."
-        )
-        count = len(self.selected_components)
-        self.selected_info_var.set(f"{count} selected" if count else "No columns selected")
+        self.selected_list.set_items(self.selected_components, empty_text=SELECTED_EMPTY_TEXT)
+        self.selected_info_var.set(selected_info(len(self.selected_components)))
         self._update_actions()
 
     def _refresh_lists(self) -> None:
@@ -1146,11 +1136,8 @@ class MainWindow(tk.Tk):
         if self.is_busy:
             return
         indices = self.selected_list.selected_indices()
-        items = self.selected_components
-        if not indices or (direction < 0 and indices[0] == 0) or (direction > 0 and indices[-1] == len(items) - 1):
+        if not move_items(self.selected_components, indices, direction):
             return
-        for index in indices if direction < 0 else reversed(indices):
-            items[index], items[index + direction] = items[index + direction], items[index]
         self._selection_changed()
         self.selected_list.select_indices([i + direction for i in indices])
 
@@ -1239,44 +1226,21 @@ class MainWindow(tk.Tk):
         result = self.scan_result
         components = list(self.selected_components)
         self._preview_components = tuple(components)
-        self._preview_rows = []
 
         # One page of columns at a time keeps the table readable; the export always has every column.
-        pages = max(1, -(-len(components) // PREVIEW_COLUMNS_PER_PAGE))
-        self._preview_page = max(0, min(self._preview_page, pages - 1))
-        first = self._preview_page * PREVIEW_COLUMNS_PER_PAGE
-        page = components[first : first + PREVIEW_COLUMNS_PER_PAGE]
-        self._update_pager(first, len(page), len(components), pages)
-        columns = [Column("No.", "center"), Column("Serial number"), Column("File"), *(Column(name, "e") for name in page)]
-
-        if result is None or not result.grouped:
-            self.preview_grid.set_table(columns, [], empty_text="Your data preview starts here.\nChoose a source folder, then scan its logs.")
-            self.preview_info_var.set("The preview uses the same rows and column order as your Excel file.")
-            self.review_count_var.set("")
+        table = preview_table(result, components, self._preview_page, self._optional_int(self.repeats_var))
+        self._preview_page = table.page
+        self._preview_rows = table.export_rows
+        self._update_pager(table.first, len(table.page_components), len(components), table.pages)
+        columns = [Column("No.", "center"), Column("Serial number"), Column("File"), *(Column(name, "e") for name in table.page_components)]
+        self.preview_grid.set_table(columns, table.rows, table.tags if table.rows else None, empty_text=table.empty_text)
+        self.preview_info_var.set(table.note)
+        self.review_count_var.set(table.count_text)
+        if not table.rows and (result is None or not result.grouped):
             self._refresh_limits()
             return
 
-        repeats = self._optional_int(self.repeats_var)
-        wrong = set(result.sns_with_wrong_repeat_count(repeats)) if repeats else set()
-        table: list[tuple] = []
-        tags: list[str] = []
-        for row in islice(iter_export_rows(result.grouped, components), PREVIEW_ROW_LIMIT):
-            missing = bool(components) and MISSING_TEXT in row.values
-            tags.append("invalid" if row.sn in wrong else "missing" if missing else "")
-            table.append((row.index, row.sn, row.filename, *row.values[first : first + PREVIEW_COLUMNS_PER_PAGE]))
-            self._preview_rows.append(row)
-        self.preview_grid.set_table(columns, table, tags)
-
         shown = len(self._preview_rows)
-        self.review_count_var.set(f"({result.total_files} rows)")
-        if components:
-            note = f"Showing {shown} of {result.total_files} rows." if shown < result.total_files else f"{shown} rows."
-            if pages > 1:
-                note += f"  The Excel file has all {len(components)} columns."
-            self.preview_info_var.set(note)
-        else:
-            self.preview_info_var.set(f"{result.total_files} files found. Add components in the Select step to build your Excel columns.")
-
         if self._preview_rows:  # keep the row you were looking at, or start with the first
             self._review_row = max(0, min(self._review_row, shown - 1))
             self.preview_grid.select(self._review_row, notify=False)
@@ -1296,19 +1260,12 @@ class MainWindow(tk.Tk):
             self.limits_title_var.set(f"Limits ({len(components)})" if components else "Limits")
             self._limit_columns = self._limit_column_layout(components)
         if not 0 <= self._review_row < len(self._preview_rows):  # no row to compare: just the limits
-            self.review_row_var.set("Click a row to compare its values with the limits.")
-            rows = [(c, "", *self._limit_texts(c), self.limits.get(c, {}).get("unit", "")) for c in components]
-            self.limits_grid.set_table(self._limit_columns, rows)
+            self.review_row_var.set(NO_ROW_CHOSEN_TEXT)
+            self.limits_grid.set_table(self._limit_columns, limit_overview(components, self.limits))
             return
         row = self._preview_rows[self._review_row]
         self.review_row_var.set(f"Row {row.index}   ·   {row.sn}   ·   {row.filename}")
-        rows: list[tuple[str, ...]] = []
-        tags: list[str] = []
-        for entry in limit_rows(row, components, self.limits):
-            mark = {HIGH: " ▲", LOW: " ▼"}.get(entry.status, "")
-            rows.append((entry.component, "–" if entry.status == MISSING else entry.value + mark,
-                         entry.low or "–", entry.high or "–", entry.unit))
-            tags.append("gap" if entry.status == MISSING else "out" if entry.status in (HIGH, LOW) else "")
+        rows, tags = limit_panel(row, components, self.limits)
         self.limits_grid.set_table(self._limit_columns, rows, tags)
 
     def _limit_column_layout(self, components: tuple[str, ...]) -> list[Column]:
@@ -1336,11 +1293,6 @@ class MainWindow(tk.Tk):
             self._summary_key = key
         return self._summary
 
-    @staticmethod
-    def _row_list(rows: tuple[int, ...], shown: int = 6) -> str:
-        text = ", ".join(str(n) for n in rows[:shown])
-        return f"{'rows' if len(rows) > 1 else 'row'} {text}" + (f" … +{len(rows) - shown} more" if len(rows) > shown else "")
-
     def _refresh_checks(self) -> None:
         """The chips beside the Export button: what to know before saving."""
         result = self.scan_result
@@ -1349,27 +1301,8 @@ class MainWindow(tk.Tk):
             self.check_chips.set_chips([])
             return
         expected, repeats = self._optional_int(self.expected_var), self._optional_int(self.repeats_var)
-        chips: list[tuple[str, str]] = []
-        if expected is not None:
-            found = result.total_sns
-            chips.append(("ok", f"✓  {found} of {expected} samples") if found == expected
-                         else ("warn", f"!  {found} of {expected} samples. You will be asked to confirm"))
-        if repeats is not None:
-            wrong = self._wrong_samples()
-            if not wrong:
-                chips.append(("ok", f"✓  {repeats} files per sample"))
-            elif len(wrong) == 1:
-                chips.append(("bad", f"!  {wrong[0]} has {len(result.grouped[wrong[0]])} files, not {repeats}. Export is blocked"))
-            else:
-                chips.append(("bad", f"!  {len(wrong)} samples do not have {repeats} files ({', '.join(wrong[:2])}…). Export is blocked"))
-        if summary.empty_cells:
-            count, columns = summary.empty_cells, len(summary.empty_columns)
-            chips.append(("warn", f"!  {count} empty cell{'s' if count != 1 else ''} in {columns} column{'s' if columns != 1 else ''}"))
-        else:
-            chips.append(("ok", "✓  No empty cells"))
-        if summary.outside_rows:
-            chips.append(("info", f"Outside min–max: {self._row_list(summary.outside_rows)}"))
-        self.check_chips.set_chips(chips)
+        wrong = self._wrong_samples() if repeats is not None else []
+        self.check_chips.set_chips(check_chips(result, summary, expected=expected, repeats=repeats, wrong=wrong))
 
     # ------------------------------------------------------------------ export
     def export_excel(self) -> None:

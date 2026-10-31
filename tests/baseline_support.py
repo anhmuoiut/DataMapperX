@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import random
+import re
 from pathlib import Path
 
 from datamapperx.exporter import generate_excel, iter_export_rows, summarize_limits
@@ -63,27 +64,68 @@ def dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def first_difference(expected, actual, path="$") -> str:
-    """Where two encoded structures first differ, for a readable failure message."""
+#: Relative tolerance for floating-point numbers when a baseline is compared across machines. Different CPUs and math
+#: libraries may differ in the last one or two digits of a double (about 1e-16 relative per operation, seen up to 4e-15
+#: after the ANOVA arithmetic); a real change in a formula or constant is many orders of magnitude larger.
+FLOAT_REL_TOL = 1e-12
+#: Floor for numbers that should be (almost) zero. The same default as the reference-study tests.
+FLOAT_ABS_TOL = 1e-18
+
+# A decimal number inside text: only the ones with a point or an exponent are floats. Integers must match exactly.
+_FLOAT_TOKEN = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+(?=[eE][-+]?\d))(?:[eE][-+]?\d+)?")
+
+
+def _close(expected: float, actual: float, rel_tol: float, abs_tol: float) -> bool:
+    return expected == actual or math.isclose(expected, actual, rel_tol=rel_tol, abs_tol=abs_tol)
+
+
+def _text_difference(expected: str, actual: str, path: str, rel_tol: float, abs_tol: float) -> str:
+    """Text must match exactly, except that decimal numbers inside it may differ within the tolerance."""
+    if expected == actual:
+        return ""
+    if rel_tol:
+        skeleton = _FLOAT_TOKEN.sub("#", expected)
+        if skeleton == _FLOAT_TOKEN.sub("#", actual):
+            old, new = _FLOAT_TOKEN.findall(expected), _FLOAT_TOKEN.findall(actual)
+            if len(old) == len(new) and all(_close(float(a), float(b), rel_tol, abs_tol) for a, b in zip(old, new, strict=True)):
+                return ""
+            for a, b in zip(old, new, strict=True):
+                if not _close(float(a), float(b), rel_tol, abs_tol):
+                    return f"{path}: number in text differs beyond tolerance: expected {a}, got {b}"
+    return f"{path}: expected {expected!r}, got {actual!r}"
+
+
+def first_difference(expected, actual, path="$", *, rel_tol: float = 0.0, abs_tol: float = FLOAT_ABS_TOL) -> str:
+    """Where two encoded structures first differ, for a readable failure message.
+
+    By default the comparison is exact. With ``rel_tol`` (for example ``FLOAT_REL_TOL``) floating-point numbers, and the
+    decimal numbers printed inside text, may differ by that relative amount; everything else is still exact: types
+    (``1`` is not ``1.0`` and not ``True``), key order, tuple versus list, the sign of zero, NaN, infinity, integers and
+    all other text.
+    """
     if type(expected) is not type(actual):
         return f"{path}: expected {type(expected).__name__} {str(expected)[:80]!r}, got {type(actual).__name__} {str(actual)[:80]!r}"
     if isinstance(expected, dict):
         for key in expected:
             if key not in actual:
                 return f"{path}: key {key!r} missing"
-            found = first_difference(expected[key], actual[key], f"{path}.{key}")
+            found = first_difference(expected[key], actual[key], f"{path}.{key}", rel_tol=rel_tol, abs_tol=abs_tol)
             if found:
                 return found
         extra = [key for key in actual if key not in expected]
         return f"{path}: unexpected keys {extra}" if extra else ""
     if isinstance(expected, list):
         for index, (left, right) in enumerate(zip(expected, actual, strict=False)):
-            found = first_difference(left, right, f"{path}[{index}]")
+            found = first_difference(left, right, f"{path}[{index}]", rel_tol=rel_tol, abs_tol=abs_tol)
             if found:
                 return found
         if len(expected) != len(actual):
             return f"{path}: expected {len(expected)} items, got {len(actual)}"
         return ""
+    if isinstance(expected, float) and rel_tol:
+        return "" if _close(expected, actual, rel_tol, abs_tol) else f"{path}: expected {expected!r}, got {actual!r}"
+    if isinstance(expected, str):
+        return _text_difference(expected, actual, path, rel_tol, abs_tol)
     return "" if dumps(expected) == dumps(actual) else f"{path}: expected {expected!r}, got {actual!r}"
 
 

@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 import tkinter as tk
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -44,10 +42,10 @@ from ..statistics import (
     explain_method,
     import_rawdata_xlsx,
     merge_customers,
-    snapshot_from_records,
 )
 from ..statistics.evaluation import combine_config, validate_evaluation_settings
 from ..statistics.study import validate_statistical_options
+from ..workspace_data import MappingSource, build_mapping_dataset, int_field, reorder_dataset
 from .dialogs import ReportDialog, open_path
 from .tasks import TaskRunner
 from .theme import Palette
@@ -71,64 +69,6 @@ ORDERS = {"worksheet": "Worksheet order", "filename": "File name order", "timest
 FILE_ORDERS = ("worksheet", "confirmed")  # a RawData.xlsx has no files of its own to order by
 OPERATOR_ORDERS = {"by_operator": "by operator  (A, A, B, B)", "by_pass": "by pass  (A, B, A, B)"}
 SECTION_NAMES = {"charts": "Charts", "observations": "Observations used (Excel only)"}
-
-
-@dataclass(frozen=True, slots=True)
-class MappingSource:
-    """What Data Mapping offers: its current scan, the components chosen, and a counter that moves when the data change."""
-    grouped: Mapping[str, Sequence[LogRecord]]
-    components: tuple[str, ...]
-    expected_repeats: int | None
-    serial: int
-    description: str
-    scan: int = 0  # moves only with a new scan, not when a choice among duplicates changes the values
-
-    @property
-    def key(self) -> tuple:
-        return (self.serial, self.components, self.expected_repeats)
-
-
-# ----------------------------------------------------------------------------- data (pure, so it can run off the UI thread)
-def reorder_dataset(dataset: Dataset, order: str) -> Dataset:
-    """Apply the order the user chose. Worksheet order is the dataset as it is; the others are claims the user makes."""
-    if order == "worksheet":
-        return dataset
-    rows = list(dataset.observations)
-    note = ""
-    if order == "confirmed":
-        basis = "acquisition"
-    elif order == "filename":
-        rows.sort(key=lambda row: (Path(str(row.source)).name.casefold(), str(row.source)))
-        basis, note = "custom", "rows sorted by file name"
-    else:
-        try:
-            rows.sort(key=lambda row: datetime.fromisoformat(str(row.timestamp).strip().replace("Z", "+00:00")))
-        except (ValueError, TypeError) as exc:
-            raise ValueError("Timestamp order requires a valid ISO 8601 timestamp for every file (assign them under File "
-                             "assignments), with consistent timezone usage.") from exc
-        basis, note = "acquisition", "rows sorted by timestamp"
-    description = f"{dataset.description}; {note}" if note else dataset.description
-    return Dataset.from_observations(rows, order_basis=basis, description=description)
-
-
-def build_mapping_dataset(source: MappingSource, field_mapping: Mapping[str, str],
-                          assignments: Mapping[str, Mapping[str, str]], order: str) -> Dataset:
-    dataset = snapshot_from_records(source.grouped, source.components, field_mapping, assignments=assignments,
-                                    description=source.description)
-    return reorder_dataset(dataset, order)
-
-
-def _int_field(text: str, name: str, minimum: int) -> int | None:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        value = int(text)
-    except ValueError:
-        raise ValueError(f"{name}: enter a whole number, or leave it empty.") from None
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}.")
-    return value
 
 
 class ValidationWorkspace(ttk.Frame):
@@ -799,7 +739,7 @@ class ValidationWorkspace(ttk.Frame):
             if names and self.nest_var.get():
                 raise ValueError("Choose either named operators or Nest as Operator, not both.")
             design = {"operators": names, "operator_order": self.operator_order_var.get(), "nest_as_operator": self.nest_var.get()}
-            options = StatisticalOptions(method="grr", expected_repeats=_int_field(self.repeats_var.get(), "Readings per sample", 2),
+            options = StatisticalOptions(method="grr", expected_repeats=int_field(self.repeats_var.get(), "Readings per sample", 2),
                                          assign_trials=self.assign_var.get())
         else:
             design = {"subgroup_from_sample": self.subgroup_var.get()}

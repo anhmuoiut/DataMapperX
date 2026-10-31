@@ -1,0 +1,2 @@
+-r requirements.txt
+PySide6-Essentials>=6.7,<7  # Qt prototype only (datamapperx/ui_qt); the tkinter app does not import it

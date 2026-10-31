@@ -33,3 +33,6 @@ tmp/pdfs/
 
 # Confidential local statistical reference review
 tmp/reference-review/
+
+# macOS
+.DS_Store
