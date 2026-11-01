@@ -17,6 +17,7 @@ try:
 except ImportError:  # the normal install has no Qt in it
     collect_ignore_glob = ["test_*.py"]
 else:
+    from PySide6.QtCore import QCoreApplication, QEvent
     from PySide6.QtWidgets import QApplication, QMessageBox
 
     from datamapperx.config import DATA_DIR_ENV
@@ -56,4 +57,5 @@ else:
         yield win
         win.close()
         win.deleteLater()
-        app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # processEvents() alone does not delete it: every
+        app.processEvents()  # later theme change would re-style the windows of all earlier tests as well

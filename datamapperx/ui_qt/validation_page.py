@@ -787,7 +787,7 @@ class ValidationWorkspace(QWidget):
         self.preview.table_model.set_headings([titles[c] for c in PREVIEW_COLUMNS])
 
     def _toggle_advanced(self) -> None:
-        opened = not self.advanced.isVisibleTo(self)
+        opened = self.advanced.isHidden()
         self.advanced.setVisible(opened)
         self.advanced_button.setText("Advanced Settings ▾" if opened else "Advanced Settings ▸")
 
@@ -1426,7 +1426,8 @@ class ValidationWorkspace(QWidget):
             return 2
 
     def selected_result(self):
-        row = self.table.selected_index()
+        index = self.table.currentIndex()  # already moved when the row signal arrives; the selection model is not yet
+        row = index.row() if index.isValid() else None
         return self._visible[row] if row is not None and row < len(self._visible) else None
 
     def _select_result(self, *_args) -> None:
@@ -1492,7 +1493,7 @@ class ValidationWorkspace(QWidget):
             parent.setBackground(1, QBrush(QColor(self.palette_tokens.soft)))
             for metric, value in rows:
                 child = QTreeWidgetItem(parent, [metric, value])
-                child.setTextAlignment(1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+                child.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             parent.setExpanded(self._advanced_open if advanced else True)
             if advanced:
                 parent.setData(0, Qt.ItemDataRole.UserRole, "advanced")

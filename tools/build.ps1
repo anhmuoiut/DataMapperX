@@ -21,7 +21,7 @@ $WorkPath = Join-Path $env:TEMP "DataMapperX_pyinstaller_build"
 Push-Location $Root
 try {
     # PyInstaller can otherwise build successfully while omitting an unavailable lazy import.
-    & $Python -c "import openpyxl, sv_ttk, PIL, PyInstaller; import reportlab.pdfgen.canvas, reportlab.platypus, reportlab.graphics.shapes"
+    & $Python -c "import openpyxl, PySide6.QtWidgets, PIL, PyInstaller; import reportlab.pdfgen.canvas, reportlab.platypus, reportlab.graphics.shapes"
     if ($LASTEXITCODE -ne 0) {
         throw "Build dependencies are missing. Run: $Python -m pip install -r requirements-dev.txt"
     }

@@ -791,11 +791,12 @@ def test_the_duplicate_dialog_applies_the_chosen_occurrence_and_keeps_defaults_o
 def test_a_data_change_reaches_the_validation_page_when_it_is_open(app, window, tmp_path):
     ready_to_review(app, window, tmp_path / "logs")
     window._show_workspace("validation")
-    source = window.validation._source
+    source = window.validation.mapping_source
     assert source is not None and source.components == tuple(window.selected_components)
     window._show_workspace("mapping")
     window.clear_selected()
-    assert window.validation._source is None
+    window._show_workspace("validation")  # picked up when it is shown again
+    assert window.validation.mapping_source is None
 
 
 # ----------------------------------------------------------------------------- dialogs

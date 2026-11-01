@@ -102,6 +102,9 @@ class TaskRunner(QObject):
         self._pool = QThreadPool(self)
         self._pause_gc = pause_gc
         self._closed = False
+        callbacks = self._callbacks
+        # A runner that goes away with tasks still on the books (its window was closed) gives back what they took.
+        self.destroyed.connect(lambda *_: [_Busy.leave() for _ in range(len(callbacks))])
 
     def run(self, work: Callable[[Callable[..., None]], Any], *, on_success: Callable[[Any], None],
             on_error: Callable[[BaseException], None], on_progress: Callable[..., None] | None = None) -> None:

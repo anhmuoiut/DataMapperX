@@ -220,6 +220,8 @@ class MainWindow(QMainWindow):
         self.settings.geometry = self.geometry_text()
         save_settings(self.settings)
         self.tasks.close()  # no worker may deliver into a window that is going away
+        if self.validation is not None:
+            self.validation.tasks.close()
         super().closeEvent(event)
 
     def exit_app(self) -> None:
@@ -615,10 +617,10 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_validation(self) -> QWidget:
-        from .analysis_page import AnalysisPage  # pulls in the statistics and the report modules
+        from .validation_page import ValidationWorkspace  # pulls in the statistics and the report modules
 
-        self.validation = AnalysisPage(self.palette_tokens, self.tasks)
-        self.validation.message.connect(self.set_status)
+        self.validation = ValidationWorkspace(self.palette_tokens, settings=self.settings, source=self._mapping_source,
+                                              save_settings=lambda: save_settings(self.settings), parent=self.content)
         return self.validation
 
     # ================================================================== steps and workspaces
@@ -671,7 +673,7 @@ class MainWindow(QMainWindow):
 
     def _notify_validation(self) -> None:
         if self.validation is not None:
-            self.validation.set_source(self._mapping_source())
+            self.validation.source_changed()
 
     def _show_workspace(self, name: str) -> None:
         if name == self.workspace:
@@ -683,7 +685,7 @@ class MainWindow(QMainWindow):
             self.step_bar.hide()
             self.content.setCurrentWidget(page)
             self.workspace = "validation"
-            self.validation.set_source(self._mapping_source())
+            self.validation.on_show()
             self.set_status("Validation & Reports works on a copy of the data. Data Mapping and the Excel export are not affected.")
         else:
             self.step_bar.show()

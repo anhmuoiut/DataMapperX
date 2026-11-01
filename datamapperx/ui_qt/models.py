@@ -88,6 +88,19 @@ class TableModel(QAbstractTableModel):
         self._aligns = tuple(ALIGN[a] for a in (aligns or ["w"] * len(self._headings)))
         self.endResetModel()
 
+    def set_rows(self, rows: Sequence[Sequence[object]], tags: Sequence[str] | None = None) -> None:
+        """New rows under the headings and alignments the table already has."""
+        self.beginResetModel()
+        self._rows = [tuple("" if value is None else str(value) for value in row) for row in rows]
+        self._tags = list(tags) if tags is not None else []
+        self._cell_tags = {}
+        self.endResetModel()
+
+    def set_headings(self, headings: Sequence[str]) -> None:
+        self._headings = tuple(headings)
+        if self._headings:
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, len(self._headings) - 1)
+
     def set_palette(self, palette: Palette) -> None:
         self._tints, self._inks = tints(palette), inks(palette)
         if self._rows:

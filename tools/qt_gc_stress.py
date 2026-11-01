@@ -67,7 +67,7 @@ def main(argv: list[str]) -> int:
     def collect() -> None:
         while not stop.is_set():
             gc.collect()
-            time.sleep(0.0003)
+            time.sleep(0.03)
 
     collector = threading.Thread(target=collect, daemon=True)
     collector.start()
@@ -89,9 +89,9 @@ def main(argv: list[str]) -> int:
             window._show_step(step)
             pump(seconds=0.02)
         window._show_workspace("validation")
-        run = getattr(window.validation, "run_analysis", None) or window.validation.run
-        run()
-        pump(lambda: bool(window.validation.results))
+        pump(lambda w=window.validation: w.dataset is not None and not w.busy)
+        window.validation.run_analysis()
+        pump(lambda w=window.validation: not w.running and w.result_set is not None)
         window._show_workspace("mapping")
         window._toggle_theme()
         short_lived_widgets(window, pump, sample)
