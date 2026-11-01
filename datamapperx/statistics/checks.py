@@ -12,6 +12,7 @@ not yet compared with Minitab output (see docs/statistical-validation.md).
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -21,7 +22,9 @@ from .grr import R_CONSTANTS
 from .models import MR_D2, Observation
 
 OK, INFO, CAUTION = "ok", "info", "caution"
+CRITICAL = "critical"  # Attribute Agreement only: the study cannot be analysed
 
+AMOUNT = "Amount of data"  # the topic of the capability check on the number of observations
 PARTS_MINIMUM, PARTS_GOOD = 10, 35
 OBSERVATIONS_MINIMUM = 100
 NORMALITY_ALPHA = 0.05
@@ -32,11 +35,29 @@ RUN_LENGTH = 9  # test 2: this many points in a row on one side of the centre li
 class Check:
     topic: str
     status: str  # ok, info or caution
-    message: str
+    message: str  # the full statement; the detail behind ``brief``
+    brief: str = ""  # one short line with the figures that matter (p-value, threshold, reading numbers); empty: use the message
+
+    @property
+    def short(self) -> str:
+        return self.brief or self.message
 
 
 def needs_attention(checks: Sequence[Check]) -> bool:
     return any(check.status == CAUTION for check in checks)
+
+
+STATUS_LABELS = {OK: "OK", INFO: "Review", CAUTION: "Issue"}
+
+
+def status_label(check: Check, guideline: bool = False) -> str:
+    """The status a table shows: OK, Review or Issue. A guideline is a reference, never a finding: it is OK or Review."""
+    return ("OK" if check.status == OK else "Review") if guideline else STATUS_LABELS[check.status]
+
+
+def findings(checks: Sequence[Check]) -> tuple[list[Check], list[Check]]:
+    """(issues, limitations): what the checks found, and what they could not assess. A check that passed is in neither."""
+    return [c for c in checks if c.status == CAUTION], [c for c in checks if c.status == INFO]
 
 
 # ----------------------------------------------------------------------------- the layout of a measurement study
@@ -122,28 +143,33 @@ def grr_amount_checks(parts: int, operators: int) -> list[Check]:
     if parts < PARTS_MINIMUM:
         checks = [Check("Parts", CAUTION, f"Only {parts} parts; at least {PARTS_MINIMUM} is the usual minimum. With few parts the "
                         "part-to-part variation, and so every percentage of the study variation, is imprecise, and it is "
-                        "misleading if the parts do not cover the normal range of the process.")]
+                        "misleading if the parts do not cover the normal range of the process.",
+                        f"{parts} parts ({PARTS_MINIMUM} or more recommended).")]
     elif parts <= 15:
         checks = [Check("Parts", INFO, f"{parts} parts meets the usual minimum of {PARTS_MINIMUM}, but the part-to-part "
                         "estimate is still imprecise: Minitab's simulations suggest about 35 parts for a margin of 20 % "
-                        "(at 90 % confidence). Use parts that cover the normal range of the process.")]
+                        "(at 90 % confidence). Use parts that cover the normal range of the process.",
+                        f"{parts} parts ({PARTS_GOOD} give a more precise estimate).")]
     elif parts < PARTS_GOOD:
         checks = [Check("Parts", OK, f"{parts} parts is well above the usual minimum of {PARTS_MINIMUM}. If they cover the "
-                        "normal range of the process, the part-to-part estimate is much better than with 10.")]
+                        "normal range of the process, the part-to-part estimate is much better than with 10.", f"{parts} parts.")]
     else:
         checks = [Check("Parts", OK, f"{parts} parts is enough for a precise part-to-part estimate, if they cover the normal "
-                        "range of the process.")]
+                        "range of the process.", f"{parts} parts.")]
     if not operators:
         return checks  # one tester: nothing to say about operators
     if operators <= 2 or parts < PARTS_MINIMUM:
         checks.append(Check("Operators", CAUTION, f"{operators} operators and {parts} parts: read the measurement variation "
-                            "as a general tendency, not a precise figure (the usual minimum is 10 parts and 3 operators)."))
+                            "as a general tendency, not a precise figure (the usual minimum is 10 parts and 3 operators).",
+                            f"{operators} operators, {parts} parts (3 operators and 10 parts recommended)."))
     elif operators <= 5:
         checks.append(Check("Operators", INFO, f"{operators} operators and {parts} parts: usually adequate for repeatability, "
                             "but the reproducibility estimate is less precise. If reproducibility is large, look at the "
-                            "differences between operators and ask whether other operators would differ the same way."))
+                            "differences between operators and ask whether other operators would differ the same way.",
+                            f"{operators} operators (reproducibility is less precise than with 6 or more)."))
     else:
-        checks.append(Check("Operators", OK, f"{operators} operators: the extra operators improve the reproducibility estimate."))
+        checks.append(Check("Operators", OK, f"{operators} operators: the extra operators improve the reproducibility estimate.",
+                            f"{operators} operators."))
     return checks
 
 
@@ -164,25 +190,39 @@ def grr_guidelines(metrics: Mapping[str, float | int | None]) -> list[Check]:
         if value is not None:
             band = _band(value, 10, 30)
             limit = {"below": "below 10 %", "between": "between 10 % and 30 %", "above": "above 30 %"}[band]
-            lines.append(Check(name, INFO, f"{value:.2f} % is {limit}: {wording[band]}."))
+            lines.append(Check(name, OK if band == "below" else INFO, f"{value:.2f} % is {limit}: {wording[band]}.",
+                               f"{value:.2f} % ({limit})."))
     variance, total = metrics.get("variance_grr"), metrics.get("variance_total")
     if variance is not None and total:
         contribution = 100 * variance / total
         band = _band(contribution, 1, 9)
         limit = {"below": "below 1 %", "between": "between 1 % and 9 %", "above": "above 9 %"}[band]
-        lines.append(Check("%Contribution", INFO, f"{contribution:.2f} % is {limit}: {wording[band]}."))
+        lines.append(Check("%Contribution", OK if band == "below" else INFO, f"{contribution:.2f} % is {limit}: {wording[band]}.",
+                           f"{contribution:.2f} % ({limit})."))
     ndc = metrics.get("ndc")
     if ndc is not None:
+        brief = f"{ndc} (5 or more recommended)."
         if ndc >= 5:
-            lines.append(Check("Distinct categories", INFO, f"{ndc} meets the guideline of at least 5."))
+            lines.append(Check("Distinct categories", OK, f"{ndc} meets the guideline of at least 5.", brief))
         elif ndc < 2:
             lines.append(Check("Distinct categories", INFO, f"{ndc} is below the guideline of at least 5, and below 2: "
                                "the measurement system cannot tell the parts apart, so it is of no use for controlling "
-                               "the process."))
+                               "the process.", f"{ndc} (cannot tell the parts apart; 5 or more recommended)."))
         else:
             lines.append(Check("Distinct categories", INFO, f"{ndc} is below the guideline of at least 5: the measurement "
-                               "system may not have enough resolution to tell the parts apart."))
+                               "system may not have enough resolution to tell the parts apart.", brief))
     return lines
+
+
+def grr_data_checks(result) -> list[Check]:
+    """What the analysis found wrong with the readings themselves: only what it reported, in its own words."""
+    found = []
+    for issue in result.issues:
+        if match := re.search(r"Negative (.+?) variance estimate truncated", issue.message):
+            found.append(Check("Variance estimate", CAUTION, issue.message, f"Negative {match.group(1)} variance estimate set to 0."))
+        elif issue.message.startswith("Cannot estimate NDC"):
+            found.append(Check("Repeatability", INFO, issue.message, "Repeatability is zero: NDC cannot be estimated."))
+    return found
 
 
 # ----------------------------------------------------------------------------- capability: stability
@@ -227,25 +267,35 @@ def i_mr_signals(values: Sequence[float]) -> Signals | None:
 def stability_check(values: Sequence[float], *, order_known: bool, order_note: str) -> Check:
     signals = i_mr_signals(values)
     if signals is None:
-        return Check("Stability", INFO, "Not assessed: the readings do not vary, or there are fewer than 2.")
+        return Check("Stability", INFO, "Not assessed: the readings do not vary, or there are fewer than 2.",
+                     "Not assessed (no variation, or fewer than 2 readings).")
     caveat = ("" if order_known else " The readings are not in a known order of measurement, so this says little about "
                                       "stability over time.")
+    unverified = "Worksheet order, not verified as time order"
     if not signals.any:
         status = OK if order_known else INFO
         return Check("Stability", status, "No out-of-control signal on the I chart (tests 1 and 2) or the MR chart "
-                     f"(test 1).{caveat}{order_note}")
-    parts = []
+                     f"(test 1).{caveat}{order_note}", "" if order_known else f"{unverified}; stability over time not assessed.")
+    parts, brief = [], []
     if signals.i_beyond:
         parts.append(f"{len(signals.i_beyond)} reading(s) more than 3 sigma from the centre line (first: reading "
                      f"{signals.i_beyond[0] + 1})")
+        n = len(signals.i_beyond)
+        brief.append(f"{n} point{'s' if n != 1 else ''} beyond 3σ ({'first: ' if n != 1 else ''}reading {signals.i_beyond[0] + 1})")
     if signals.i_run:
         parts.append(f"a run of {RUN_LENGTH} or more readings on one side of the centre line (from reading "
                      f"{signals.i_run[0] + 1})")
+        brief.append(f"run of {RUN_LENGTH} or more (from reading {signals.i_run[0] + 1})")
     if signals.mr_beyond:
         parts.append(f"{len(signals.mr_beyond)} unusually large change(s) between consecutive readings (first: reading "
                      f"{signals.mr_beyond[0] + 1})")
-    return Check("Stability", CAUTION, "Possible instability: " + "; ".join(parts) + ". Capability assumes a stable process; "
-                 f"look for the cause before relying on the indices.{caveat}{order_note}")
+        n = len(signals.mr_beyond)
+        brief.append(f"{n} large jump{'s' if n != 1 else ''} between readings ({'first: ' if n != 1 else ''}reading {signals.mr_beyond[0] + 1})")
+    # These are tests on the sequence of the readings: without a known order they are not evidence of instability over time.
+    status = CAUTION if order_known else INFO
+    return Check("Stability", status, "Possible instability: " + "; ".join(parts) + ". Capability assumes a stable process; "
+                 f"look for the cause before relying on the indices.{caveat}{order_note}",
+                 "; ".join(brief) + "." if order_known else f"{unverified}: " + "; ".join(brief) + ".")
 
 
 # ----------------------------------------------------------------------------- capability: normality
@@ -293,44 +343,96 @@ def anderson_darling_normal(values: Sequence[float]) -> tuple[float, float] | No
 
 def normality_check(values: Sequence[float]) -> Check:
     if len(values) < 8:
-        return Check("Normality", INFO, f"Not tested: {len(values)} readings are too few for a normality test.")
+        return Check("Normality", INFO, f"Not tested: {len(values)} readings are too few for a normality test.",
+                     f"Not tested (N = {len(values)}; at least 8 needed).")
     outcome = anderson_darling_normal(values)
     if outcome is None:
-        return Check("Normality", INFO, "Not tested: the readings do not vary.")
+        return Check("Normality", INFO, "Not tested: the readings do not vary.", "Not tested (no variation).")
     p = outcome[1]
     shown = "< 0.001" if p < 0.001 else f"= {p:.3f}"
     if p >= NORMALITY_ALPHA:
         return Check("Normality", OK, f"Anderson-Darling p {shown} (at least {NORMALITY_ALPHA}): no evidence against a normal "
-                     "distribution.")
+                     "distribution.", f"Passed (Anderson–Darling p {shown}).")
     return Check("Normality", CAUTION, f"Anderson-Darling p {shown} (below {NORMALITY_ALPHA}): the readings may not follow a "
-                 "normal distribution, so Cp, Cpk, Pp and Ppk, which assume one, may be inaccurate. Look at the histogram.")
+                 "normal distribution, so Cp, Cpk, Pp and Ppk, which assume one, may be inaccurate. Look at the histogram.",
+                 f"Failed (Anderson–Darling p {shown}{'' if p < 0.001 else f', below {NORMALITY_ALPHA}'}).")
 
 
 def capability_checks(values: Sequence[float], *, individuals: bool, order_known: bool, order_note: str = "") -> list[Check]:
     n = len(values)
     if n >= OBSERVATIONS_MINIMUM:
-        amount = Check("Amount of data", OK, f"{n} observations.")
+        amount = Check(AMOUNT, OK, f"{n} observations.", f"N = {n}.")
     else:
-        amount = Check("Amount of data", CAUTION, f"Only {n} observations; at least {OBSERVATIONS_MINIMUM} are recommended for "
+        amount = Check(AMOUNT, CAUTION, f"Only {n} observations; at least {OBSERVATIONS_MINIMUM} are recommended for "
                        "precise capability estimates (with 100, the estimated benchmark Z is within 15 % of the true value "
-                       "with 90 % confidence when Z is above 3).")
+                       "with 90 % confidence when Z is above 3).", f"Limited (N = {n}; {OBSERVATIONS_MINIMUM} or more recommended).")
     if individuals:
         stability = stability_check(values, order_known=order_known, order_note=order_note)
     else:
         stability = Check("Stability", INFO, "Not assessed: this analysis uses subgroups, and stability is checked here on "
-                          "individual readings only. Look at an Xbar and S chart.")
+                          "individual readings only. Look at an Xbar and S chart.",
+                          "Not assessed for subgroup data (use an Xbar-S chart).")
     return [stability, normality_check(values), amount]
+
+
+# ----------------------------------------------------------------------------- Attribute Agreement
+ATTRIBUTE_LABELS = {CRITICAL: "Critical", CAUTION: "Review", INFO: "Info", OK: "OK"}
+ATTRIBUTE_ORDER = {CRITICAL: 0, CAUTION: 1, INFO: 2, OK: 3}
+# What the engine's errors are about, by what their message says (the first match wins)
+ATTRIBUTE_TOPICS = (("Every appraiser must rate", "Study layout"), ("Standard", "Standard"), ("trial", "Trial"), ("Sample ID", "Sample ID"),
+                    ("rating", "Rating"), ("operator identifier", "Appraiser"), ("Duplicate source", "Source"))
+
+
+def attribute_status_label(check: Check) -> str:
+    """Critical (the study cannot be analysed), Review (a calculation is limited) or Info (an optional design choice)."""
+    return ATTRIBUTE_LABELS[check.status]
+
+
+def attribute_checks(result) -> list[Check]:
+    """What is worth knowing about one Attribute Agreement item, most serious first. Each finding is stated once, where it
+    belongs: an error of the data is Critical (the message is the engine's own), a statistic that cannot be calculated is
+    Review, and a study without a Standard is Info. Nothing is said of a study that has nothing to report."""
+    found = []
+    for issue in result.issues:
+        if issue.severity == "error":
+            topic = next((name for word, name in ATTRIBUTE_TOPICS if word in issue.message), "Data")
+            found.append(Check(topic, CRITICAL, issue.message))
+        elif "letter case" in issue.message:
+            found.append(Check("Responses", CAUTION, issue.message))
+    if not result.valid:
+        return sorted(found, key=lambda check: ATTRIBUTE_ORDER[check.status])
+    details = result.details
+    appraisers = details.get("appraisers", ())
+    if len(details.get("levels", ())) < 2:
+        found.append(Check("Categories", CAUTION, "Only one response category: kappa is undefined."))
+    else:
+        tables = {"Within Appraisers": [a["kappa_within"] for a in appraisers], "vs Standard": [a["kappa_standard"] for a in appraisers],
+                  "Between Appraisers": [details.get("kappa_between")], "All Appraisers vs Standard": [details.get("kappa_all_standard")]}
+        undefined = [name for name, group in tables.items() if any(table and table["reason"] for table in group)]
+        if undefined:
+            found.append(Check("Kappa", CAUTION, "Undefined for " + ", ".join(undefined) + ": a response has no variation to measure."))
+    if appraisers and appraisers[0]["within"] is None:
+        found.append(Check("Trials", CAUTION, "One rating per sample: Within Appraisers is not computed (it needs at least two trials)."))
+    if details.get("standard_problem"):  # a Standard was given but cannot be used: Within Appraisers stands, vs Standard does not
+        found.append(Check("Standard", CRITICAL, f"Appraiser vs Standard is not computed. {details['standard_problem']}"))
+    elif not details.get("standard_known"):
+        found.append(Check("Standard", INFO, "Not provided: Appraiser vs Standard is not computed."))
+    return sorted(found, key=lambda check: ATTRIBUTE_ORDER[check.status])
 
 
 # ----------------------------------------------------------------------------- one result
 def result_checks(result, *, order_known: bool, order_note: str = "") -> tuple[list[Check], list[Check]]:
-    """The data checks and the guidelines for one analysis result."""
+    """(data checks, guidelines) for one analysis result. The data checks are what the readings show; the guidelines are
+    published figures to compare with (how much data, the AIAG bands), which help a judgement and are never a verdict."""
+    if result.method == "attribute":
+        return attribute_checks(result), []
     if not result.valid:
-        return [Check("Data", INFO, "This item could not be analysed; see Data messages.")], []
+        return [Check("Data", INFO, "This item could not be analysed; the Details tab says why.")], []
     if result.method == "grr":
         crossed = result.details.get("crossed")
         operators = len(result.details.get("operators") or ()) if crossed else 0
-        return grr_amount_checks(result.parts, operators), grr_guidelines(result.metrics)
+        return grr_data_checks(result), [*grr_amount_checks(result.parts, operators), *grr_guidelines(result.metrics)]
     values = [number for number in (to_number(row.value) for row in result.observations) if number is not None]
     individuals = result.details.get("within_method") == "individuals"
-    return capability_checks(values, individuals=individuals, order_known=order_known, order_note=order_note), []
+    checks = capability_checks(values, individuals=individuals, order_known=order_known, order_note=order_note)
+    return [c for c in checks if c.topic != AMOUNT], [c for c in checks if c.topic == AMOUNT]

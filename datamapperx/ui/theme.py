@@ -149,6 +149,7 @@ def configure_styles(root: tk.Tk, p: Palette) -> None:
     style.configure("Pick.TLabel", background=p.pick, foreground=p.fg, padding=(10, 6))
 
     style.configure("Treeview", rowheight=28, background=p.surface, fieldbackground=p.surface, foreground=p.fg)
+    style.configure("Compact.Treeview", rowheight=24)  # the Details and Checks tables of the results
     style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(10, 8))
     style.map("Treeview", background=[("selected", p.accent)], foreground=[("selected", p.on_accent)])
 

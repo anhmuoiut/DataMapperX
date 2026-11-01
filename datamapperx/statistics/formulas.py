@@ -9,7 +9,50 @@ from .models import MR_D2, NDC_FACTOR, AnalysisConfig, AnalysisResult
 METRIC_LABELS = {"percent_tolerance": "%SV/Tol", "percent_study_var": "%Study Var", "ndc": "NDC", "cpk": "Cpk"}
 
 
+def _attribute_sections(config: AnalysisConfig) -> tuple[tuple[str, str], ...]:
+    percent = f"{config.confidence * 100:g} %"
+    minimum = config.agreement_min
+    return (
+        ("Purpose", "Measure how well categorical ratings (such as PASS and FAIL) agree with themselves when the same appraiser rates a sample again, "
+                    "and with the known correct rating (the Standard) of each sample. Agreement is counted per sample."),
+        ("Required input", "Test Item, Sample ID, the Rating of each assessment, and the Trial of repeated ratings. The Standard of each sample is optional, "
+                           "but it is needed for Appraiser vs Standard. Every appraiser rates every sample the same number of times; Within Appraisers needs at "
+                           "least two trials."),
+        ("Formulas used", "Percent = 100*m/N, where N is the number of samples inspected and m the number matched. Within Appraisers: m counts the samples "
+                          "whose trials all agree. Appraiser vs Standard: m counts the samples whose trials all equal the Standard. Between Appraisers and "
+                          "All Appraisers vs Standard: the same over the trials of all appraisers.\n"
+                          f"Confidence interval ({percent}, alpha = {1 - config.confidence:g}): exact (Clopper-Pearson). Lower = Beta(alpha/2; m, N-m+1) and "
+                          "upper = Beta(1-alpha/2; m+1, N-m) quantiles. When m = N the lower limit is alpha^(1/N) and the upper is 1; when m = 0 the lower "
+                          "limit is 0 and the upper is 1-alpha^(1/N).\n"
+                          "Fleiss' kappa: n samples, m ratings of each sample, x_ij the ratings of sample i in category j, p_j = sum_i x_ij/(n*m). "
+                          "Kj = 1 - sum_i x_ij*(m-x_ij)/(n*m*(m-1)*p_j*(1-p_j)); overall K = (Po-Pe)/(1-Pe) with Po = sum_ij x_ij*(x_ij-1)/(n*m*(m-1)) "
+                          "and Pe = sum_j p_j^2. Under H0 (K = 0), Var(Kj) = 2/(n*m*(m-1)); Z = K/sqrt(Var); P = P(Z' > Z), one-sided.\n"
+                          "Known Standard: for each trial, kappa is computed with the Standard as a second trial (m = 2) and the kappas are averaged; the "
+                          "variance of the average is the sum of the variances divided by (number of trials)^2. All Appraisers vs Standard: the mean of the appraisers' "
+                          "kappas against the Standard, with the sum of their variances divided by (number of appraisers)^2.\n"
+                          "Assessment Disagreement (a known Standard and exactly two responses): each sample of an appraiser is counted once. #X/Y: every trial rated X while the Standard is Y; "
+                          "#Mixed: the trials of the sample differ. Percent: #X/Y over the samples whose Standard is Y, #Mixed over all samples; N/A when no sample has that Standard. "
+                          "The single ratings that differ from the Standard over all ratings (100*c/N) are kept in the result details."),
+        ("Variables", "n: samples; m: ratings of one sample; N: samples inspected; x_ij: ratings of sample i in category j; p_j: share of all ratings in category j; "
+                      "Po, Pe: observed and expected agreement; K: kappa; Z: standard normal statistic; alpha: 1 - confidence level."),
+        ("Calculation steps", "1. Check Sample ID, ratings, trials, a consistent Standard and equal numbers of ratings. 2. Count the samples matched. 3. Compute the "
+                              "exact interval of each percent. 4. Compute kappa, its standard error, Z and P for each response and overall. 5. Classify each sample "
+                              "for Assessment Disagreement. 6. Apply the minimum agreement, if one is set. Round only for display."),
+        ("Acceptance", (f"Within Appraisers and Appraiser vs Standard are each compared with the minimum percent agreement ({minimum:g} %): PASS at or above it, "
+                        "FAIL below it. " if minimum is not None else "No acceptance is applied (a minimum percent agreement can be set). ")
+                       + "A measure that cannot be judged, such as vs Standard without a Standard, is N/A, never PASS. Any acceptance rule is the user's, not a statistical conclusion."),
+        ("Worked example", "30 samples all matched: Percent = 100*30/30 = 100; the lower limit is 0.05^(1/30) = 0.9050, so the 95 % interval is (90.50, 100.00). "
+                           "With 30 samples rated 3 times, perfect agreement and both categories present, each Kj = 1 and SE = sqrt(2/(30*3*2)) = 0.105409, Z = 9.48683."),
+        ("Assumptions and limitations", "Nominal categories; the ratings of one appraiser on one sample are independent trials. Ordered categories "
+                                        "(Kendall's coefficients) and Cohen's kappa are not calculated. Assessment Disagreement follows Minitab's definitions and one published "
+                                        "example; it has not yet been compared with a full Minitab run. Kappa is N/A when the ratings and the "
+                                        "Standard hold a single category. Results are statistical estimates subject to the quality of the ratings."),
+    )
+
+
 def _formula_sections(config: AnalysisConfig) -> tuple[tuple[str, str], ...]:
+    if config.method == "attribute":
+        return _attribute_sections(config)
     if config.method == "capability":
         within = (f"Individuals in supplied collection order: MR_i = |x_i - x_(i-1)|; "
                   f"MRbar = sum(MR_i)/(N-1); sigma_within = MRbar/{MR_D2}. Moving range length = 2."

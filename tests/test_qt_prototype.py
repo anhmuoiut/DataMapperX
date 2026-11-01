@@ -6,6 +6,7 @@ application's own modules produce.
 """
 from __future__ import annotations
 
+import gc
 import os
 import threading
 import time
@@ -40,6 +41,23 @@ from .conftest import ict_block, write_ict_log
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _destroy_widgets_on_the_gui_thread():
+    """Qt must destroy a widget on the thread that owns it. The widgets these tests create have no parent, so Python owns them,
+    and the references between a widget, its model, its delegate and its signal connections form cycles that only the cyclic
+    collector can free. The collector runs on whichever thread allocates when it is due; during a scan that is often a pool
+    worker, which then destroys a widget off the GUI thread, leaves its timers registered, and the next ``processEvents``
+    segfaults in ``QTimerInfoList::activateTimers``. So no collection may run during a test, and what the test left behind is
+    collected here, on the GUI thread, once it is over (see docs/qt-widget-ownership.md)."""
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+        gc.collect()
 
 
 def pump(app, condition, timeout=15.0):

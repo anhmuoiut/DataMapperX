@@ -35,6 +35,25 @@ from .conftest import ict_block, write_ict_log
 
 # ----------------------------------------------------------------------------- exact encoding
 
+# Fields added after the baseline was recorded, with the value each must have wherever the baseline is compared. The baseline
+# does not contain them, so they are left out of its encoding; one that is not at its default fails loudly instead of being
+# silently dropped, so nothing can hide behind the omission. The fixtures themselves are never regenerated.
+ADDED_FIELDS = {
+    "Observation": {"standard": ""},
+    "AnalysisConfig": {"confidence": 0.95, "agreement_min": None},
+    "StatisticalOptions": {"confidence": 0.95},
+    "EvaluationSettings": {"agreement_min": None},
+}
+
+
+def baseline_fields(value) -> list[dataclasses.Field]:
+    """The fields of a dataclass instance as the baseline knows them."""
+    added = ADDED_FIELDS.get(type(value).__name__, {})
+    for name, default in added.items():
+        if getattr(value, name) != default:
+            raise AssertionError(f"{type(value).__name__}.{name} is {getattr(value, name)!r}, not its default, in a baseline comparison")
+    return [f for f in dataclasses.fields(value) if f.name not in added]
+
 
 def encode(value):
     """JSON-able, lossless encoding of the values the statistics code returns."""
@@ -56,7 +75,7 @@ def encode(value):
         return {"__dict__": [[encode(key), encode(item)] for key, item in value.items()]}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {"__dataclass__": type(value).__name__,
-                "fields": [[f.name, encode(getattr(value, f.name))] for f in dataclasses.fields(value)]}
+                "fields": [[f.name, encode(getattr(value, f.name))] for f in baseline_fields(value)]}
     raise TypeError(f"cannot encode {type(value).__name__}")
 
 
@@ -133,7 +152,7 @@ def first_difference(expected, actual, path="$", *, rel_tol: float = 0.0, abs_to
 
 
 def observation_to_dict(observation: Observation) -> dict:
-    return {f.name: getattr(observation, f.name) for f in dataclasses.fields(Observation)}
+    return {f.name: getattr(observation, f.name) for f in baseline_fields(observation)}
 
 
 def observation_from_dict(data: dict) -> Observation:
@@ -141,10 +160,21 @@ def observation_from_dict(data: dict) -> Observation:
 
 
 def config_to_dict(config: AnalysisConfig) -> dict:
-    data = {f.name: getattr(config, f.name) for f in dataclasses.fields(AnalysisConfig)}
+    data = {f.name: getattr(config, f.name) for f in baseline_fields(config)}
     if config.criteria is not None:
         data["criteria"] = [{f.name: getattr(c, f.name) for f in dataclasses.fields(Criterion)} for c in config.criteria]
     return data
+
+
+# The fixture recorded method="attribute" as an unsupported method. Attribute Agreement Analysis is a supported method now, so
+# that one case is replayed with a method that does not exist, and its message is the one the code gives today. The fixture
+# itself is left as it was recorded.
+SUPERSEDED_ERRORS = {"unknown_method": (AnalysisConfig(method="unknown"), "Select capability, grr or attribute.")}
+
+
+def config_error_case(case: dict) -> tuple[AnalysisConfig, str]:
+    """The configuration of a recorded config-error case, and the message it must give."""
+    return SUPERSEDED_ERRORS.get(case["name"]) or (config_from_dict(case["config"]), case["message"])
 
 
 def config_from_dict(data: dict) -> AnalysisConfig:

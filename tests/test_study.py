@@ -42,7 +42,7 @@ from datamapperx.statistics.evaluation import (
 from datamapperx.statistics.models import DISPLAY_FIELDS, EVALUATION_FIELDS, STATISTICAL_FIELDS, statistical_config
 from datamapperx.statistics.study import method_verification, validate_statistical_options
 
-from .baseline_support import config_from_dict, encode, result_signature
+from .baseline_support import config_error_case, config_from_dict, encode, result_signature
 
 BASELINE = json.loads((Path(__file__).parent / "fixtures" / "baseline" / "analyze_baseline.json").read_text(encoding="utf-8"))
 
@@ -134,15 +134,15 @@ def test_the_new_validators_give_the_messages_validate_config_gives():
                    "alpha_zero", "alpha_one", "alpha_nan"}
     display = {"precision_11", "precision_bool"}
     for case in BASELINE["config_errors"]:
-        config = config_from_dict(case["config"])
+        config, message = config_error_case(case)
         with pytest.raises(ValueError) as expected:
             validate_config(config)
-        assert str(expected.value) == case["message"]
+        assert str(expected.value) == message
         name = case["name"]
         if name in statistical:
             with pytest.raises(ValueError) as caught:
                 validate_statistical_options(config)
-            assert str(caught.value) == case["message"]
+            assert str(caught.value) == message
             validate_evaluation_settings(evaluation_settings(config))
         elif name in display:
             validate_statistical_options(config)
@@ -151,7 +151,7 @@ def test_the_new_validators_give_the_messages_validate_config_gives():
             validate_statistical_options(config)
             with pytest.raises(ValueError) as caught:
                 validate_evaluation_settings(evaluation_settings(config))
-            assert str(caught.value) == case["message"]
+            assert str(caught.value) == message
 
 
 # ----------------------------------------------------------------------------- stale detection

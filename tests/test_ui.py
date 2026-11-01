@@ -2189,6 +2189,23 @@ def open_validation(app):
     return ws
 
 
+def check_rows(ws):
+    """The Checks tab as (section, check, result, status) rows."""
+    tree = ws.checks_tree
+    return [(tree.item(section, "text"), tree.item(row, "text"), *map(str, tree.item(row, "values")))
+            for section in tree.get_children() for row in tree.get_children(section)]
+
+
+def figures_of(ws):
+    return [cells for cells, tags in grr_table_rows(ws) if not tags]
+
+
+def grr_table_rows(ws):
+    """The Gage R&R Details tab as (cells, tags) rows: a title row, a row of column names, then the figures of each table."""
+    tree = ws.grr_tree
+    return [(tuple(str(v) for v in tree.item(row, "values")), tree.item(row, "tags")) for row in tree.get_children()]
+
+
 def run_validation(app, ws):
     ws.run_button.invoke()
     pump(app, lambda: not ws.running and ws.result_set is not None and not ws.stale)
@@ -2215,7 +2232,7 @@ def test_validation_is_a_workspace_beside_data_mapping_and_leaves_the_raw_export
     run_validation(app, ws)  # Quick Analysis: no trial step, no setup needed
     assert ws.tabs.index(ws.tabs.select()) == ws.tabs.index(ws.results_tab)
     assert len(ws.results) == 3 and all("ndc" in r.metrics for r in ws.results)
-    assert len(ws.table.get_children()) == 3 and "3 items" in ws.summary_var.get()
+    assert len(ws.table.get_children()) == 3 and ws.summary_var.get().startswith("3 items analyzed · Acceptance off")
     assert ws.tabs.tab(ws.report_tab, "state") == "normal" and ws.pdf_button.instate(["!disabled"])
     assert before == {str(r.path): asdict(r) for records in app.scan_result.grouped.values() for r in records}
     app.mapping_switch.invoke()
@@ -2305,13 +2322,14 @@ def test_results_appear_at_once_with_notes_and_without_any_confirmation(app, tmp
     app.update()
     headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
     assert headers == ["Test Item", "N", "Cp", "Cpk", "Pp", "Ppk"]  # no criteria chosen: statistics only, no Result column
-    assert "statistics only" in ws.summary_var.get() and showing(app, ws.filter_combo, False)
+    assert "Acceptance off" in ws.summary_var.get() and showing(app, ws.filter_combo, False)
     assert all(r.metrics.get("cpk") is not None and r.status == "N/A" for r in ws.results)
     assert ws.pdf_button.instate(["!disabled"])  # a report never waits for a verdict or a confirmation
-    assert showing(app, ws.notes_bar) and "Keep in mind" in ws.notes_var.get() and "not confirmed" not in ws.notes_var.get()
+    assert showing(app, ws.notes_bar, False) and ws.notes_var.get() == ""  # no "keep in mind" line above the table
+    assert ws.notes_link.winfo_manager() == "grid"  # what the report says about the readings: one click from the Checks
     shown = []
     monkeypatch.setattr(validation_workspace, "ReportDialog", lambda *args: shown.append(args[-1]))
-    ws.notes_button.invoke()
+    ws.show_notes()
     assert "Process stability" in shown[-1] and "Normal distribution" in shown[-1] and "do not block" in shown[-1]
     ws.judge_var.set(True)  # judging against a limit is optional and changes no number
     app.update()
@@ -2334,7 +2352,7 @@ def test_grr_has_no_pass_or_fail_until_criteria_are_chosen(app, tmp_path):
     assert ws.profile_var.get() == "None (statistics only)"
     run_validation(app, ws)
     assert [ws.table.heading(c)["text"] for c in ws.table["columns"]] == ["Test Item", "%SV/Tol", "%Study Var", "NDC"]
-    assert all(r.status == "N/A" and "ndc" in r.metrics for r in ws.results) and "statistics only" in ws.summary_var.get()
+    assert all(r.status == "N/A" and "ndc" in r.metrics for r in ws.results) and "Acceptance off" in ws.summary_var.get()
     assert ws.plan_title_var.get() == "Variable Gage R&R" and ws.plan_var.get() == "3 Test Items · 3 Samples" and not ws._judge_for("grr")
     ws.profile_var.set("SolarEdge")  # criteria are a layer on top: the figures stay and PASS / FAIL appear
     app.update()
@@ -2365,14 +2383,21 @@ def test_the_details_tab_shows_the_tables_of_the_selected_item(app, tmp_path):
     ready_to_review(app, folder)
     ws = open_validation(app)
     run_validation(app, ws)
-    text = ws.session.text.get("1.0", "end")
-    assert "One-Way ANOVA Table" in text and "Variance Components" in text and "%Contribution" in text and "%Tolerance" in text
-    assert "Gage Evaluation" in text and "Number of Distinct Categories" in text and "Part-To-Part" in text
+    rows = grr_table_rows(ws)  # Gage R&R: three tables, NDC above them
+    assert [cells[0] for cells, tags in rows if "section" in tags] == ["One-Way ANOVA", "Variance Components", "Gage Evaluation"]
+    heads = [cells for cells, tags in rows if "head" in tags]
+    assert heads[0][:5] == ("Source", "DF", "MS", "F", "P") and "SS" not in heads[0]  # the essential columns
+    assert heads[1][:3] == ("Source", "VarComp", "%Contribution") and "%Tolerance" in heads[2] and "Study Var (6 × SD)" not in heads[2]
+    assert any(cells[0] == "Part-To-Part" for cells, _ in rows) and ws.ndc_var.get() == str(ws.results[0].metrics["ndc"])
+    assert ws.grr_frame.winfo_manager() == "grid" and ws.details_frame.winfo_manager() == "" and ws.session.winfo_manager() == ""
     ws.method_var.set("capability")
     run_validation(app, ws)
-    text = ws.session.text.get("1.0", "end")
-    for expected in ("Process Data", "StDev(Within)", "Potential (Within) Capability", "Overall Capability", "Ppk", "PPM < LSL"):
-        assert expected in text
+    groups = [ws.details.item(group, "text") for group in ws.details.get_children()]  # a capability item: a table, not text
+    assert groups == ["Specification", "Variation", "Capability", "Advanced Details"]
+    assert ws.details_frame.winfo_manager() == "grid" and ws.session.winfo_manager() == ""
+    metrics = [ws.details.item(row, "text") for group in ws.details.get_children() for row in ws.details.get_children(group)]
+    for expected in ("LSL", "USL", "Sample N", "Mean", "Within SD", "Overall SD", "Cp", "Cpk", "Pp", "Ppk", "CPL", "PPU", "Observed PPM Total"):
+        assert expected in metrics
 
 
 def test_ppk_can_be_the_decision_index_and_the_table_leaves_out_what_does_not_decide(app, tmp_path):
@@ -2690,8 +2715,9 @@ def test_validation_layout_and_theme_fit_supported_desktop_size(app, tmp_path):
     ws.method_var.set("capability")
     run_validation(app, ws)
     app.update()
-    for widget in (ws.table, ws.about_button, ws.notes_button):
+    for widget in (ws.table, ws.about_button):
         assert inside(app, widget), widget
+    assert not ws.notes_bar.winfo_ismapped()  # nothing is said above the table that the Checks do not say
     headers = [ws.table.heading(c)["text"] for c in ws.table["columns"]]
     assert sum(int(ws.table.column(c, "width")) for c in ws.table["columns"]) <= ws.table.winfo_width() + 4, headers  # no sideways scroll
     ws.tabs.select(ws.report_tab)
@@ -2745,7 +2771,7 @@ def test_every_new_study_starts_as_statistics_only_even_if_an_older_version_save
     pump(app, lambda: ws.dataset is not None and not ws.busy)
     assert ws.profile_var.get() == NO_CRITERIA and not ws.judge_var.get()  # the next study starts again without criteria
     run_validation(app, ws)
-    assert all(r.status == "N/A" for r in ws.results) and "statistics only" in ws.summary_var.get()
+    assert all(r.status == "N/A" for r in ws.results) and "Not evaluated" in ws.summary_var.get()
 
 
 def test_the_within_sigma_method_is_an_advanced_option(app, tmp_path):
@@ -2838,17 +2864,19 @@ def test_the_checks_tab_gives_amount_of_data_and_the_guidelines_for_gage_rr(app,
     folder.mkdir()
     ws = scanned_study(app, folder, parts=8, operators=("T1",), by_folder=False)
     run_validation(app, ws)
-    shown = ws.checks_view.text.get("1.0", "end")
-    assert "!  Parts: Only 8 parts" in shown and "Operators:" not in shown  # fewer than 10 parts
-    assert "Guidelines (AIAG, as Minitab quotes them)" in shown and "%Study Var:" in shown and "%Contribution:" in shown
-    assert "not printed in the report" in shown
-    assert "with data checks to review" in ws.summary_var.get()
+    rows = check_rows(ws)
+    assert rows[0] == ("Data Checks", "All checks", "No data issues detected.", "OK")  # nothing wrong with the readings themselves
+    guidelines = {row[1]: row for row in rows if row[0] == "Guidelines (reference only)"}
+    assert guidelines["Parts"][2:] == ("8 parts (10 or more recommended)", "Review") and "Operators" not in guidelines  # fewer than 10 parts
+    assert {"%Study Var", "%Contribution", "NDC"} <= set(guidelines) and all(row[3] in ("OK", "Review") for row in guidelines.values())
+    assert all(len(row) == 4 and len(row[2]) < 70 for row in rows)  # one short line each, no paragraphs
+    assert ws.summary_var.get().endswith("1 Need Review")
     folder2 = tmp_path / "checks_grr_ok"
     folder2.mkdir()
     ws = scanned_study(app, folder2, parts=12, operators=("T1",), by_folder=False)
     run_validation(app, ws)
-    assert "i  Parts: 12 parts meets the usual minimum" in ws.checks_view.text.get("1.0", "end")
-    assert "with data checks to review" not in ws.summary_var.get()
+    assert ("Guidelines (reference only)", "Parts", "12 parts (35 give a more precise estimate)", "Review") in check_rows(ws)
+    assert "Need Review" not in ws.summary_var.get()  # a guideline about precision is not a data problem
 
 
 def test_file_time_order_sorts_by_when_each_log_was_saved_and_is_taken_as_the_order_of_measurement(app, tmp_path):
@@ -2870,16 +2898,17 @@ def test_file_time_order_sorts_by_when_each_log_was_saved_and_is_taken_as_the_or
     first_files = [ws.preview.item(item, "values")[-1] for item in ws.preview.get_children()][:2]
     assert first_files[0].endswith("P10_Ann_9.log") and first_files[1].endswith("P10_Ann_8.log")  # the last name was saved first
     run_validation(app, ws)
-    shown = ws.checks_view.text.get("1.0", "end")
-    assert "Stability:" in shown and "Normality:" in shown and "Amount of data:" in shown
-    assert "taken as the order of measurement" in shown and ws.hint_var.get() == ""  # an order was chosen: nothing to warn about
+    shown = " ".join(" ".join(row) for row in check_rows(ws))
+    assert "Sample Size Limited (N = 9" in shown and "not verified" not in shown  # an order was chosen: no caveat on the stability
+    assert ws.hint_var.get() == ""  # and nothing to warn about on the Data tab
     ws.method_var.set("grr")
     assert ws.hint_var.get() == ""
     ws.method_var.set("capability")
     ws.order_var.set(ORDERS["worksheet"])
     pump(app, lambda: ws.dataset is not None and not ws.busy and ws.dataset.order_basis == "worksheet")
     run_validation(app, ws)
-    assert "choose File time order" in ws.checks_view.text.get("1.0", "end")
+    assert any(row[1] == "Stability" and row[2].startswith("Worksheet order, not verified as time order") and row[3] == "Review"
+               for row in check_rows(ws))
 
 
 def test_the_notes_of_a_capability_analysis_point_to_the_checks_tab_without_changing_the_noted_text(app, tmp_path, monkeypatch):
@@ -3031,8 +3060,8 @@ def test_results_put_the_table_beside_the_charts_in_a_wide_window_and_above_them
     assert ws.selected_var.get() == item_label(ws.selected_result()) and ws.chart_canvas.winfo_height() > 450
     assert not any(bar.winfo_ismapped() for bar in ws.table_bars)  # nothing to scroll: the room goes to the data
     summary = ws.notes_bar.master.winfo_children()[0]
-    assert str(summary.cget("textvariable")) == str(ws.summary_var) and ws.notes_bar.winfo_ismapped()  # the notes sit beside the summary
-    assert abs(summary.winfo_rooty() - ws.notes_bar.winfo_rooty()) <= 12 and ws.filters.master is ws.table_page  # search and sort: above the table
+    assert str(summary.cget("textvariable")) == str(ws.summary_var) and not ws.notes_bar.winfo_ismapped()  # a notes line only when an item failed
+    assert ws.filters.master is ws.table_page  # search and sort: above the table
     app.geometry("1000x680+0+0")
     ws.tabs.select(ws.data_tab)
     app.update()
@@ -3083,3 +3112,172 @@ def test_the_capability_setup_is_two_checkboxes_the_criteria_on_demand_and_advan
     ws.advanced_button.invoke()
     ws.method_var.set("grr")
     assert ws.plan_title_var.get() == "Variable Gage R&R"
+
+
+def test_gage_rr_details_show_the_essential_columns_and_all_of_them_on_request(app, tmp_path):
+    folder = tmp_path / "grr_details"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.precision_var.set("2")
+    run_validation(app, ws)
+    ws.result_tabs.select(1)
+    app.update()
+
+    def heads():
+        return [cells for cells, tags in grr_table_rows(ws) if "head" in tags]
+
+    assert heads()[0][:5] == ("Source", "DF", "MS", "F", "P") and "Study Var (6 × SD)" not in heads()[2]
+    assert ws.ndc_label.winfo_ismapped() and ws.ndc_var.get() == str(ws.results[0].metrics["ndc"])  # NDC stays above the tables
+    ws.all_columns_var.set(True)
+    ws._show_details(ws.selected_result())
+    assert heads()[0] == ("Source", "DF", "SS", "MS", "F", "P") and "Study Var (6 × SD)" in heads()[2]
+    assert any(cells[0] == "Sample ID" for cells in figures_of(ws))  # complete results stay available
+    ws.precision_var.set("4")  # the decimals setting of the window
+    app.update()
+    assert any(cells[2] == f"{ws.results[0].details['anova'][0]['ss']:.9f}" for cells in figures_of(ws) if cells[0] == "Sample ID")
+
+
+def test_the_table_columns_fit_their_headings_and_figures_with_text_left_and_numbers_right(app, tmp_path):
+    folder = tmp_path / "fit_columns"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.profile_var.set("SolarEdge")  # criteria: the Acceptance Result and Review columns appear as well
+    run_validation(app, ws)
+    app.update()
+    columns = ws.table["columns"]
+    headings = [ws.table.heading(c)["text"] for c in columns]
+    assert headings[:4] == ["Test Item", "%SV/Tol", "%Study Var", "NDC"] and "Acceptance Result" in headings
+    body, head = ws._table_fonts()
+    for column, heading in zip(columns, headings, strict=True):
+        width = int(ws.table.column(column, "width"))
+        assert width >= head.measure(heading) + 20, heading  # the heading is not cut
+        assert all(width >= body.measure(str(ws.table.set(row, column))) + 12 for row in ws.table.get_children()), heading
+        text = heading in ("Test Item", "Acceptance Result", "Review")
+        assert str(ws.table.column(column, "anchor")) == ("w" if text else "e") and str(ws.table.heading(column)["anchor"]) == ("w" if text else "e")
+
+
+def test_capability_details_are_a_table_with_advanced_details_collapsed_that_follows_the_decimals(app, tmp_path):
+    folder = tmp_path / "cap_details"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    ws.precision_var.set("2")
+    run_validation(app, ws)
+    app.update()
+
+    def figures():
+        return {ws.details.item(row, "text"): ws.details.set(row, "value")
+                for group in ws.details.get_children() for row in ws.details.get_children(group)}
+
+    *primary, advanced = ws.details.get_children()
+    assert all(ws.details.item(group, "open") for group in primary) and not ws.details.item(advanced, "open")
+    result = ws.selected_result()
+    assert figures()["Cpk"] == f"{result.metrics['cpk']:.2f}" and figures()["Sample N"] == str(result.n)
+    ws.precision_var.set("4")  # the decimals setting of the window
+    app.update()
+    assert figures()["Cpk"] == f"{ws.selected_result().metrics['cpk']:.4f}"
+    ws.precision_var.set("2")
+    app.update()
+    advanced = ws.details.get_children()[-1]
+    ws.details.item(advanced, open=True)
+    ws._remember_advanced()
+    ws.table.selection_set(ws.table.get_children()[1])  # another item: Advanced Details stays as the user left it
+    app.update()
+    assert ws.details.item(ws.details.get_children()[-1], "open") and ws.selected_result() is ws._visible[1]
+    ws.method_var.set("grr")
+    run_validation(app, ws)
+    assert ws.details_frame.winfo_manager() == "" and ws.grr_frame.winfo_manager() == "grid" and ws.session.winfo_manager() == ""
+
+
+def test_the_capability_checks_list_only_what_was_found_in_short_lines(app, tmp_path):
+    from datamapperx.statistics.checks import Check
+
+    folder = tmp_path / "cap_checks"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    rows = check_rows(ws)
+    stability = next(row for row in rows if row[1] == "Stability")  # a sequence test says nothing about time here
+    assert stability[0] == "Data Checks" and stability[2].startswith("Worksheet order, not verified as time order") and stability[3] == "Review"
+    assert next(row for row in rows if row[1] == "Sample Size")[0] == "Guidelines (reference only)"  # how much data: a guideline
+    assert any(row[1] == "Sample Size" and row[2].startswith("Limited (N = ") and row[3] == "Review" for row in rows)
+    shown = " ".join(" ".join(row) for row in rows)
+    assert "Capability assumes a stable process" not in shown and "No data issues detected." not in shown
+    assert ws.notes_link.winfo_manager() == "grid"  # the report notes: one click away
+    result = ws.selected_result()
+    ws._checks[result.label] = ([Check("Normality", "ok", "passed", "Passed (Anderson–Darling p = 0.235).")], [])
+    ws._show_checks(result)
+    assert check_rows(ws) == [("Data Checks", "All checks", "No data issues detected.", "OK")]  # a check that passed is not listed
+    ws._checks[result.label] = ([Check("Stability", "info", "the whole statement", "the short line"),
+                                 Check("Normality", "caution", "the whole statement", "Failed (Anderson–Darling p = 0.006, below 0.05).")], [])
+    ws._show_checks(result)
+    assert check_rows(ws) == [("Data Checks", "Normality", "Failed (Anderson–Darling p = 0.006, below 0.05)", "Issue"),
+                              ("Data Checks", "Stability", "the short line", "Review")]  # what was found, the issues first
+
+
+def test_a_warning_mark_leads_to_the_checks_and_never_changes_pass_or_fail(app, tmp_path):
+    from collections import Counter
+
+    folder = tmp_path / "cap_marks"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    ws.tabs.select(ws.results_tab)
+    app.update()
+    marked = sorted(ws._marked)
+    assert marked and all(ws.table.set(row, "0").endswith("  ⚠") for row in marked)
+    assert [ws.table.heading(c)["text"] for c in ws.table["columns"]] == ["Test Item", "N", "Cp", "Cpk", "Pp", "Ppk"]
+    assert ws.summary_var.get() == f"3 items analyzed · Acceptance off · {len(marked)} Need Review"
+    ws.judge_var.set(True)  # acceptance: the Cpk threshold only
+    app.update()
+    assert [r.status for r in ws._visible] == ["PASS" if r.metrics["cpk"] > 1.33 else "FAIL" for r in ws._visible]
+    counts = Counter(r.status for r in ws._visible)
+    assert ws.summary_var.get() == " · ".join(["3 items analyzed", *(f"{n} {status}" for status, n in counts.items()), f"{len(marked)} Need Review"])
+    ws.result_tabs.select(0)
+    app.update()
+    row = marked[0]
+    x, y, width, height = ws.table.bbox(row, "0")
+    over = [px for px in range(x, x + width) if ws._on_mark(row, px)]
+    assert over and min(over) > x + 10 and max(over) < x + width and not ws._on_mark(row, x + 3)  # on the mark, not the name
+    ws.table.event_generate("<Button-1>", x=x + 3, y=y + height // 2)
+    app.update()
+    assert ws.result_tabs.select() != str(ws.checks_page)
+    ws.table.event_generate("<Button-1>", x=over[len(over) // 2], y=y + height // 2)
+    app.update()
+    assert ws.result_tabs.select() == str(ws.checks_page) and ws.table.selection() == (row,)
+
+
+def test_the_capability_histogram_scale_is_chosen_beside_the_chart_and_gage_rr_has_none(app, tmp_path):
+    folder = tmp_path / "cap_scale"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    run_validation(app, ws)
+    ws.tabs.select(ws.results_tab)
+    ws.result_tabs.select(0)
+    app.update()
+
+    def texts():
+        return [ws.chart_canvas.itemcget(i, "text") for i in ws.chart_canvas.find_all() if ws.chart_canvas.type(i) == "text"]
+
+    assert showing(app, ws.chart_tools) and choices(ws.chart_tools, "TRadiobutton") == ["Auto", "Full Limits"]
+    assert ws.chart_scale_var.get() == "auto"
+    result = ws.selected_result()
+    ws.chart_tools.winfo_children()[1].invoke()  # Full Limits: both limits, at their true places
+    app.update()
+    assert ws.chart_scale_var.get() == "full" and {"LSL", "USL"} <= set(texts()) and not any("off scale" in t for t in texts())
+    ws.chart_tools.winfo_children()[0].invoke()
+    app.update()
+    assert ws.chart_scale_var.get() == "auto" and ws.selected_result() is result
+    ws.method_var.set("grr")
+    run_validation(app, ws)
+    app.update()
+    assert showing(app, ws.chart_tools, False) and any("Components of Variation" in t for t in texts())

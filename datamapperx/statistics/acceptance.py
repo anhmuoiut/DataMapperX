@@ -6,7 +6,8 @@ from collections.abc import Sequence
 
 from .models import CONDITIONAL, FAIL, NOT_EVALUATED, PASS, AnalysisConfig, Criterion
 
-METRIC_NAMES = {"percent_tolerance": "%SV/Tol", "percent_study_var": "%Study Var", "ndc": "NDC", "cpk": "Cpk", "ppk": "Ppk"}
+METRIC_NAMES = {"percent_tolerance": "%SV/Tol", "percent_study_var": "%Study Var", "ndc": "NDC", "cpk": "Cpk", "ppk": "Ppk",
+                "agreement": "Agreement %"}
 CONFLICT_LABELS = {key: METRIC_NAMES[key] for key in ("percent_tolerance", "percent_study_var", "ndc")}
 
 
@@ -102,6 +103,24 @@ def acceptance_conflicts(metrics: dict, config: AnalysisConfig, decision: str) -
         elif percentage_status(value, config) == FAIL:
             found.append((key, f"{label} {value:.2f}% is above {config.percent_fail:g}%"))
     return found
+
+
+def attribute_acceptance(details: dict, minimum: float | None) -> tuple[str, dict[str, str]]:
+    """Within Appraisers and Appraiser vs Standard, each judged on its own against a minimum percent agreement.
+
+    A measure that cannot be judged (no Standard, a single trial, acceptance off) is N/A, never PASS. With several appraisers a
+    measure passes only when every appraiser passes it. The overall result is FAIL if either measure fails, PASS only when
+    both pass, and N/A otherwise. The comparison uses the counts, so 27 of 30 meets a minimum of 90 exactly.
+    """
+    statuses = {"within": NOT_EVALUATED, "standard": NOT_EVALUATED}
+    appraisers = details.get("appraisers") or ()
+    if minimum is not None and appraisers:
+        for measure in statuses:
+            entries = [a.get(measure) for a in appraisers]
+            if all(entries):
+                statuses[measure] = PASS if all(e["matched"] * 100 >= minimum * e["inspected"] for e in entries) else FAIL
+    overall = (FAIL if FAIL in statuses.values() else PASS if all(s == PASS for s in statuses.values()) else NOT_EVALUATED)
+    return overall, statuses
 
 
 def acceptance(metrics: dict, config: AnalysisConfig) -> tuple[str, str]:

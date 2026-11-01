@@ -2,9 +2,11 @@
 
 A Variable Gage R&R report has, for each test item, the tables Minitab prints (ANOVA, Variance Components, Gage
 Evaluation, Number of Distinct Categories) and the Gage R&R graphs. A Process Capability report has the capability
-histogram with the Process Data, the Overall and Potential (Within) Capability and the Performance table. Nothing is
-recalculated here: the report prints what the analysis found. PASS/FAIL, acceptance criteria and long explanations stay
-in the application. Heavy export dependencies load lazily.
+histogram with the Process Data, the Overall and Potential (Within) Capability and the Performance table. An Attribute
+Agreement report has the Assessment Agreement tables (Within Appraisers, each appraiser against the Standard, between
+appraisers), Fleiss' kappa, the assessments that differ from the Standard, and the two Assessment Agreement panels; its
+acceptance, when one was applied, is a separate table. Nothing is recalculated here: the report prints what the analysis
+found. PASS/FAIL, acceptance criteria and long explanations stay in the application. Heavy export dependencies load lazily.
 """
 
 from __future__ import annotations
@@ -19,7 +21,15 @@ from html import escape
 from pathlib import Path
 
 from .exporter import set_text
-from .stat_charts import ChartSpec, charts_for_result, plain_number, reportlab_chart
+from .stat_charts import (
+    AGREEMENT_TITLES,
+    MAX_DECIMALS,
+    ChartSpec,
+    agreement_axis,
+    charts_for_result,
+    plain_number,
+    reportlab_chart,
+)
 from .statistics.acceptance import metric_label
 
 ALL_SECTIONS = ("charts", "observations")
@@ -51,6 +61,7 @@ METHOD_TITLES = {
     "grr_crossed_interaction_retained": "Gage R&R: crossed ANOVA, interaction retained",
     "capability_individuals": "Process capability: individuals (average moving range)",
     "capability_pooled": "Process capability: pooled subgroups",
+    "attribute_agreement": "Attribute Agreement Analysis: exact intervals, Fleiss' kappa",
 }
 
 
@@ -111,6 +122,9 @@ def format_value(value, kind: str, decimals: int = 2) -> str:
         return value
     if value is None or (isinstance(value, float) and not math.isfinite(value)):
         return "*"
+    if kind == "ci":  # a confidence interval: (lower limit, upper limit)
+        low, high = value
+        return f"({low:.{decimals}f}, {high:.{decimals}f})"
     if kind == "text":
         return str(value)
     if kind == "int":
@@ -123,12 +137,20 @@ def format_value(value, kind: str, decimals: int = 2) -> str:
         return f"{value:.2f}"
     if kind == "p":
         return f"{value:.3f}"
+    if kind == "p4":  # the P value of a kappa: four decimals, and never a zero that stands for something small
+        return "<0.0001" if value < 0.00005 else f"{value:.4f}"
+    if kind.startswith("f+"):  # the decimals chosen, and a few more: Minitab prints the SE and the Z of a kappa to more digits
+        return f"{value:.{decimals + int(kind[2:])}f}"
     return f"{value:.{decimals}f}"  # f, idx
 
 
 def _excel_format(value, kind: str, decimals: int) -> str:
     if kind == "var":
         return "0." + "0" * (decimals + 5)
+    if kind == "p4":
+        return '[<0.00005]"<0.0001";0.0000'  # the cell keeps the full value; only a tiny one is shown as "<0.0001", never as 0.0000
+    if kind.startswith("f+"):
+        return "0." + "0" * (decimals + int(kind[2:]))
     if kind == "sig":
         return "General"
     fixed = {"pct": "0.00", "ppm": "0.00", "p": "0.000", "int": "0"}
@@ -149,7 +171,7 @@ class ReportTable:
     title: str
     headers: tuple[str, ...]  # all empty: the table has no header row
     rows: tuple[tuple, ...]
-    kinds: tuple[str, ...]  # per column: text, int, var, f, p, pct, idx, ppm, sig
+    kinds: tuple[str, ...]  # per column: text, int, var, f, p, pct, idx, ppm, sig; f+N (N more decimals), p4, ci (a (lower, upper) pair)
     note: str = ""
 
     def cells(self, decimals: int) -> list[list[str]]:
@@ -279,13 +301,237 @@ def capability_tables(result) -> list[ReportTable]:
     return [process, overall_table, within_table, performance]
 
 
+def _scale_number(value, decimals: int) -> str:
+    """A figure in the units of the measurement: fixed decimals (never E notation), with more of them when the chosen
+    number would round a small figure to zero. N/A when there is none."""
+    number = _num(value)
+    if number is None:
+        return "N/A"
+    if number != 0:
+        decimals = max(decimals, min(MAX_DECIMALS, 2 - math.floor(math.log10(abs(number)))))
+    return f"{number:.{decimals}f}"
+
+
+def _fixed(value, decimals: int) -> str:
+    number = _num(value)
+    return "N/A" if number is None else f"{number:.{decimals}f}"
+
+
+def capability_details(result, decimals: int = 2) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The figures of one capability item for the Details tab: (group, [(metric, value)]). The last group, Advanced Details,
+    holds the secondary figures. Every value is text, N/A where it is not defined; the calculations are those of the report."""
+    m = result.metrics
+    within, overall = _num(m.get("sigma_within")), _num(m.get("sigma_overall"))
+    idx = capability_indices(_num(result.mean), result.lsl, result.usl, within, overall)
+    ppm = capability_ppm(result)
+    advanced = [(name, _fixed(idx[key], decimals)) for name, key in (("CPL", "cpl"), ("CPU", "cpu"), ("PPL", "ppl"), ("PPU", "ppu"))]
+    for title, key in (("Observed", "observed"), ("Expected Within", "within"), ("Expected Overall", "overall")):
+        advanced += [(f"{title} PPM {side}", _fixed(value, 2)) for side, value in zip(("< LSL", "> USL", "Total"), ppm[key], strict=True)]
+    return [
+        ("Specification", [("LSL", _scale_number(result.lsl, decimals)), ("USL", _scale_number(result.usl, decimals))]),
+        ("Variation", [("Sample N", str(result.n)), ("Mean", _scale_number(result.mean, decimals)),
+                       ("Within SD", _scale_number(within, decimals)), ("Overall SD", _scale_number(overall, decimals))]),
+        ("Capability", [(name, _fixed(m.get(key), decimals)) for name, key in (("Cp", "cp"), ("Cpk", "cpk"), ("Pp", "pp"), ("Ppk", "ppk"))]),
+        ("Advanced Details", advanced),
+    ]
+
+
+DETAIL_MAX_DECIMALS = 10  # a small figure gets as many decimals as it needs up to here, and scientific notation beyond
+EXTRA_COLUMNS = ("SS", "Study Var")  # columns of the Gage R&R tables that the Details tab shows only on request
+
+
+def detail_cell(value, kind: str, decimals: int = 2) -> str:
+    """One figure as the Details tab shows it: as in the report, except that a small figure is never shown as zero or with
+    fewer than three significant digits. It gets the decimals it needs, or scientific notation when that would be too
+    many; a tiny p-value or percentage reads ``<``."""
+    if isinstance(value, str):
+        return value
+    number = _num(value)
+    if number is None:
+        return "N/A"
+    if kind == "text":
+        return str(value)
+    if kind == "int":
+        return str(int(number))
+    text = format_value(number, kind, decimals)
+    if kind == "p":
+        return "<0.001" if number < 0.0005 else text
+    if number == 0:
+        return text
+    if kind in ("pct", "ppm"):
+        return text if float(text) != 0 else "<0.01"
+    needed = 2 - math.floor(math.log10(abs(number)))
+    if len(text.partition(".")[2]) >= needed:
+        return text
+    return f"{number:.{needed}f}" if needed <= DETAIL_MAX_DECIMALS else f"{number:.3e}"
+
+
+@dataclass(frozen=True, slots=True)
+class DetailTable:
+    title: str
+    headers: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+
+
+def grr_details(result, decimals: int = 2, all_columns: bool = False) -> list[DetailTable]:
+    """The tables of a Gage R&R item for the Details tab: the ANOVA table(s), Variance Components and Gage Evaluation, from
+    the same figures as the report. The essential columns only, unless ``all_columns`` (then SS and Study Var as well)."""
+    tables = []
+    for table in grr_tables(result):
+        first = [h.split("\n")[0] for h in table.headers]
+        keep = [i for i, name in enumerate(first) if all_columns or name not in EXTRA_COLUMNS]
+        headers = tuple(table.headers[i].replace("\n", " ") if first[i] == "Study Var" else first[i] for i in keep)
+        rows = tuple(tuple(detail_cell(row[i], table.kinds[i], decimals) for i in keep) for row in table.rows)
+        title = table.title.replace(" Table", "") + (f" ({table.note})" if table.note else "")
+        tables.append(DetailTable(title, headers, rows))
+    return tables
+
+
+def _agreement_table(title: str, entries, level: float, decimals: int) -> DetailTable:
+    rows = tuple((label, str(e["inspected"]), str(e["matched"]), f"{e['percent']:.{decimals}f}",
+                  f"({e['lower']:.{decimals}f}, {e['upper']:.{decimals}f})") for label, e in entries)
+    return DetailTable(title, ("Appraiser", "Inspected", "Matched", "Agreement %", f"{level:g}% CI"), rows)
+
+
+def _kappa_table(title: str, entries, decimals: int) -> DetailTable:
+    """Fleiss' kappa of each response. With two responses the overall kappa is each response's, so it is listed only for more."""
+    def cell(value, places):
+        return "N/A" if value is None else f"{value:.{places}f}"
+
+    def p_value(value):
+        return "N/A" if value is None else "<0.0001" if value < 0.00005 else f"{value:.4f}"
+
+    rows = []
+    for label, table in entries:
+        listed = [*table["rows"], *([table["overall"]] if len(table["rows"]) > 2 else [])]
+        rows += [(label, r["response"], cell(r["kappa"], decimals), cell(r["se"], decimals + 4), cell(r["z"], decimals + 3), p_value(r["p"]))
+                 for r in listed]
+    return DetailTable(title, ("Appraiser", "Response", "Kappa", "SE", "Z", "P"), tuple(rows))
+
+
+DISAGREEMENT_NA = "N/A: no sample has that value as its Standard."
+
+
+def _disagreement_headers(entries) -> tuple[str, ...]:
+    """Appraiser, then each count of Minitab's Assessment Disagreement table with its Percent."""
+    return ("Appraiser", *(heading for column in entries[0][1]["columns"] for heading in (column["heading"], "Percent")))
+
+
+def attribute_details(result, decimals: int = 2) -> tuple[list[DetailTable], list[str]]:
+    """The tables of an Attribute Agreement item for the Details tab, in the order of Minitab's report, and the notes that go
+    with them (each said once). Only what the study has: no Within Appraisers table for a single trial, and no Assessment
+    Disagreement without a known Standard and exactly two responses."""
+    d = result.details
+    appraisers, level = d.get("appraisers", ()), 100 * d.get("confidence", 0.95)
+    labelled = {key: [(a["label"], a[key]) for a in appraisers if a[key]]
+                for key in ("within", "kappa_within", "standard", "kappa_standard", "disagreement")}
+    tables, notes = [], []
+    if labelled["within"]:
+        tables.append(_agreement_table("Within Appraisers", labelled["within"], level, decimals))
+    if labelled["kappa_within"]:
+        tables.append(_kappa_table("Fleiss' Kappa Statistics", labelled["kappa_within"], decimals))
+    if labelled["standard"]:
+        tables.append(_agreement_table("Each Appraiser vs Standard", labelled["standard"], level, decimals))
+        tables.append(_kappa_table("Fleiss' Kappa Statistics vs Standard", labelled["kappa_standard"], decimals))
+    shown = [(label, entry) for label, entry in labelled["disagreement"] if entry["applicable"]]
+    if shown:
+        rows = tuple((label, *(cell for column in e["columns"] for cell in (str(column["count"]), "N/A" if column["percent"] is None
+                                                                             else f"{column['percent']:.{decimals}f}")))
+                     for label, e in shown)
+        tables.append(DetailTable("Assessment Disagreement", _disagreement_headers(shown), rows))
+        if any(column["percent"] is None for _, e in shown for column in e["columns"]):
+            notes.append(DISAGREEMENT_NA)
+    if d.get("between"):
+        tables.append(_agreement_table("Between Appraisers", [("All", d["between"])], level, decimals))
+        tables.append(_kappa_table("Fleiss' Kappa Statistics (Between Appraisers)", [("All", d["kappa_between"])], decimals))
+    if d.get("all_standard"):
+        tables.append(_agreement_table("All Appraisers vs Standard", [("All", d["all_standard"])], level, decimals))
+        tables.append(_kappa_table("Fleiss' Kappa Statistics (All Appraisers vs Standard)", [("All", d["kappa_all_standard"])], decimals))
+    if d.get("standard_problem"):  # a Standard was given but cannot be used: say what is N/A, and why
+        notes.insert(0, f"Appraiser vs Standard is N/A. {d['standard_problem']}")
+    if any(table["reason"] for key in ("kappa_within", "kappa_standard") for _, table in labelled[key]):
+        notes.append("Kappa is N/A where a response has no variation to measure.")
+    return tables, notes
+
+
+def _na(value):
+    return "N/A" if value is None else value
+
+
+def attribute_tables(result) -> list[ReportTable]:
+    """The tables of an Attribute Agreement report, in the order of Minitab's: Within Appraisers, then each appraiser against the
+    Standard, Assessment Disagreement (#Pass/Fail, #Fail/Pass and #Mixed, each with its percent) and, for two or more
+    appraisers, Between Appraisers and All Appraisers vs Standard. Every figure is that of the result snapshot, one row for each
+    appraiser; nothing is pooled that the study did not pool. What is not defined reads N/A, with its reason under the table."""
+    d = result.details
+    if not result.valid or "appraisers" not in d:
+        return []
+    appraisers, interval = d["appraisers"], f"{100 * d.get('confidence', 0.95):g}% CI"
+
+    def agreement(title, entries, note=""):
+        rows = tuple((label, e["inspected"], e["matched"], e["percent"], (e["lower"], e["upper"])) for label, e in entries)
+        return ReportTable(title, ("Appraiser", "# Inspected", "# Matched", "Percent", interval), rows, ("text", "int", "int", "f", "ci"), note)
+
+    def kappa(title, entries):
+        rows, note = [], ""
+        for label, table in entries:
+            listed = [*table["rows"], *([table["overall"]] if len(table["rows"]) > 2 else [])]  # two responses: Overall is each of them
+            rows += [(label, r["response"], *(_na(r[key]) for key in ("kappa", "se", "z", "p"))) for r in listed]
+            if table["reason"]:
+                note = "N/A: kappa is not defined for a response with no variation."
+        return ReportTable(title, ("Appraiser", "Response", "Kappa", "SE Kappa", "Z", "P(vs > 0)"), tuple(rows),
+                           ("text", "text", "f", "f+4", "f+3", "p4"), note)
+
+    def entries(key):
+        return [(a["label"], a[key]) for a in appraisers if a[key]]
+
+    tables = []
+    if entries("within"):
+        tables += [agreement("Within Appraisers: Assessment Agreement", entries("within")),
+                   kappa("Fleiss' Kappa Statistics", entries("kappa_within"))]
+    against = "Each Appraiser vs Standard: Assessment Agreement"
+    if entries("standard"):
+        tables += [agreement(against, entries("standard")), kappa("Fleiss' Kappa Statistics vs Standard", entries("kappa_standard"))]
+    elif d.get("standard_problem"):  # a Standard was given but cannot be used: the section is there, and says so
+        tables.append(ReportTable(against, ("Appraiser", "# Inspected", "# Matched", "Percent", interval),
+                                  tuple((a["label"], "N/A", "N/A", "N/A", "N/A") for a in appraisers), ("text", "int", "int", "f", "ci"),
+                                  f"N/A: {d['standard_problem']}"))
+    shown = [(a["label"], a["disagreement"]) for a in appraisers if a["disagreement"] and a["disagreement"]["applicable"]]
+    if shown:
+        missing = any(column["percent"] is None for _, e in shown for column in e["columns"])
+        tables.append(ReportTable(
+            "Assessment Disagreement", _disagreement_headers(shown),
+            tuple((label, *(cell for column in e["columns"] for cell in (column["count"], _na(column["percent"])))) for label, e in shown),
+            ("text", *("int", "f") * len(shown[0][1]["columns"])), DISAGREEMENT_NA if missing else ""))
+    if d.get("between"):
+        tables += [agreement("Between Appraisers: Assessment Agreement", [("All", d["between"])]),
+                   kappa("Fleiss' Kappa Statistics (Between Appraisers)", [("All", d["kappa_between"])])]
+    if d.get("all_standard"):
+        tables += [agreement("All Appraisers vs Standard: Assessment Agreement", [("All", d["all_standard"])]),
+                   kappa("Fleiss' Kappa Statistics (All Appraisers vs Standard)", [("All", d["kappa_all_standard"])])]
+    return tables
+
+
+def acceptance_table(result) -> ReportTable | None:
+    """The optional acceptance of an Attribute Agreement item, apart from its statistics: only when a minimum agreement was
+    applied. It is the user's criterion, not a statistical conclusion."""
+    status, minimum = result.details.get("agreement_status"), result.details.get("agreement_min")
+    if result.method != "attribute" or not status or minimum is None:
+        return None
+    rows = (("Within Appraisers", f"{minimum:g} %", status["within"]), ("Appraiser vs Standard", f"{minimum:g} %", status["standard"]),
+            ("Overall", "", result.status))
+    return ReportTable("Acceptance (a criterion you chose, not a statistical result)", ("Percent agreement", "Minimum", "Result"), rows,
+                       ("text", "text", "text"), "PASS: at or above the minimum. N/A: cannot be judged, for example without a Standard.")
+
+
 def report_charts(result, titled: bool = False) -> list[ChartSpec]:
     """The charts of one item, in the order of Minitab's Gage R&R report. The report leaves the title of the capability
     histogram to the page heading; the notes stay in the application."""
     if not result.valid:
         return []
-    charts = [replace(spec, note="", title=spec.title if titled or result.method != "capability" else "")
-              for spec in charts_for_result(result)]
+    charts = [replace(spec, note=spec.note if result.method == "attribute" else "",
+                      title=spec.title if titled or result.method != "capability" else "")
+              for spec in charts_for_result(result)]  # an Attribute panel keeps its note: it says why the panel is N/A
     order = ("Components of Variation", "R Chart", "Measurement by Sample ID", "Xbar Chart", "Measurement by Operator",
              "Sample ID x Operator Interaction")
     return sorted(charts, key=lambda spec: order.index(spec.title) if spec.title in order else len(order))
@@ -314,6 +560,31 @@ def info_rows(result, context: ReportContext | None) -> list[tuple[str, str]]:
 
 
 # ----------------------------------------------------------------------------- the application's own summary table
+def summary_line(results: Sequence, judged: bool, review: int = 0) -> str:
+    """The line above the results table: 8 items analyzed · Acceptance off. Items that could not be analysed are counted apart
+    from the acceptance results, which are shown only when criteria were applied."""
+    analysed = sum(1 for result in results if result.valid)
+    parts = [f"{analysed} item{'s' if analysed != 1 else ''} analyzed"]
+    if judged:
+        counts: dict[str, int] = {}
+        for result in results:
+            counts[result.status] = counts.get(result.status, 0) + 1
+        parts += [f"{n} {status}" for status, n in counts.items()]
+    else:
+        parts.append("Acceptance off")
+    if analysed != len(results):
+        parts.append(f"{len(results) - analysed} not analyzed")
+    if review:
+        parts.append(f"{review} Need Review")
+    return " · ".join(parts)
+
+
+def summary_number(value, header: str, precision: int, method: str = "grr") -> str:
+    """One figure of the summary table. A percentage is written with two decimals, as Minitab prints it, except for Attribute
+    Agreement, whose percentages and kappa follow the decimals chosen on screen like every other figure of that table."""
+    return display_number(value, 2 if "%" in header and method != "attribute" else precision)
+
+
 def summary_rows(results: Sequence, judged: bool = True) -> tuple[tuple[str, ...], list[tuple]]:
     """The summary table of the application. Without criteria (``judged=False``) it holds the statistics only."""
     if not results:
@@ -321,7 +592,11 @@ def summary_rows(results: Sequence, judged: bool = True) -> tuple[tuple[str, ...
     methods = {result.method for result in results}
     if len(methods) != 1:
         raise ValueError("A report must contain only one analysis method.")
-    if results[0].method == "capability":
+    if results[0].method == "attribute":  # the first Kappa is Within Appraisers; the others are in the details
+        headers = ("Test Item", "System", "Samples", "Within %", "vs Standard %", "Kappa", "Acceptance Result")
+        rows = [(r.test_item, r.system, r.parts, *(r.metrics.get(key) for key in ("within_percent", "standard_percent", "kappa_within")),
+                 r.status) for r in results]
+    elif results[0].method == "capability":
         headers = ("Test Item", "System", "N", "Mean", "Min", "Max", "Cp", "Cpk", "Pp", "Ppk", "Result")
         rows = [(r.test_item, r.system, r.n, r.mean, r.minimum, r.maximum,
                  *(r.metrics.get(key) for key in ("cp", "cpk", "pp", "ppk")), r.status) for r in results]
@@ -330,7 +605,7 @@ def summary_rows(results: Sequence, judged: bool = True) -> tuple[tuple[str, ...
         rows = [(r.test_item, r.system, *(r.metrics.get(key) for key in ("percent_tolerance", "percent_study_var", "ndc")),
                  r.status, review_note(r), metric_label(r.decision_metric)) for r in results]
     if not judged:
-        keep = len(headers) - (1 if results[0].method == "capability" else 3)
+        keep = len(headers) - (3 if results[0].method == "grr" else 1)
         headers, rows = headers[:keep], [row[:keep] for row in rows]
     return headers, rows
 
@@ -342,6 +617,10 @@ def review_note(result) -> str:
 
 def _workbook_summary(results: Sequence) -> tuple[tuple[str, ...], list[tuple], tuple[str, ...]]:
     """One line per item for a workbook with several items: the figures Minitab reports, nothing else."""
+    if results[0].method == "attribute":
+        return (("Test Item", "Samples", "Within %", "vs Standard %", "Kappa"),
+                [(item_label(r), r.parts, *(_na(r.metrics.get(k)) for k in ("within_percent", "standard_percent", "kappa_within")))
+                 for r in results], ("text", "int", "f", "f", "f"))
     if results[0].method == "capability":
         return (("Test Item", "N", "Cp", "Cpk", "Pp", "Ppk"),
                 [(item_label(r), r.n, *(r.metrics.get(k) for k in ("cp", "cpk", "pp", "ppk"))) for r in results],
@@ -379,21 +658,69 @@ def session_text(result, decimals: int = 2) -> str:
                 lines.append(f"  {table.note}")
             lines.append("")
         lines.append(f"Number of Distinct Categories = {format_value(result.metrics.get('ndc'), 'int')}")
+    elif result.method == "attribute":
+        lines.append("Attribute Agreement Analysis")
+        for table in [*attribute_tables(result), *filter(None, [acceptance_table(result)])]:
+            lines += ["", table.title, *_text_table(table, decimals)]
+            if table.note:
+                lines.append(f"  {table.note}")
     else:
         lines.append("Process Capability")
         for table in capability_tables(result):
             lines += ["", table.title, *_text_table(table, decimals)]
         lines += ["", "The actual process spread is represented by 6 sigma."]
-    issues = [i for i in result.issues if i.severity in ("warning", "error")]
+    issues = [i for i in result.issues if i.severity in ("warning", "error") and result.method != "attribute"]  # its notes are under its tables
     if issues:
         lines += ["", "Notes"] + [f"  {i.message}" for i in issues]
     return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------- Excel
+def _excel_agreement_chart(ws, data_ws, spec: ChartSpec, start_col: int, anchor: str, size: tuple[float, float]):
+    """One panel of the Assessment Agreement graph as a native chart: the percent of each appraiser as a circle, the two limits of
+    its interval as X markers, and a line between the limits. The data sheet holds the full values."""
+    from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart.axis import ChartLines
+    from openpyxl.chart.marker import Marker
+    from openpyxl.chart.shapes import GraphicalProperties
+
+    if not spec.series:  # N/A: the table says why; there is nothing to plot
+        return start_col
+    percent = next(s for s in spec.series if s.kind == "scatter")
+    interval = next(s for s in spec.series if s.kind == "interval")
+    lower, upper = interval.points[0::2], interval.points[1::2]
+    count, col = len(spec.categories), start_col
+    for offset, header in enumerate(("Appraiser", percent.label, f"{interval.label} lower", f"{interval.label} upper")):
+        set_text(data_ws.cell(1, col + offset), header)
+    for row, label in enumerate(spec.categories, 2):
+        set_text(data_ws.cell(row, col), label[:32767])
+        for offset, value in enumerate((percent.points[row - 2][1], lower[row - 2][1], upper[row - 2][1]), 1):
+            data_ws.cell(row, col + offset, value)
+    chart = LineChart()
+    chart.title, chart.x_axis.title, chart.y_axis.title = spec.title, spec.x_label, spec.y_label
+    chart.style, chart.width, chart.height = 13, size[0], size[1]
+    for offset, series, symbol, marker_size in ((1, percent, "circle", 7), (2, interval, "x", 8), (3, interval, "x", 8)):
+        chart.add_data(Reference(data_ws, min_col=col + offset, min_row=1, max_row=count + 1), titles_from_data=True)
+        item, color = chart.series[-1], series.color.lstrip("#")
+        item.marker = Marker(symbol=symbol, size=marker_size)
+        item.marker.graphicalProperties = GraphicalProperties(solidFill=color)
+        item.marker.graphicalProperties.line.solidFill = color
+        item.graphicalProperties = GraphicalProperties()
+        item.graphicalProperties.line.noFill = True  # markers only; the line between the limits is the chart's high-low line
+    chart.set_categories(Reference(data_ws, min_col=col, min_row=2, max_row=count + 1))
+    chart.hiLowLines = ChartLines()
+    chart.y_axis.scaling.min, chart.y_axis.scaling.max = agreement_axis(spec)
+    chart.x_axis.delete = chart.y_axis.delete = False
+    ws.add_chart(chart, anchor)
+    return col + 4
+
+
 def _excel_chart(ws, data_ws, spec: ChartSpec, start_col: int, anchor: str, size: tuple[float, float] = (16, 8.5)):
     from openpyxl.chart import BarChart, LineChart, Reference, ScatterChart, Series
     from openpyxl.chart.shapes import GraphicalProperties
+
+    if spec.title in AGREEMENT_TITLES:
+        return _excel_agreement_chart(ws, data_ws, spec, start_col, anchor, size)
 
     def write(cell, value):
         if isinstance(value, str):
@@ -522,24 +849,32 @@ def _write_table(ws, row: int, table: ReportTable, decimals: int) -> int:
         set_text(heading, table.title)
         heading.font = Font(name="Calibri", size=12, bold=True, color="0B5CAD")
         row += 1
+    # A confidence interval is one cell in a PDF, "(90.50, 100.00)"; in a workbook it is two, each with its full value.
+    columns: list[tuple[str, str, int, int | None]] = []  # (heading, kind, column of the table, 0 lower / 1 upper)
+    for index, kind in enumerate(table.kinds):
+        heading = table.headers[index] if index < len(table.headers) else ""
+        columns += [(f"{heading} lower", "f", index, 0), (f"{heading} upper", "f", index, 1)] if kind == "ci" else [(heading, kind, index, None)]
     if any(table.headers):
-        for col, text in enumerate(table.headers, 1):
+        for col, (text, kind, _source, _part) in enumerate(columns, 1):
             cell = ws.cell(row, col)
             set_text(cell, text)
             cell.font = Font(name="Calibri", size=10, bold=True)
-            cell.alignment = Alignment(horizontal="left" if table.kinds[col - 1] == "text" else "right", vertical="bottom", wrap_text=True)
+            cell.alignment = Alignment(horizontal="left" if kind == "text" else "right", vertical="bottom", wrap_text=True)
             cell.border = Border(bottom=Side(style="thin", color="404040"))
         ws.row_dimensions[row].height = 30 if any("\n" in h for h in table.headers) else 16
         row += 1
     for values in table.rows:
-        for col, value in enumerate(values, 1):
-            cell, kind = ws.cell(row, col), table.kinds[col - 1]
+        for col, (_text, kind, source, part) in enumerate(columns, 1):
+            value = values[source] if source < len(values) else None
+            if part is not None and isinstance(value, tuple):
+                value = value[part]
+            cell = ws.cell(row, col)
             cell.font = Font(name="Calibri", size=10)
             if value is None or (isinstance(value, float) and not math.isfinite(value)):
                 cell.value, cell.alignment = "*", Alignment(horizontal="right")
             elif isinstance(value, str):
                 set_text(cell, value)
-                cell.alignment = Alignment(horizontal="left")
+                cell.alignment = Alignment(horizontal="left" if kind == "text" else "right")  # an N/A in a column of figures
             else:
                 cell.value = value  # the full value; only the display is formatted
                 cell.number_format = _excel_format(value, kind, decimals)
@@ -562,10 +897,11 @@ def _export_xlsx(path: Path, results: Sequence, decimals: int, context: ReportCo
     first = workbook.active
     used: set[str] = set()
     capability = results[0].method == "capability"
+    attribute = results[0].method == "attribute"
     if len(results) > 1:
         first.title = "Summary"
         used.add("summary")
-        set_text(first["A1"], "Process Capability" if capability else "Variable Gage R&R")
+        set_text(first["A1"], "Process Capability" if capability else "Attribute Agreement Analysis" if attribute else "Variable Gage R&R")
         first["A1"].font = Font(name="Calibri", size=14, bold=True, color="0B5CAD")
         row = 2
         for label, value in context.info if context else ():
@@ -582,7 +918,8 @@ def _export_xlsx(path: Path, results: Sequence, decimals: int, context: ReportCo
     for index, result in enumerate(results):
         ws = first if len(results) == 1 else workbook.create_sheet(_sheet_name(item_label(result), used))
         heading = ws.cell(1, 1)
-        set_text(heading, f"{'Process Capability Report for' if capability else 'Gage R&R for'} {item_label(result)}")
+        kind = "Process Capability Report for" if capability else "Attribute Agreement Analysis for" if attribute else "Gage R&R for"
+        set_text(heading, f"{kind} {item_label(result)}")
         heading.font = Font(name="Calibri", size=14, bold=True, color="0B5CAD")
         row = 2
         for label, value in info_rows(result, context):
@@ -594,12 +931,17 @@ def _export_xlsx(path: Path, results: Sequence, decimals: int, context: ReportCo
         if not result.valid:
             set_text(ws.cell(row, 1), failure(result))
         else:
-            for table in capability_tables(result) if capability else grr_tables(result):
+            tables = capability_tables(result) if capability else attribute_tables(result) if attribute else grr_tables(result)
+            for table in tables:
                 row = _write_table(ws, row, table, decimals)
-            closing = ("The actual process spread is represented by 6 sigma." if capability else
-                       f"Number of Distinct Categories = {format_value(result.metrics.get('ndc'), 'int')}")
-            set_text(ws.cell(row, 1), closing)
-            ws.cell(row, 1).font = Font(name="Calibri", size=10, bold=not capability, italic=capability)
+            if attribute:
+                if (acceptance := acceptance_table(result)) is not None:  # apart from the statistics, and only when one was applied
+                    row = _write_table(ws, row, acceptance, decimals)
+            else:
+                closing = ("The actual process spread is represented by 6 sigma." if capability else
+                           f"Number of Distinct Categories = {format_value(result.metrics.get('ndc'), 'int')}")
+                set_text(ws.cell(row, 1), closing)
+                ws.cell(row, 1).font = Font(name="Calibri", size=10, bold=not capability, italic=capability)
         ws.column_dimensions["A"].width = 28
         for letter in "BCDEFG":
             ws.column_dimensions[letter].width = 16
@@ -614,13 +956,17 @@ def _export_xlsx(path: Path, results: Sequence, decimals: int, context: ReportCo
                 column = _excel_chart(ws, data_ws, spec, column, anchor, (18, 10) if capability else (16, 8.5))
     if "observations" in sections:
         raw = workbook.create_sheet(_sheet_name("Observations", used))
-        for col, text in enumerate(("Test Item", "Sample ID", "Value", "LSL", "USL", "Trial", "Operator", "Source"), 1):
+        headings = (("Test Item", "Sample ID", "Appraiser", "Trial", "Rating", "Standard", "Source") if attribute else
+                    ("Test Item", "Sample ID", "Value", "LSL", "USL", "Trial", "Operator", "Source"))
+        for col, text in enumerate(headings, 1):
             set_text(raw.cell(1, col), text)
             raw.cell(1, col).font = Font(name="Calibri", size=10, bold=True)
         line = 2
         for result in results:
             for o in result.observations:
-                for col, value in enumerate((result.label, o.sample_id, o.value, o.lsl, o.usl, o.trial, o.operator, o.source), 1):
+                cells = ((result.label, o.sample_id, o.operator or "1", o.trial, o.value, o.standard, o.source) if attribute else
+                         (result.label, o.sample_id, o.value, o.lsl, o.usl, o.trial, o.operator, o.source))
+                for col, value in enumerate(cells, 1):
                     if isinstance(value, str):
                         set_text(raw.cell(line, col), value[:32767])
                     else:
@@ -770,6 +1116,44 @@ def _grr_story(result, context, decimals, fonts, styles, width, charts, chart_si
     return story
 
 
+def _attribute_chart_page(result, context, fonts, styles, specs, width, height):
+    """The Assessment Agreement graph on a page of its own, as Minitab prints it: the study above, the two panels side by side."""
+    from reportlab.platypus import KeepTogether, Paragraph, Spacer, Table, TableStyle
+
+    header = [Paragraph(f"Assessment Agreement for {escape(item_label(result))}", styles["title"])]
+    info = _chart_info_flow(result, context, fonts, width)
+    if info is not None:
+        header.append(info)
+    header.append(Spacer(1, 8))
+    header_height = sum(flow.wrap(width, height)[1] + flow.getSpaceBefore() + flow.getSpaceAfter() for flow in header)
+    row_height = min(300, height - header_height - 10)
+    half = width / 2
+    drawings = [reportlab_chart(spec, half - 10, row_height - 6, *fonts) for spec in specs]
+    table = Table([drawings + [""] * (2 - len(drawings))], colWidths=[half] * 2, rowHeights=[row_height], hAlign="LEFT")
+    table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 2), ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+    return KeepTogether([*header, table])
+
+
+def _attribute_story(result, context, decimals, fonts, styles, width, charts, chart_size):
+    from reportlab.platypus import KeepTogether, NextPageTemplate, PageBreak, Paragraph, Spacer
+
+    story = [Paragraph(f"Attribute Agreement Analysis for {escape(item_label(result))}", styles["title"])]
+    story.extend(_info_flow(result, context, fonts))
+    if not result.valid:
+        return [*story, Spacer(1, 8), Paragraph(escape(failure(result)), styles["body"])]
+    for table in [*attribute_tables(result), *filter(None, [acceptance_table(result)])]:
+        block = [Paragraph(escape(table.title), styles["heading"]), _pdf_table(table, decimals, fonts)]
+        if table.note:
+            block.append(Paragraph(escape(table.note), styles["note"]))
+        story.append(KeepTogether(block))  # a heading never ends a page without its table
+    specs = report_charts(result) if charts else []
+    if specs:
+        story += [NextPageTemplate("grr-charts"), PageBreak(), _attribute_chart_page(result, context, fonts, styles, specs, *chart_size),
+                  NextPageTemplate("grr-tables")]
+    return story
+
+
 def _capability_story(result, context, decimals, fonts, styles, width, charts):
     from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
 
@@ -817,6 +1201,8 @@ def _export_pdf(path: Path, results: Sequence, decimals: int, title: str, contex
             story.append(PageBreak())
         if capability:
             story += _capability_story(result, context, decimals, fonts, styles, width, charts)
+        elif results[0].method == "attribute":
+            story += _attribute_story(result, context, decimals, fonts, styles, width, charts, chart_size)
         else:
             story += _grr_story(result, context, decimals, fonts, styles, width, charts, chart_size)
     if capability:

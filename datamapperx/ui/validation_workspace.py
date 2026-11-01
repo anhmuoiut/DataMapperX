@@ -9,26 +9,33 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import tkinter as tk
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 from ..method_guide import method_guide
 from ..models import LogRecord
-from ..stat_charts import draw_tk_charts, plain_number
+from ..stat_charts import agreement_chart_note, draw_tk_charts, plain_number
 from ..stat_reports import (
     ALL_SECTIONS,
     CONDITION_TITLES,
-    display_number,
+    attribute_details,
+    capability_details,
+    detail_cell,
     export_statistical_report,
+    grr_details,
     item_label,
     report_charts,
     report_context,
     review_note,
     session_text,
+    summary_line,
+    summary_number,
     summary_rows,
 )
 from ..statistics import (
@@ -46,12 +53,29 @@ from ..statistics import (
     import_rawdata_xlsx,
     merge_customers,
 )
-from ..statistics.checks import CAUTION, INFO, OK, describe_layouts, layout_of, needs_attention, result_checks
+from ..statistics.checks import (
+    CRITICAL,
+    attribute_status_label,
+    describe_layouts,
+    findings,
+    layout_of,
+    needs_attention,
+    result_checks,
+    status_label,
+)
 from ..statistics.evaluation import combine_config, validate_evaluation_settings
+from ..statistics.ratings import (
+    ImportedRatings,
+    attribute_settings,
+    attribute_summary,
+    attribute_warnings,
+    read_ratings_table,
+)
 from ..statistics.study import validate_statistical_options
 from ..workspace_data import MappingSource, build_mapping_dataset, int_field, reorder_dataset
 from .dialogs import ReportDialog, open_path
 from .method_dialog import MethodDialog
+from .ratings_import import RatingsImportDialog
 from .tasks import TaskRunner
 from .theme import Palette
 from .validation import DATE_FORMAT, AssignmentDialog, CustomersDialog, DatePickerDialog
@@ -63,22 +87,43 @@ PREVIEW_ROWS = 300
 WIDE_RESULTS = 1100  # pixels of the Results tab from which the table and the charts sit side by side
 _UNSET = object()
 NO_CRITERIA = "None (statistics only)"
-SHORT_NOTES = {"acquisition_order": "order of the readings", "repeated_measurements": "repeated readings",
-               "process_stability": "stability", "normality": "distribution"}
 STATUSES = ("All results", "PASS", "CONDITIONAL PASS", "FAIL", "N/A")
 WITHIN_CHOICES = {"auto": "Automatic (from the subgroup size)",
                   "individuals": "Average moving range, length 2 (subgroup size 1)",
                   "pooled": "Pooled standard deviation (subgroups of 2 or more)"}
-METHOD_NAMES = {"grr": "Variable Gage R&R", "capability": "Process Capability (Cp/Cpk)"}
-PLAN_TITLES = {"grr": "Variable Gage R&R", "capability": "Process Capability"}
+METHOD_NAMES = {"grr": "Variable Gage R&R", "capability": "Process Capability (Cp/Cpk)", "attribute": "Attribute Agreement"}
+PLAN_TITLES = {"grr": "Variable Gage R&R", "capability": "Process Capability", "attribute": "Attribute Agreement"}
+CONFIDENCE_LEVELS = ("90%", "95%", "99%")
+ATTRIBUTE_RESULTS_READY = False  # stays False until the Attribute Results, Details and Checks have been seen working in the window
+ATTRIBUTE_REPORTS_READY = False  # stays False until its PDF and Excel report have been opened and checked in their own programs
+ATTRIBUTE_PREVIEW_ENV = "DATAMAPPERX_ATTRIBUTE_RESULTS"  # set to 1 to run Attribute Agreement before it is released, to check it
+ATTRIBUTE_REPORTS_ENV = "DATAMAPPERX_ATTRIBUTE_REPORTS"  # set to 1 to generate its PDF and Excel report before they are released
+ATTRIBUTE_PENDING = "Attribute Agreement can be set up here. Its results are still being checked, so it cannot be run yet."
+ATTRIBUTE_REPORT_PENDING = "Reports for Attribute Agreement are not available yet."
+SORT_KEYS = {"Cpk": "cpk", "Ppk": "ppk", "%SV/Tol": "percent_tolerance", "%Study Var": "percent_study_var", "NDC": "ndc",
+             "Within %": "within_percent", "vs Standard %": "standard_percent", "Kappa": "kappa_within"}  # the sort choice -> its metric
+
+
+def attribute_runnable() -> bool:
+    """Whether Attribute Agreement may be run: when it is released, or when it is being checked on purpose."""
+    return ATTRIBUTE_RESULTS_READY or os.environ.get(ATTRIBUTE_PREVIEW_ENV) == "1"
+
+
+def attribute_reportable() -> bool:
+    """Whether its PDF and Excel report may be generated: when they are released, or when they are being checked on purpose."""
+    return ATTRIBUTE_REPORTS_READY or os.environ.get(ATTRIBUTE_REPORTS_ENV) == "1"
 ORDERS = {"worksheet": "Worksheet order", "filename": "File name order",
           "filetime": "File time order (when each log file was saved)", "timestamp": "Timestamp order (File assignments)",
           "confirmed": "Rows are in measurement order (I confirm)"}
-CHECK_MARKS = {OK: "✓", INFO: "i", CAUTION: "!"}
+CHECK_TOPICS = {"Amount of data": "Sample Size", "Distinct categories": "NDC"}  # how the Checks tab names a check
+GRR_COLUMNS = 7  # the most columns of the tables of the Details: the ANOVA table has 6, Assessment Disagreement 7
+WARNING_MARK = "  ⚠"  # after a Test Item whose data checks need a look: it says nothing about the acceptance result
+CHART_SCALES = (("auto", "Auto"), ("full", "Full Limits"))  # the horizontal scale of a capability histogram
 FILE_ORDERS = ("worksheet", "confirmed")  # a RawData.xlsx has no files of its own to order by
 STUDY_FACTORS = (1, 2, 3, 4, 5, 6)  # Study Variation = k x SD; 6 is the usual choice (+/- 3 sigma)
-PREVIEW_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "lsl", "usl", "unit", "source")  # all kept with each row
+PREVIEW_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "lsl", "usl", "unit", "source", "standard")  # all kept with each row
 DISPLAY_COLUMNS = ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")  # the ones the table shows
+ATTRIBUTE_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "standard")  # ratings have no limits or unit
 ALL_ITEMS = "All Test Items"
 SECTION_NAMES = {"charts": "Charts", "observations": "Observations used (Excel only)"}
 
@@ -100,6 +145,7 @@ class ValidationWorkspace(ttk.Frame):
         self.study: Study | None = None
         self.dataset: Dataset | None = None
         self.imported: ImportedData | None = None
+        self.ratings: ImportedRatings | None = None  # a ratings table (CSV or XLSX) imported for Attribute Agreement
         self.mapping_source: MappingSource | None = None
         self.grouped: Mapping[str, Sequence[LogRecord]] = {}
         self.components: tuple[str, ...] = ()
@@ -121,6 +167,10 @@ class ValidationWorkspace(ttk.Frame):
         self._dataset_generation = 0
         self._visible: list = []
         self._charts: list = []
+        self._marked: set[str] = set()  # the rows of the table with a warning mark
+        self._scaled = False  # the chart shown is a capability histogram, whose horizontal scale can be chosen
+        self._advanced_open = False  # Details: whether the user left Advanced Details open
+        self._advanced_item = ""
         self.preparing = False
         self.running = False
         self.export_busy = False
@@ -171,13 +221,20 @@ class ValidationWorkspace(ttk.Frame):
         self.stale_var = tk.StringVar()
         self.summary_var = tk.StringVar()
         self.notes_var = tk.StringVar()
+        self.chart_scale_var = tk.StringVar(value=CHART_SCALES[0][0])
+        self.ndc_var = tk.StringVar()
+        self.tables_note_var = tk.StringVar()  # the one line under the tables of an Attribute Agreement item
+        self.confidence_var = tk.StringVar(value=CONFIDENCE_LEVELS[1])  # Attribute Agreement: 95 %
+        self.agreement_var = tk.StringVar(value="90")  # its minimum percent agreement, used only when acceptance is on
+        self.all_columns_var = tk.BooleanVar(value=False)  # Gage R&R Details: the essential columns, or all of them
         self.review_var = tk.StringVar()
         self.coverage_var = tk.StringVar()
         self.report_var = tk.StringVar()
 
     def _wire(self) -> None:
         setup = (self.method_var, self.study_factor_var, self.assign_var, self.repeats_var,
-                 self.profile_var, self.within_var, self.subgroup_var, self.index_var, self.threshold_var, self.judge_var)
+                 self.profile_var, self.within_var, self.subgroup_var, self.index_var, self.threshold_var, self.judge_var,
+                 self.confidence_var, self.agreement_var)
         for variable in setup:
             variable.trace_add("write", self._settings_changed)
         self.method_var.trace_add("write", lambda *_: self._apply_method_layout())
@@ -240,6 +297,8 @@ class ValidationWorkspace(ttk.Frame):
         ttk.Radiobutton(kinds, text="Use Data Mapping results", variable=self.source_var, value="mapping",
                         style="Surface.TRadiobutton").pack(side="left", padx=(0, 16))
         ttk.Radiobutton(kinds, text="Import RawData.xlsx", variable=self.source_var, value="file",
+                        style="Surface.TRadiobutton").pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(kinds, text="Import ratings (CSV/XLSX)", variable=self.source_var, value="ratings",
                         style="Surface.TRadiobutton").pack(side="left")
         self.settings_button = ttk.Menubutton(top, text="Settings ▾")
         self.settings_button.pack(side="right")
@@ -272,7 +331,8 @@ class ValidationWorkspace(ttk.Frame):
         for column, (title, width, anchor) in {"test_item": ("Test Item", 220, "w"), "sample": ("Sample ID", 140, "w"),
                                                "operator": ("Operator", 80, "w"), "trial": ("Trial", 60, "center"),
                                                "value": ("Value", 120, "e"), "lsl": ("LSL", 100, "e"), "usl": ("USL", 100, "e"),
-                                               "unit": ("Unit", 60, "center"), "source": ("Source", 200, "w")}.items():
+                                               "unit": ("Unit", 60, "center"), "source": ("Source", 200, "w"),
+                                               "standard": ("Standard", 90, "w")}.items():
             self.preview.heading(column, text=title, anchor=anchor)
             self.preview.column(column, width=width, minwidth=50, anchor=anchor, stretch=column == "test_item")
         self.preview.tag_configure("inferred", foreground=self.palette.muted)  # a Trial counted from the row order, not read from the data
@@ -295,11 +355,14 @@ class ValidationWorkspace(ttk.Frame):
                         value="grr", style="Surface.TRadiobutton").grid(row=4, column=0, sticky="w", pady=(4, 0))
         ttk.Radiobutton(tab, text="Process Capability – Cp/Cpk, Pp/Ppk",
                         variable=self.method_var, value="capability", style="Surface.TRadiobutton").grid(row=5, column=0, sticky="w")
+        ttk.Radiobutton(tab, text="Attribute Agreement – PASS/FAIL ratings",
+                        variable=self.method_var, value="attribute", style="Surface.TRadiobutton").grid(row=6, column=0, sticky="w")
 
         self.grr_setup = ttk.Frame(tab, style="Surface.TFrame")
         self.cap_setup = ttk.Frame(tab, style="Surface.TFrame")
-        for frame in (self.grr_setup, self.cap_setup):
-            frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        self.attr_setup = ttk.Frame(tab, style="Surface.TFrame")
+        for frame in (self.grr_setup, self.cap_setup, self.attr_setup):
+            frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
             frame.columnconfigure(1, weight=1)
 
         def hint(parent, text, row, column=1, **grid):
@@ -356,6 +419,20 @@ class ValidationWorkspace(ttk.Frame):
         ttk.Label(self.advanced, textvariable=self.within_hint_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
         self.advanced.grid_remove()
 
+        attr = self.attr_setup
+        ttk.Label(attr, text="Confidence level", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
+        level = ttk.Frame(attr, style="Surface.TFrame")
+        level.grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Combobox(level, textvariable=self.confidence_var, values=CONFIDENCE_LEVELS, state="readonly", width=6).pack(side="left")
+        ttk.Label(level, text="for the interval of each percent agreement", style="SurfaceHint.TLabel").pack(side="left", padx=8)
+        ttk.Checkbutton(attr, text="Enable acceptance criteria", variable=self.judge_var,
+                        style="Surface.TCheckbutton").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.agreement_row = ttk.Frame(attr, style="Surface.TFrame")  # only while the criteria are enabled
+        self.agreement_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(2, 3))
+        ttk.Label(self.agreement_row, text="Minimum agreement", style="SurfaceHint.TLabel").pack(side="left")
+        ttk.Entry(self.agreement_row, textvariable=self.agreement_var, width=6).pack(side="left", padx=(8, 4))
+        ttk.Label(self.agreement_row, text="% for Within Appraisers and vs Standard, each on its own", style="SurfaceHint.TLabel").pack(side="left")
+
     def _build_results(self) -> None:
         tab = self.results_tab
         tab.rowconfigure(1, weight=1)
@@ -403,6 +480,8 @@ class ValidationWorkspace(ttk.Frame):
         self.table_bars = (ys, xs)
         self.table.configure(yscrollcommand=lambda lo, hi: self._scrolled(ys, lo, hi), xscrollcommand=lambda lo, hi: self._scrolled(xs, lo, hi))
         self.table.bind("<<TreeviewSelect>>", self._select_result)
+        self.table.bind("<Button-1>", self._table_click, add="+")  # the warning mark leads to the Checks
+        self.table.bind("<Motion>", self._table_hover)
         self.review_label = ttk.Label(table_page, textvariable=self.review_var, style="SurfaceHint.TLabel", wraplength=700, justify="left")
         self.review_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.review_label.grid_remove()
@@ -421,12 +500,18 @@ class ValidationWorkspace(ttk.Frame):
         self.split.add(right, weight=3)
         chart_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
         chart_page.columnconfigure(0, weight=1)
-        chart_page.rowconfigure(0, weight=1)
+        chart_page.rowconfigure(1, weight=1)
         self.result_tabs.add(chart_page, text="Charts")
+        self.chart_tools = ttk.Frame(chart_page, style="Surface.TFrame")  # only for a capability histogram
+        self.chart_tools.grid(row=0, column=0, columnspan=2, sticky="e", pady=(0, 2))
+        for column, (value, text) in enumerate(CHART_SCALES):
+            ttk.Radiobutton(self.chart_tools, text=text, value=value, variable=self.chart_scale_var, style="Toolbutton",
+                            command=self._draw_chart).grid(row=0, column=column, padx=(0 if column == 0 else 2, 0))
+        self.chart_tools.grid_remove()
         self.chart_canvas = tk.Canvas(chart_page, bg="white", highlightthickness=0, height=200)
-        self.chart_canvas.grid(row=0, column=0, sticky="nsew")
+        self.chart_canvas.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(chart_page, orient="vertical", command=self.chart_canvas.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
+        scroll.grid(row=1, column=1, sticky="ns")
         self.chart_canvas.configure(yscrollcommand=lambda lo, hi: self._scrolled(scroll, lo, hi))
         self.chart_canvas.bind("<Configure>", lambda _e: self._draw_chart())
         self.chart_canvas.bind("<MouseWheel>", lambda e: self.chart_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
@@ -435,16 +520,77 @@ class ValidationWorkspace(ttk.Frame):
         session_page.columnconfigure(0, weight=1)
         session_page.rowconfigure(0, weight=1)
         self.result_tabs.add(session_page, text="Details")
-        self.session = ReadOnlyText(session_page, self.palette, height=8, width=60)
+        self.session = ReadOnlyText(session_page, self.palette, height=8, width=60)  # an item that could not be analysed: why
         self.session.text.configure(font=("Consolas", 10), wrap="none")
         self.session.grid(row=0, column=0, sticky="nsew")
+        self.details_frame = ttk.Frame(session_page, style="Surface.TFrame")  # a capability item: its figures as a table
+        self.details_frame.grid(row=0, column=0, sticky="nsew")
+        self.details_frame.columnconfigure(0, weight=1)
+        self.details_frame.rowconfigure(0, weight=1)
+        self.details = ttk.Treeview(self.details_frame, columns=("value",), show="tree headings", selectmode="none", height=10,
+                                    style="Compact.Treeview")
+        self.details.heading("#0", text="Metric", anchor="w")
+        self.details.heading("value", text="Value", anchor="e")
+        self.details.column("#0", width=200, minwidth=120, stretch=True)
+        self.details.column("value", width=130, minwidth=80, stretch=False, anchor="e")
+        self.details.tag_configure("group", font=("Segoe UI Semibold", 10))
+        details_bar = ttk.Scrollbar(self.details_frame, orient="vertical", command=self.details.yview)
+        details_bar.grid(row=0, column=1, sticky="ns")
+        self.details.configure(yscrollcommand=lambda lo, hi: self._scrolled(details_bar, lo, hi))
+        self.details.grid(row=0, column=0, sticky="nsew")
+        self.details.bind("<Button-1>", self._details_click, add="+")
+        for event in ("<<TreeviewOpen>>", "<<TreeviewClose>>"):
+            self.details.bind(event, lambda _e: self.after_idle(self._remember_advanced))
+        self.details_frame.grid_remove()
 
-        checks_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
+        self.grr_frame = ttk.Frame(session_page, style="Surface.TFrame")  # a Gage R&R item: its tables, NDC above them
+        self.grr_frame.grid(row=0, column=0, sticky="nsew")
+        self.grr_frame.columnconfigure(0, weight=1)
+        self.grr_frame.rowconfigure(1, weight=1)
+        headline = self.grr_headline = ttk.Frame(self.grr_frame, style="Surface.TFrame")  # NDC and the column choice: Gage R&R only
+        headline.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        headline.columnconfigure(2, weight=1)
+        ttk.Label(headline, text="Number of Distinct Categories (NDC)", style="Surface.TLabel").grid(row=0, column=0)
+        self.ndc_label = ttk.Label(headline, textvariable=self.ndc_var, style="Section.TLabel")
+        self.ndc_label.grid(row=0, column=1, padx=(8, 0))
+        ttk.Checkbutton(headline, text="All columns", variable=self.all_columns_var, style="Toolbutton",
+                        command=lambda: self._show_details(self.selected_result())).grid(row=0, column=3, sticky="e")
+        names = tuple(f"c{i}" for i in range(GRR_COLUMNS))
+        self.grr_tree = ttk.Treeview(self.grr_frame, columns=names, show=(), selectmode="none", height=10, style="Compact.Treeview")
+        self.grr_tree.column("c0", width=230, minwidth=170, stretch=True, anchor="w")
+        for name in names[1:]:
+            self.grr_tree.column(name, width=96, minwidth=70, stretch=False, anchor="e")
+        grr_y = ttk.Scrollbar(self.grr_frame, orient="vertical", command=self.grr_tree.yview)
+        grr_y.grid(row=1, column=1, sticky="ns")
+        grr_x = ttk.Scrollbar(self.grr_frame, orient="horizontal", command=self.grr_tree.xview)
+        grr_x.grid(row=2, column=0, sticky="ew")
+        self.grr_tree.configure(yscrollcommand=lambda lo, hi: self._scrolled(grr_y, lo, hi),
+                                xscrollcommand=lambda lo, hi: self._scrolled(grr_x, lo, hi))
+        self.grr_tree.grid(row=1, column=0, sticky="nsew")
+        self.tables_note = ttk.Label(self.grr_frame, textvariable=self.tables_note_var, style="SurfaceHint.TLabel", wraplength=640,
+                                     justify="left")
+        self.tables_note.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.tables_note.grid_remove()
+        self.grr_frame.grid_remove()
+
+        checks_page = self.checks_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
         checks_page.columnconfigure(0, weight=1)
         checks_page.rowconfigure(0, weight=1)
         self.result_tabs.add(checks_page, text="Checks")
-        self.checks_view = ReadOnlyText(checks_page, self.palette, height=8, width=60)
-        self.checks_view.grid(row=0, column=0, sticky="nsew")
+        self.checks_tree = ttk.Treeview(checks_page, columns=("result", "status"), show="tree headings", selectmode="none", height=8,
+                                        style="Compact.Treeview")  # Check | Result | Status, a section for the data and one for the guidelines
+        for column, text, width, anchor, stretch in (("#0", "Check", 150, "w", False), ("result", "Result", 300, "w", True),
+                                                      ("status", "Status", 70, "w", False)):
+            self.checks_tree.heading(column, text=text, anchor="w")
+            self.checks_tree.column(column, width=width, minwidth=60, stretch=stretch, anchor=anchor)
+        self.checks_tree.tag_configure("group", font=("Segoe UI Semibold", 10))
+        checks_y = ttk.Scrollbar(checks_page, orient="vertical", command=self.checks_tree.yview)
+        checks_y.grid(row=0, column=1, sticky="ns")
+        self.checks_tree.configure(yscrollcommand=lambda lo, hi: self._scrolled(checks_y, lo, hi))
+        self.checks_tree.grid(row=0, column=0, sticky="nsew")
+        self.notes_link = ttk.Button(checks_page, text="Notes on this analysis…", command=self.show_notes)  # what the report says about the readings
+        self.notes_link.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.notes_link.grid_remove()
 
     @staticmethod
     def _scrolled(bar: ttk.Scrollbar, low: str, high: str) -> None:
@@ -591,22 +737,32 @@ class ValidationWorkspace(ttk.Frame):
         self.review_label.configure(foreground=palette.warn)
         for status, color in (("PASS", palette.ok), ("CONDITIONAL PASS", palette.warn), ("FAIL", palette.danger), ("N/A", palette.muted)):
             self.table.tag_configure(status, foreground=color)
-        for view in (self.session, self.checks_view):
-            view.text.configure(bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
-                                highlightbackground=palette.line, highlightcolor=palette.accent)
-        for tag, color in ((OK, palette.ok), (CAUTION, palette.warn), (INFO, palette.muted)):
-            self.checks_view.text.tag_configure(tag, foreground=color)
+        self.session.text.configure(bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
+                                    highlightbackground=palette.line, highlightcolor=palette.accent)
+        for status, color in (("Critical", palette.danger), ("Issue", palette.danger), ("Review", palette.warn), ("Info", palette.muted),
+                              ("OK", palette.muted)):  # a guideline is never a verdict colour
+            self.checks_tree.tag_configure(status, foreground=color)
+        for tree in (self.checks_tree, self.details):
+            tree.tag_configure("group", background=palette.soft)
+        self.grr_tree.tag_configure("section", background=palette.soft, foreground=palette.fg, font=("Segoe UI Semibold", 10))
+        self.grr_tree.tag_configure("head", foreground=palette.muted, font=("Segoe UI Semibold", 9))
         self.item_list.configure(bg=palette.surface, fg=palette.fg, selectbackground=palette.accent,
                                  selectforeground=palette.on_accent, highlightbackground=palette.line, highlightcolor=palette.accent)
 
     # ------------------------------------------------------------------ layout switches
     def _apply_method_layout(self) -> None:
-        capability = self.method_var.get() == "capability"
-        (self.grr_setup.grid_remove if capability else self.grr_setup.grid)()
-        (self.cap_setup.grid if capability else self.cap_setup.grid_remove)()
-        self.sort_combo.configure(values=("Test Item", "Cpk", "Ppk") if capability else ("Test Item", "%SV/Tol", "%Study Var", "NDC"))
+        method = self.method_var.get()
+        for name, frame in (("grr", self.grr_setup), ("capability", self.cap_setup), ("attribute", self.attr_setup)):
+            (frame.grid if method == name else frame.grid_remove)()
+        self.sort_combo.configure(values={"capability": ("Test Item", "Cpk", "Ppk"),
+                                          "attribute": ("Test Item", "Within %", "vs Standard %", "Kappa")}.get(
+            method, ("Test Item", "%SV/Tol", "%Study Var", "NDC")))
         if self.sort_var.get() not in self.sort_combo.cget("values"):
             self.sort_var.set("Test Item")
+        attribute = method == "attribute"  # ratings have a Rating and a Standard, no limits or unit
+        self.preview.configure(displaycolumns=ATTRIBUTE_COLUMNS if attribute else DISPLAY_COLUMNS)
+        self.preview.heading("value", text="Rating" if attribute else "Value")
+        self.preview.heading("operator", text="Appraiser" if attribute else "Operator")
 
     def _toggle_advanced(self) -> None:
         if self.advanced.winfo_manager():
@@ -617,7 +773,8 @@ class ValidationWorkspace(ttk.Frame):
             self.advanced_button.configure(text="Advanced Settings ▾")
 
     def _apply_judge_layout(self) -> None:
-        (self.criteria_row.grid if self.judge_var.get() else self.criteria_row.grid_remove)()
+        for row in (self.criteria_row, self.agreement_row):  # the threshold of the method on screen; the other one is hidden with its frame
+            (row.grid if self.judge_var.get() else row.grid_remove)()
 
     def _apply_source_layout(self) -> None:
         """What belongs to the chosen source: File assignments only for Data Mapping results that exist; the choice file for an import."""
@@ -627,6 +784,7 @@ class ValidationWorkspace(ttk.Frame):
                 frame.pack(side="left", padx=(16, 0))
             else:
                 frame.pack_forget()
+        self.file_button.configure(text="Import ratings…" if self.source_var.get() == "ratings" else "Choose file…")
         keys = list(ORDERS) if mapping else list(FILE_ORDERS)
         self.order_menu.delete(0, "end")
         self.order_menu.add_command(label="Order of the readings", state="disabled")
@@ -672,7 +830,45 @@ class ValidationWorkspace(ttk.Frame):
         if self.source_var.get() == "mapping":
             self._prepare_dataset()
 
+    def choose_ratings(self) -> None:
+        path = filedialog.askopenfilename(parent=self._dialog_parent(), title="Choose a ratings table",
+                                          filetypes=[("CSV or Excel", "*.csv *.xlsx *.txt *.tsv"), ("All files", "*.*")])
+        if not path:
+            return
+        name = Path(path).name
+        self.message_var.set(f"Reading {name}…")
+        self.preparing = True
+        self._refresh_state()
+
+        def failed(exc):
+            self.preparing = False
+            self.message_var.set(f"Could not read {name}: {exc}")
+            self._refresh_state()
+
+        def loaded(table):
+            self.preparing = False
+            self.message_var.set("Choose the columns of the ratings, then press Import.")
+            self._refresh_state()
+            RatingsImportDialog(self._dialog_parent(), table, self._ratings_ready)
+
+        self.tasks.run(lambda _report: read_ratings_table(path), on_success=loaded, on_error=failed)
+
+    def _ratings_ready(self, imported: ImportedRatings) -> None:
+        """The user imported a ratings table: Attribute Agreement is its method, and its dataset is the study's data."""
+        self.ratings = imported
+        self.file_var.set(str(imported.record.get("file", "")))
+        self._ready_message = (f"Imported {imported.ratings} ratings of {imported.samples} samples. "
+                               "Press Run analysis, or set up the study first.")
+        if self.method_var.get() != "attribute":
+            self.method_var.set("attribute")
+        if self.source_var.get() != "ratings":
+            self.source_var.set("ratings")  # prepares the dataset
+        else:
+            self._prepare_dataset()
+
     def choose_file(self) -> None:
+        if self.source_var.get() == "ratings":
+            return self.choose_ratings()
         path = filedialog.askopenfilename(parent=self._dialog_parent(), title="Choose a RawData.xlsx",
                                           filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
         if path:
@@ -701,7 +897,7 @@ class ValidationWorkspace(ttk.Frame):
 
     def data_edited(self) -> None:
         """File assignments or the order changed: take a new snapshot."""
-        if self.mapping_source is not None or self.imported is not None:
+        if self.mapping_source is not None or self.imported is not None or self.ratings is not None:
             self._prepare_dataset()
 
     def _prepare_dataset(self) -> None:
@@ -717,9 +913,10 @@ class ValidationWorkspace(ttk.Frame):
             def work(_report):
                 return build_mapping_dataset(source, assignments, order)
         else:
-            imported = self.imported
+            ratings = self.source_var.get() == "ratings"
+            imported = self.ratings if ratings else self.imported
             if imported is None:
-                self._clear_dataset("Choose a RawData.xlsx to analyse.")
+                self._clear_dataset("Import a ratings table (CSV or XLSX) to analyse." if ratings else "Choose a RawData.xlsx to analyse.")
                 return
 
             def work(_report):
@@ -757,9 +954,12 @@ class ValidationWorkspace(ttk.Frame):
         self._refresh_state()
 
     def _mapping_record(self) -> dict:
-        return {"source": self.source_var.get(), "components": list(self.components) if self.source_var.get() == "mapping" else [],
-                "assignments": {k: dict(v) for k, v in self.assignments.items()},
-                "order": self._order_key(), "file": self.file_var.get() if self.source_var.get() == "file" else ""}
+        record = {"source": self.source_var.get(), "components": list(self.components) if self.source_var.get() == "mapping" else [],
+                  "assignments": {k: dict(v) for k, v in self.assignments.items()},
+                  "order": self._order_key(), "file": self.file_var.get() if self.source_var.get() == "file" else ""}
+        if self.source_var.get() == "ratings" and self.ratings is not None:
+            record["ratings"] = self.ratings.record  # which column holds what, and the categories: part of what the results depend on
+        return record
 
     def _dataset_ready(self, dataset: Dataset) -> None:
         self.dataset = dataset
@@ -780,7 +980,9 @@ class ValidationWorkspace(ttk.Frame):
         dataset, study = self.dataset, self.study
         if dataset is None or study is None:
             return
-        rows, warnings = dataset.observations, list(self.imported.warnings) if self.source_var.get() == "file" and self.imported else []
+        source = self.source_var.get()
+        carried = self.imported if source == "file" else self.ratings if source == "ratings" else None  # what the import said
+        rows, warnings = dataset.observations, list(carried.warnings) if carried else []
         try:
             rows = study.analysis_observations()
         except DesignError as exc:
@@ -791,10 +993,13 @@ class ValidationWorkspace(ttk.Frame):
                 if not study.options.assign_trials and any(not str(row.trial).strip() for row in rows):
                     warnings.append("These readings have no Trial. Turn on trial labelling in the Analysis tab, or give each file its "
                                     "trial in File assignments.")
+            elif study.options.method == "attribute":
+                warnings += attribute_warnings(rows)
             elif dataset.order_basis == "worksheet":
                 warnings.append("The readings are in worksheet order, which is not a verified order of measurement. Capability depends "
                                 "on that order: choose another in Settings.")
-        self.dataset_var.set(self._summary(rows))
+        attribute = study.options.method == "attribute"
+        self.dataset_var.set(attribute_summary(rows) if attribute else self._summary(rows))
         self.hint_var.set("  ".join(warnings))
         (self.hint_label.grid if warnings else self.hint_label.grid_remove)()
         items = list(dict.fromkeys(str(row.test_item) for row in rows))
@@ -804,8 +1009,8 @@ class ValidationWorkspace(ttk.Frame):
         self.preview.delete(*self.preview.get_children())
         for index, (row, trial, inferred) in enumerate(listed[:PREVIEW_ROWS]):
             self.preview.insert("", "end", iid=str(index), tags=("inferred",) if inferred else (), values=(
-                row.test_item, row.sample_id, row.operator, trial, self._cell(row.value), self._cell(row.lsl), self._cell(row.usl),
-                row.unit, row.source))
+                row.test_item, row.sample_id, row.operator or ("1" if attribute else ""), trial, self._cell(row.value),
+                self._cell(row.lsl), self._cell(row.usl), row.unit, row.source, row.standard))
         shown = min(PREVIEW_ROWS, len(listed))
         note = f"Showing the first {shown} of {len(listed)} readings." if shown < len(listed) else f"{len(listed)} readings."
         if any(inferred for _, _, inferred in listed[:shown]):
@@ -886,6 +1091,10 @@ class ValidationWorkspace(ttk.Frame):
             options = StatisticalOptions(method="grr", study_factor=float(factor),
                                          expected_repeats=int_field(self.repeats_var.get(), "Readings per sample", 2),
                                          assign_trials=self.assign_var.get())
+        elif method == "attribute":
+            design = {}  # the ratings are analysed as they are
+            level, _minimum = attribute_settings(self.confidence_var.get(), self.judge_var.get(), self.agreement_var.get())
+            options = StatisticalOptions(method="attribute", confidence=level)
         else:
             design = {"subgroup_from_sample": self.subgroup_var.get()}
             within = self._within_key()
@@ -906,6 +1115,9 @@ class ValidationWorkspace(ttk.Frame):
         if method == "grr":
             customer = self.profile_var.get()
             return EvaluationSettings(profile=customer, criteria=self.customers[customer])
+        if method == "attribute":
+            _level, minimum = attribute_settings(self.confidence_var.get(), True, self.agreement_var.get())
+            return EvaluationSettings(agreement_min=minimum)
         try:
             threshold = float(self.threshold_var.get())
         except ValueError:
@@ -955,7 +1167,11 @@ class ValidationWorkspace(ttk.Frame):
         if self.study is None or self.dataset is None:
             return ""
         items, samples = len(self.dataset.items), len({o.sample_id for o in self.dataset.observations})
-        return f"{items} Test Item{'s' if items != 1 else ''} · {samples} Sample{'s' if samples != 1 else ''}"
+        line = f"{items} Test Item{'s' if items != 1 else ''} · {samples} Sample{'s' if samples != 1 else ''}"
+        if self.study.options.method == "attribute":
+            appraisers = len({o.operator for o in self.dataset.observations})
+            line += f" · {appraisers} Appraiser{'s' if appraisers != 1 else ''}"
+        return line
 
     def _within_text(self) -> str:
         """Which within sigma is in use (it may be chosen from the subgroup size), shown with the advanced settings."""
@@ -968,6 +1184,9 @@ class ValidationWorkspace(ttk.Frame):
     def run_analysis(self) -> None:
         study = self.study
         if study is None or self.busy:
+            return
+        if self.method_var.get() == "attribute" and not attribute_runnable():
+            self.message_var.set(ATTRIBUTE_PENDING)
             return
         self._settings_changed()
         if self.setup_error:
@@ -1055,11 +1274,13 @@ class ValidationWorkspace(ttk.Frame):
         has_data = self.dataset is not None and self.study is not None
         has_result = self.result_set is not None and self.evaluated is not None
         stale = self.stale
-        self.run_button.configure(state="normal" if has_data and not self.setup_error and not self.busy else "disabled")
+        pending = ATTRIBUTE_PENDING if self.method_var.get() == "attribute" and not attribute_runnable() else ""
+        blocked = self.setup_error or pending
+        self.run_button.configure(state="normal" if has_data and not blocked and not self.busy else "disabled")
         for tab, enabled in ((self.setup_tab, has_data), (self.results_tab, has_result), (self.report_tab, has_result)):
             self.tabs.tab(tab, state="normal" if enabled else "disabled")
-        if self.setup_error:
-            self.message_var.set(self.setup_error)
+        if blocked:
+            self.message_var.set(blocked)
         self.plan_var.set(self._plan_text())
         self.plan_title_var.set(PLAN_TITLES[self.method_var.get()] if self.dataset is not None else "")
         self.within_hint_var.set(self._within_text())
@@ -1069,14 +1290,18 @@ class ValidationWorkspace(ttk.Frame):
             self.stale_banner.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         else:
             self.stale_banner.grid_remove()
-        self.update_button.configure(state="normal" if has_data and not self.setup_error and not self.busy else "disabled")
-        reportable = has_result and not stale and not self.busy
+        self.update_button.configure(state="normal" if has_data and not blocked and not self.busy else "disabled")
+        withheld = has_result and self.evaluated.record.method == "attribute" and not attribute_reportable()
+        reportable = has_result and not stale and not self.busy and not withheld
         for button in (self.pdf_button, self.excel_button):
             button.configure(state="normal" if reportable else "disabled")
         self._refresh_notes()
-        if has_result and stale and not self.report_var.get().startswith("Saved"):
+        if withheld:
+            self.report_var.set(ATTRIBUTE_REPORT_PENDING)
+        elif has_result and stale and not self.report_var.get().startswith("Saved"):
             self.report_var.set("Update the results before generating a report.")
-        elif has_result and not stale and self.report_var.get().startswith("Update the results"):
+        elif (has_result and not stale and self.report_var.get().startswith("Update the results")) or \
+                self.report_var.get() == ATTRIBUTE_REPORT_PENDING:
             self.report_var.set("")
 
     def _problems(self) -> list[tuple[str, str]]:
@@ -1086,24 +1311,14 @@ class ValidationWorkspace(ttk.Frame):
         return [(stat.label, issue.message) for stat in self.result_set.statistics for issue in stat.issues if issue.severity == "error"]
 
     def _refresh_notes(self) -> None:
-        conditions = self.evaluated.record.validation.conditions if self.evaluated else ()
         failed = {label for label, _ in self._problems()}
-        if failed:
+        if failed:  # what has to be fixed; every other note is on the Checks tab
             self.notes_var.set(f"{len(failed)} item{'s' if len(failed) != 1 else ''} could not be analysed. Read the notes to see what to fix.")
             self.notes_label.configure(foreground=self.palette.warn)
             self.notes_bar.grid()
-            return
-        if not conditions:
-            self.notes_bar.grid_remove()
-            return
-        important = [SHORT_NOTES.get(c.code, c.code) for c in conditions if c.severity.value == "warning"]
-        if important:
-            self.notes_var.set("Keep in mind: " + ", ".join(important) + ".")
-            self.notes_label.configure(foreground=self.palette.warn)
         else:
-            self.notes_var.set(f"{len(conditions)} note{'s' if len(conditions) != 1 else ''} on this analysis.")
-            self.notes_label.configure(foreground=self.palette.muted)
-        self.notes_bar.grid()
+            self.notes_var.set("")
+            self.notes_bar.grid_remove()
 
     # ------------------------------------------------------------------ results
     def _refresh_table(self) -> None:
@@ -1117,20 +1332,12 @@ class ValidationWorkspace(ttk.Frame):
             self.review_var.set("")
             self.review_label.grid_remove()
             self.chart_canvas.delete("all")
-            self.session.set_text("")
-            self.checks_view.set_parts([])
+            self._marked = set()
+            self._show_details(None)
+            self._show_checks(None)
             return
         judged = evaluated.record.judged
-        if judged:
-            counts: dict[str, int] = {}
-            for result in results:
-                counts[result.status] = counts.get(result.status, 0) + 1
-            self.summary_var.set(f"{len(results)} items · " + " · ".join(f"{n} {status}" for status, n in counts.items()))
-        else:
-            self.summary_var.set(f"{len(results)} items · statistics only")
-        attention = sum(1 for result in results if needs_attention(self._checks.get(result.label, ([], []))[0]))
-        if attention:
-            self.summary_var.set(f"{self.summary_var.get()} · {attention} with data checks to review (Checks tab)")
+        self.summary_var.set(summary_line(results, judged, sum(1 for result in results if self._needs_review(result))))
         if judged and not self.filter_combo.winfo_manager():
             self.filter_combo.grid(row=0, column=2, padx=(6, 0))  # filtering by result needs criteria
         elif not judged:
@@ -1148,7 +1355,7 @@ class ValidationWorkspace(ttk.Frame):
             self.review_label.grid_remove()
         query, wanted = self.search_var.get().casefold(), self.filter_var.get() if judged else STATUSES[0]
         self._visible = [r for r in results if query in r.label.casefold() and (wanted == STATUSES[0] or r.status == wanted)]
-        metric = {"Cpk": "cpk", "Ppk": "ppk", "%SV/Tol": "percent_tolerance", "%Study Var": "percent_study_var", "NDC": "ndc"}.get(self.sort_var.get())
+        metric = SORT_KEYS.get(self.sort_var.get())
         self._visible.sort(key=lambda r: (r.metrics.get(metric) is None, r.metrics.get(metric) or 0) if metric else (r.test_item, r.system))
         if not self._visible:
             self._charts = []
@@ -1161,17 +1368,24 @@ class ValidationWorkspace(ttk.Frame):
         self.table.configure(columns=tuple(str(i) for i in range(len(headers))))
         status_column = next((i for i, h in enumerate(headers) if h in ("Result", "Acceptance Result")), None)
         precision = self._precision()
-        for i, heading in enumerate(headers):
-            self.table.heading(str(i), text=heading)
-            wide = 180 if i == 0 else 140 if heading in ("Review", "Acceptance Result", "Result") else 80
-            self.table.column(str(i), width=wide, minwidth=70, stretch=i == 0, anchor="w" if i == 0 or heading == "Review" else "e")
+        self._marked, shown = set(), []
         for i, row in enumerate(all_rows):
-            values = [display_number(row[k], 2 if "%" in all_headers[k] else precision) for k in keep]
-            tags = ()
+            values = [summary_number(row[k], all_headers[k], precision, self._visible[i].method) for k in keep]
+            if self._needs_review(self._visible[i]):
+                values[0] += WARNING_MARK
+                self._marked.add(str(i))
             if status_column is not None:
                 values[status_column] = self._visible[i].status
-                tags = (values[status_column],)
-            self.table.insert("", "end", iid=str(i), values=values, tags=tags)
+            shown.append(values)
+        body, heading_font = self._table_fonts()
+        for i, heading in enumerate(headers):  # a column is as wide as its heading and its widest figure need; text left, figures right
+            fit = max(heading_font.measure(heading) + 36, *(body.measure(values[i]) + 28 for values in shown))
+            anchor = "w" if i == 0 or i == status_column or heading == "Review" else "e"
+            self.table.heading(str(i), text=heading, anchor=anchor)
+            self.table.column(str(i), width=max(fit, 150 if i == 0 else 56), minwidth=max(fit, 120 if i == 0 else 56),
+                              stretch=i == 0, anchor=anchor)
+        for i, values in enumerate(shown):
+            self.table.insert("", "end", iid=str(i), values=values, tags=(values[status_column],) if status_column is not None else ())
         self.set_palette(self.palette)
         self.table.selection_set("0")
         self._select_result()
@@ -1189,29 +1403,162 @@ class ValidationWorkspace(ttk.Frame):
     def _select_result(self, *_) -> None:
         result = self.selected_result()
         self._charts = report_charts(result, titled=True) if result else []
+        self._scaled = result is not None and result.method == "capability"
+        (self.chart_tools.grid if self._scaled else self.chart_tools.grid_remove)()
         self._draw_chart()
         self.selected_var.set(item_label(result) if result else "")
-        self.session.set_text(session_text(result, self._precision()) if result else "")
+        self._show_details(result)
         self._show_checks(result)
 
+    def _table_click(self, event) -> None:
+        row = self.table.identify_row(event.y)
+        if self.table.identify_column(event.x) == "#1" and self._on_mark(row, event.x):
+            self.table.selection_set(row)
+            self.result_tabs.select(self.checks_page)
+
+    def _table_hover(self, event) -> None:
+        self.table.configure(cursor="hand2" if self.table.identify_column(event.x) == "#1"
+                             and self._on_mark(self.table.identify_row(event.y), event.x) else "")
+
+    def _table_fonts(self) -> tuple[tkfont.Font, tkfont.Font]:
+        """The fonts of the cells and of the headings of a table, to size its columns by."""
+        style = ttk.Style(self)
+
+        def font(element: str, fallback: str) -> tkfont.Font:
+            try:
+                return tkfont.Font(root=self, font=style.lookup(element, "font") or fallback)
+            except tk.TclError:
+                return tkfont.nametofont("TkDefaultFont", root=self)
+        return font("Treeview", "TkDefaultFont"), font("Treeview.Heading", "TkHeadingFont")
+
+    def _needs_review(self, result) -> bool:
+        """Does a data check, or a guideline about the amount of data, ask for a look at this item? (The AIAG bands do not.)
+        An item that could not be analysed is counted as that, not here; one that was analysed but has a Critical finding (an
+        unusable Standard) is."""
+        checks, guidelines = self._checks.get(result.label, ([], []))
+        return needs_attention([*checks, *guidelines]) or (result.valid and any(check.status == CRITICAL for check in checks))
+
+    def _on_mark(self, row: str, x: int) -> bool:
+        """Is the pointer on the warning mark that ends the Test Item of this row?"""
+        cell = self.table.bbox(row, "0") if row in self._marked else None
+        if not cell:
+            return False
+        font = self._table_fonts()[0]
+        text = str(self.table.set(row, "0"))
+        return cell[0] + font.measure(text.removesuffix(WARNING_MARK)) <= x <= cell[0] + font.measure(text) + 12
+
+    def _show_details(self, result) -> None:
+        """The figures of the item as tables: Process Capability in groups, Gage R&R as its ANOVA table, Variance Components
+        and Gage Evaluation. An item that could not be analysed says why, as text."""
+        shown = result.method if result is not None and result.valid else ""
+        tables = "grr" if shown == "attribute" else shown  # Gage R&R and Attribute Agreement share one table view
+        for name, frame in (("capability", self.details_frame), ("grr", self.grr_frame)):
+            (frame.grid if tables == name else frame.grid_remove)()
+        (self.session.grid_remove if shown else self.session.grid)()
+        if not shown:
+            self.session.set_text(session_text(result, self._precision()) if result else "")
+            return
+        if shown == "grr":
+            self._fill_grr_details(result)
+            return
+        if shown == "attribute":
+            self._fill_attribute_details(result)
+            return
+        self.details.delete(*self.details.get_children())
+        for group, rows in capability_details(result, self._precision()):
+            advanced = group == "Advanced Details"
+            parent = self.details.insert("", "end", text=group, tags=("group",), open=self._advanced_open if advanced else True)
+            if advanced:
+                self._advanced_item = parent
+            for metric, value in rows:
+                self.details.insert(parent, "end", text=metric, values=(value,))
+
+    def _insert_tables(self, tables) -> None:
+        """A title row, the column names in the columns they name, then the figures, for each table."""
+        self.grr_tree.delete(*self.grr_tree.get_children())
+        blank = ("",) * (GRR_COLUMNS - 1)
+        for table in tables:
+            self.grr_tree.insert("", "end", values=(table.title, *blank), tags=("section",))
+            self.grr_tree.insert("", "end", values=table.headers, tags=("head",))
+            for row in table.rows:
+                self.grr_tree.insert("", "end", values=row)
+
+    def _fill_grr_details(self, result) -> None:
+        self.ndc_var.set(detail_cell(result.metrics.get("ndc"), "int"))
+        self.grr_headline.grid()
+        self.tables_note.grid_remove()
+        self.grr_tree.column("c4", width=96)
+        self._insert_tables(grr_details(result, self._precision(), self.all_columns_var.get()))
+
+    def _fill_attribute_details(self, result) -> None:
+        tables, notes = attribute_details(result, self._precision())
+        self.grr_headline.grid_remove()
+        self.grr_tree.column("c4", width=130)  # the confidence interval
+        self._insert_tables(tables)
+        self.tables_note_var.set("  ".join(notes))
+        (self.tables_note.grid if notes else self.tables_note.grid_remove)()
+
+    def _details_click(self, event) -> None:
+        """A group opens and closes by its name as well as by its arrow."""
+        row = self.details.identify_row(event.y)
+        if row and self.details.get_children(row) and "indicator" not in self.details.identify_element(event.x, event.y):
+            self.details.item(row, open=not self.details.item(row, "open"))
+            self._remember_advanced()
+
+    def _remember_advanced(self) -> None:
+        if self._advanced_item and self.details.exists(self._advanced_item):
+            self._advanced_open = bool(self.details.item(self._advanced_item, "open"))
+
     def _show_checks(self, result) -> None:
-        """What to look at before trusting this result, and the published guidelines for its figures."""
+        """Check | Result | Status. First what the checks found in the data (nothing is listed for a check that passed), then the
+        guidelines: published figures to compare with. A guideline is OK or Review, never a verdict. The longer explanations are
+        in About the method."""
+        tree = self.checks_tree
+        tree.delete(*tree.get_children())
+        attribute = result is not None and result.method == "attribute"
+        tree.heading("result", text="Finding" if attribute else "Result")
         if result is None:
-            self.checks_view.set_parts([])
+            self.notes_link.grid_remove()
             return
         checks, guidelines = self._checks.get(result.label, ([], []))
-        parts: list[tuple[str, str | None]] = [("Data checks\n", "heading")]
-        for check in checks:
-            parts += [(f"{CHECK_MARKS[check.status]}  {check.topic}: ", check.status), (f"{check.message}\n", None)]
+        if attribute:
+            self._show_attribute_checks(checks)
+            return
+        issues, limitations = findings(checks)
+        section = tree.insert("", "end", text="Data Checks", tags=("group",), open=True)
+        if not issues and not limitations:
+            tree.insert(section, "end", text="All checks", values=("No data issues detected.", "OK"), tags=("OK",))
+        for check in (*issues, *limitations):
+            self._check_row(section, check, False)
         if guidelines:
-            parts.append(("\nGuidelines (AIAG, as Minitab quotes them). They help a judgement; they are not a verdict.\n", "heading"))
-            for guideline in guidelines:
-                parts += [(f"•  {guideline.topic}: ", INFO), (f"{guideline.message}\n", None)]
-        parts.append(("\nThese checks change no figure and are not printed in the report.", INFO))
-        self.checks_view.set_parts(parts)
+            section = tree.insert("", "end", text="Guidelines (reference only)", tags=("group",), open=True)
+            for check in guidelines:
+                self._check_row(section, check, True)
+        notes = self.evaluated is not None and (self.evaluated.record.validation.conditions or self._problems())
+        (self.notes_link.grid if notes else self.notes_link.grid_remove)()
+
+    def _show_attribute_checks(self, checks) -> None:
+        """Check | Finding | Status for an Attribute Agreement item: Critical (cannot be calculated), Review (a statistic is limited)
+        or Info (an optional design choice). The findings are everything there is to say, so there is no link to more notes."""
+        section = self.checks_tree.insert("", "end", text="Data Checks", tags=("group",), open=True)
+        if not checks:
+            self.checks_tree.insert(section, "end", text="All checks", values=("No data issues detected.", "OK"), tags=("OK",))
+        for check in checks:
+            self._check_row(section, check, False, attribute=True)
+        self.notes_link.grid_remove()
+
+    def _check_row(self, parent: str, check, guideline: bool, attribute: bool = False) -> None:
+        status = attribute_status_label(check) if attribute else status_label(check, guideline)
+        self.checks_tree.insert(parent, "end", text=CHECK_TOPICS.get(check.topic, check.topic), values=(check.short.removesuffix("."), status), tags=(status,))
 
     def _draw_chart(self) -> None:
-        draw_tk_charts(self.chart_canvas, self._charts, columns=1 if len(self._charts) == 1 else 2)
+        draw_tk_charts(self.chart_canvas, self._charts, columns=1 if len(self._charts) == 1 else 2,
+                       x_scale=self.chart_scale_var.get() if self._scaled else None, compact=True)
+        selected = self.selected_result()
+        note = agreement_chart_note(selected) if selected is not None and selected.method == "attribute" else ""
+        if note and not self._charts:  # an analysed item that has no panel: which one it would need
+            self.chart_canvas.create_text(16, 16, anchor="nw", fill=self.palette.muted, font=("Segoe UI", 10), text=note,
+                                          width=max(200, self.chart_canvas.winfo_width() - 32))
 
     # ------------------------------------------------------------------ explanations
     def _config(self):
@@ -1263,6 +1610,9 @@ class ValidationWorkspace(ttk.Frame):
 
     def generate_report(self, suffix: str) -> None:
         if self.export_busy:
+            return
+        if self.study is not None and self.study.options.method == "attribute" and not attribute_reportable():
+            self.report_var.set(ATTRIBUTE_REPORT_PENDING)
             return
         if self.stale:
             self.report_var.set("Update the results before generating a report.")

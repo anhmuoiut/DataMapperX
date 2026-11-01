@@ -29,8 +29,8 @@ def validate_criteria(criteria: Sequence[Criterion]) -> None:
 
 
 def validate_config(config: AnalysisConfig) -> None:
-    if config.method not in {"capability", "grr"}:
-        raise ValueError("Select capability or grr; attribute studies are unsupported.")
+    if config.method not in {"capability", "grr", "attribute"}:
+        raise ValueError("Select capability, grr or attribute.")
     if config.within_method not in {"individuals", "pooled"}:
         raise ValueError("Within sigma method must be individuals or pooled.")
     for name in ("cpk_threshold", "percent_pass", "percent_fail", "study_factor"):
@@ -56,6 +56,15 @@ def validate_config(config: AnalysisConfig) -> None:
         raise ValueError("Expected repetitions must be an integer of at least two.")
     if isinstance(config.precision, bool) or not isinstance(config.precision, int) or not 0 <= config.precision <= 10:
         raise ValueError("Display precision must be an integer from 0 to 10.")
+    if isinstance(config.confidence, bool) or not isinstance(config.confidence, (int, float)) or not 0 < config.confidence < 1:
+        raise ValueError("confidence must be greater than 0 and less than 1.")
+    validate_agreement_min(config.agreement_min)
+
+
+def validate_agreement_min(value) -> None:
+    """The lowest acceptable percent agreement: None (no acceptance), or a number above 0 and up to 100."""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100):
+        raise ValueError("Minimum agreement must be a percentage above 0 and at most 100.")
 
 
 def common_validation(rows: Sequence[Observation]) -> tuple[list[float], float | None, float | None, list[Issue]]:

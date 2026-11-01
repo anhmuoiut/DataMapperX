@@ -99,7 +99,7 @@ Runtime dependencies are only `openpyxl`, `sv-ttk`, `reportlab`. This is already
 | Tables | `QTableView` + one read-only `QAbstractTableModel` | Replaces `DataGrid`; rows are virtual, so cost does not grow with row count. Row/cell tags map to `BackgroundRole`. |
 | Add/remove list (+ / ×) | `QListView`/`QTableView` + a paint/click **delegate** | Replaces `ActionList`; avoids one widget per row. |
 | Charts | Paint existing `chart_primitives()` with `QPainter` in a plain `QWidget` | No `QtCharts`, no matplotlib. PDF and Excel keep using reportlab/openpyxl unchanged. |
-| Background work | `QThreadPool` + `QRunnable`, results delivered by signals | Keep the same `run(work, on_success, on_error, on_progress)` signature so call sites barely change; the GC workaround disappears. |
+| Background work | `QThreadPool` + `QRunnable`, results delivered by signals | Keep the same `run(work, on_success, on_error, on_progress)` signature so call sites barely change. The GC rule of `ui/tasks.py` does not simply disappear: a widget without a parent that a reference cycle keeps alive is destroyed by the cyclic collector on whichever thread runs it, and on a pool thread that crashes the process (`docs/qt-widget-ownership.md`, `tools/qt_ownership_repro.py`). Parent every widget, delete with `deleteLater()` on the GUI thread, avoid cycles through widgets, and keep pausing the collector around tasks until a soak run shows the rule holds. |
 | Tests | `pytest` + `QT_QPA_PLATFORM=offscreen` + `QtTest` | Headless: UI tests stop opening real windows. No `pytest-qt` needed at first. |
 | Python | Keep `>=3.11` | PySide6 6.12 ran on 3.12 here; CI uses 3.13. |
 
@@ -201,7 +201,7 @@ Work on a branch; the tkinter app stays shippable until cutover. Each phase ends
 | *Gate 1: go / no-go* | Proposed thresholds (adjust to taste): packaged size ≤ 2.5× today after trimming; cold start of the one-file exe ≤ 1.5× today; RSS ≤ today; smooth scrolling at 100k rows; antivirus does not flag the build. | |
 | **2. Data Mapping** | Step 1 and Step 2 screens, profile manager, sample wizard, duplicate / update / access / about / export-done dialogs, and the shared widget kit. | largest (≈ 70% of UI lines) |
 | **3. Validation & Reports** | Data, Analysis, Results (QPainter charts), Report; criteria dialogs. | large (≈ 25% of UI lines) |
-| **4. Cutover** | New entry point, update `DataMapperX.spec` (hidden imports, excludes, icon), CI (add `QT_QPA_PLATFORM=offscreen`), README, `--smoke-test` in Qt; delete tkinter, `sv-ttk`, `tasks.py` GC hack. | small |
+| **4. Cutover** | New entry point, update `DataMapperX.spec` (hidden imports, excludes, icon), CI (add `QT_QPA_PLATFORM=offscreen`), README, `--smoke-test` in Qt; delete tkinter and `sv-ttk`. Keep the `tasks.py` GC rule until the ownership rule of `docs/qt-widget-ownership.md` is shown to hold for every widget. | small |
 
 Effort *(rough, order-of-magnitude, not a commitment)*: on the order of 1.5–2 months for one developer; the UI is ~6,200 lines to rewrite and ~2,700 lines of UI tests to port, partly offset by ~850 lines of custom canvas code that Qt provides. AI assistance shortens writing, but review and Windows verification do not shrink in proportion.
 
@@ -212,6 +212,7 @@ Effort *(rough, order-of-magnitude, not a commitment)*: on the order of 1.5–2 
 | One-file startup (unpacking ~80 MB on every start) and antivirus on Windows | Medium | Medium | Measure at Gate 1; trim Qt; fall back to one-dir distribution if the gate fails. Size itself is no longer a concern (§4.4). |
 | Subtle UI behaviour drift (duplicate-component flow, access gating, update flow, validation staleness) | Medium | Medium | Map each of the 120 UI tests to a Qt test and track them in a table; use README/CHANGELOG as a feature checklist. |
 | UI test rewrite is large | Certain | Medium | Phase 0b first: most assertions move to widget-free `workflow` tests. |
+| Qt object ownership: a widget without a parent, kept alive by a reference cycle, is destroyed by the cyclic collector on the thread that happens to allocate (a `QThreadPool` thread during a scan); the process then crashes later in `QTimerInfoList::activateTimers`, a segfault and not an exception | Medium (reproduced 6 of 6 in a minimal program; the prototype's own code does not do it, but nothing prevents it) | High | Ownership rule for Phases 2 to 4: every widget has a parent or is deleted with `deleteLater()` on the GUI thread; no reference cycle through a widget (a signal connected to a closure that captures it); the GC pause around tasks stays until a soak run (the Qt test module repeated, `tools/qt_ownership_repro.py` as the control) shows it is unnecessary. See `docs/qt-widget-ownership.md`. |
 | Statistical drift | Low | High | Engine untouched; layered gates (§5.3). |
 | Bit-exact baseline stays fragile across machines | Certain until fixed | Medium | Phase 0. |
 | Self-update with a larger exe | Low | Medium | Updater logic unchanged; test download/replace at the new size. |

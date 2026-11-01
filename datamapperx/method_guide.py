@@ -15,6 +15,7 @@ from .statistics.models import MR_D2, AnalysisConfig
 
 GRR_METHOD = "One-way ANOVA (Single Tester)"
 CAPABILITY_METHOD = "Normal capability analysis (within and overall standard deviation)"
+ATTRIBUTE_METHOD = "Exact agreement intervals and Fleiss' kappa"
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +210,20 @@ def capability_values(result, config: AnalysisConfig) -> tuple[tuple[str, str], 
     return tuple(rows)
 
 
+def _attribute_guide(config: AnalysisConfig) -> Guide:
+    """Attribute Agreement Analysis in words: its formulas are the plain-text sections of ``statistics/formulas.py``."""
+    from .statistics.formulas import formula_sections
+
+    sections = tuple(Section(heading, notes=tuple(line for line in text.split("\n") if line), opened=index < 3)
+                     for index, (heading, text) in enumerate(formula_sections(config)))
+    return Guide("Attribute Agreement Analysis", ATTRIBUTE_METHOD,
+                 "How well categorical ratings, such as PASS and FAIL, agree with themselves and with a known Standard.", sections)
+
+
 def method_guide(config: AnalysisConfig, result=None) -> Guide:
     """The guide for the analysis in ``config``. With a ``result`` it ends with the values of that item."""
+    if config.method == "attribute":
+        return _attribute_guide(config)
     return _grr_guide(config, result) if config.method == "grr" else _capability_guide(config, result)
 
 

@@ -14,6 +14,10 @@ NDC_FACTOR = 1.41
 GRR_METRICS = ("sigma_grr", "sigma_part", "sigma_total", "percent_tolerance", "percent_study_var", "ndc",
                "variance_repeatability", "variance_part", "variance_total", "study_var", "sigma_reproducibility",
                "sigma_repeatability", "variance_reproducibility", "variance_grr")
+# Every Attribute Agreement result carries the same keys. Percentages are 0 to 100; the single-appraiser ones are None
+# when the study has several appraisers (each one is then in the details).
+ATTRIBUTE_METRICS = ("within_percent", "within_matched", "within_inspected", "standard_percent", "standard_matched",
+                     "standard_inspected", "kappa_within", "kappa_standard", "between_percent", "all_standard_percent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +35,7 @@ class Observation:
     unit: str = ""
     source: str = ""
     subgroup: str = ""
+    standard: str = ""  # Attribute Agreement: the known correct rating of the sample (empty: not known)
 
 
 CRITERION_METRICS = ("percent_tolerance", "percent_study_var", "ndc")
@@ -70,13 +75,18 @@ class AnalysisConfig:
     # Gage R&R acceptance per customer. When set, the overall result is the worst of the applied criteria and
     # profile / decision_metric / percent_pass / percent_fail / ndc_min are ignored.
     criteria: tuple[Criterion, ...] | None = None
+    # Attribute Agreement: the confidence level of the intervals (statistical), and the lowest percent agreement that is
+    # acceptable (evaluation; None: no acceptance is applied).
+    confidence: float = 0.95
+    agreement_min: float | None = None
 
 
 # Every AnalysisConfig field is exactly one of these. Statistical fields decide the numbers; evaluation fields decide
 # PASS/FAIL from those numbers; display fields only change how they are shown.
 STATISTICAL_FIELDS = ("method", "within_method", "use_unbiasing", "study_factor", "expected_repeats", "assign_trials",
-                      "interaction_alpha")
-EVALUATION_FIELDS = ("cpk_threshold", "profile", "decision_metric", "percent_pass", "percent_fail", "ndc_min", "criteria")
+                      "interaction_alpha", "confidence")
+EVALUATION_FIELDS = ("cpk_threshold", "profile", "decision_metric", "percent_pass", "percent_fail", "ndc_min", "criteria",
+                     "agreement_min")
 DISPLAY_FIELDS = ("precision",)
 
 

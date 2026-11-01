@@ -21,7 +21,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .acceptance import acceptance, acceptance_conflicts, decision_metric, describe_criteria, metric_label
+from .acceptance import (
+    acceptance,
+    acceptance_conflicts,
+    attribute_acceptance,
+    decision_metric,
+    describe_criteria,
+    metric_label,
+)
 from .models import (
     CONDITIONAL,
     NOT_EVALUATED,
@@ -32,7 +39,7 @@ from .models import (
     Issue,
     StatisticsResult,
 )
-from .validation import validate_criteria
+from .validation import validate_agreement_min, validate_criteria
 
 # ----------------------------------------------------------------------------- evaluation settings
 
@@ -47,11 +54,12 @@ class EvaluationSettings:
     percent_fail: float = 30.0
     ndc_min: int = 5
     criteria: tuple[Criterion, ...] | None = None
+    agreement_min: float | None = None  # Attribute Agreement: lowest acceptable percent agreement; None: no acceptance
 
 
 def evaluation_settings(config: AnalysisConfig) -> EvaluationSettings:
     return EvaluationSettings(config.cpk_threshold, config.profile, config.decision_metric, config.percent_pass,
-                              config.percent_fail, config.ndc_min, config.criteria)
+                              config.percent_fail, config.ndc_min, config.criteria, config.agreement_min)
 
 
 def combine_config(statistics, settings: EvaluationSettings, precision: int = 3) -> AnalysisConfig:
@@ -60,6 +68,7 @@ def combine_config(statistics, settings: EvaluationSettings, precision: int = 3)
         method=statistics.method, within_method=statistics.within_method, use_unbiasing=statistics.use_unbiasing,
         study_factor=statistics.study_factor, expected_repeats=statistics.expected_repeats,
         assign_trials=statistics.assign_trials, interaction_alpha=statistics.interaction_alpha,
+        confidence=statistics.confidence, agreement_min=settings.agreement_min,
         cpk_threshold=settings.cpk_threshold, profile=settings.profile, decision_metric=settings.decision_metric,
         percent_pass=settings.percent_pass, percent_fail=settings.percent_fail, ndc_min=settings.ndc_min,
         criteria=settings.criteria, precision=precision)
@@ -73,6 +82,7 @@ def validate_evaluation_settings(settings, method: str | None = None) -> None:
             raise ValueError(f"{name} must be positive and finite.")
     if settings.criteria is not None:
         validate_criteria(settings.criteria)
+    validate_agreement_min(settings.agreement_min)
     if settings.percent_fail < settings.percent_pass:
         raise ValueError("The conditional upper boundary must be at least the pass boundary.")
     allowed = {"percent_tolerance", "percent_study_var", "ndc"} | ({"cpk", "ppk"} if method in (None, "capability") else set())
@@ -85,8 +95,25 @@ def validate_evaluation_settings(settings, method: str | None = None) -> None:
 # ----------------------------------------------------------------------------- evaluating
 
 
+def _attribute_result(stat: StatisticsResult, config: AnalysisConfig, judged: bool) -> AnalysisResult:
+    """An Attribute Agreement result: the statistics, and Within and vs Standard judged on their own when ``judged``."""
+    details = dict(stat.details)
+    facts = stat.facts
+    details.update({key: facts[key] for key in ("sample_count", "measurement_count", "valid_numeric_count", "lsl", "usl")})
+    status, selected = NOT_EVALUATED, ""
+    if judged:
+        status, parts = attribute_acceptance(stat.details, config.agreement_min) if stat.valid else (NOT_EVALUATED, {})
+        selected = "agreement" if config.agreement_min is not None else ""
+        details.update({"agreement_min": config.agreement_min, "agreement_status": parts})
+    return AnalysisResult(stat.method, stat.test_item, stat.system, stat.n, stat.parts, stat.repeats, stat.mean,
+                          stat.minimum, stat.maximum, stat.lsl, stat.usl, stat.unit, dict(stat.metrics), status, selected,
+                          tuple(dict.fromkeys(stat.issues)), details, stat.observations, config)
+
+
 def evaluate_one(stat: StatisticsResult, config: AnalysisConfig) -> AnalysisResult:
     """Judge one statistics result. The logic, issue order and details order are those ``analyze`` has always produced."""
+    if config.method == "attribute":
+        return _attribute_result(stat, config, True)
     status, selected_metric = acceptance(stat.metrics, config)
     if not stat.valid:
         # Partial/invalid data cannot receive a statistical acceptance decision.
@@ -128,6 +155,8 @@ def criteria_snapshot(settings, method: str) -> dict[str, Any]:
     """Everything that decides PASS/FAIL for ``method``, in a form that can be stored and hashed."""
     if method == "capability":
         return {"kind": "capability", "cpk_threshold": settings.cpk_threshold}
+    if method == "attribute":
+        return {"kind": "attribute", "agreement_min": settings.agreement_min}
     if settings.criteria is not None:
         return {"kind": "customer-criteria", "profile": settings.profile,
                 "criteria": [[c.metric, c.enabled, c.pass_limit, c.fail_limit] for c in settings.criteria]}
@@ -231,6 +260,8 @@ def detect_conditions(statistics: Sequence[StatisticsResult], method: str, order
     Items whose data are invalid already carry their own errors, so they add no note.
     """
     valid = [stat for stat in statistics if stat.valid]
+    if method == "attribute":
+        return ()
     if method == "capability":
         found: list[Condition] = []
         if order_basis != "acquisition":
@@ -275,6 +306,8 @@ def detect_conditions(statistics: Sequence[StatisticsResult], method: str, order
 
 def evaluate_unjudged(stat: StatisticsResult, config: AnalysisConfig) -> AnalysisResult:
     """The statistics as a result with no criteria applied: no status, no decision metric, no Review flag."""
+    if config.method == "attribute":
+        return _attribute_result(stat, config, False)
     details = dict(stat.details)
     facts = stat.facts
     details.update({key: facts[key] for key in ("sample_count", "measurement_count", "valid_numeric_count", "lsl", "usl")})

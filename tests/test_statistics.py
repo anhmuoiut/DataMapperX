@@ -361,7 +361,7 @@ def test_custom_profile_thresholds():
     assert result.status == PASS and result.decision_metric == "percent_study_var"
 
 
-@pytest.mark.parametrize("kwargs", [{"method": "attribute"}, {"within_method": "overall"}, {"cpk_threshold": 0},
+@pytest.mark.parametrize("kwargs", [{"method": "unknown"}, {"within_method": "overall"}, {"cpk_threshold": 0},
                                      {"cpk_threshold": math.nan}, {"percent_pass": 40, "percent_fail": 30},
                                      {"study_factor": math.inf}, {"expected_repeats": 1}, {"expected_repeats": 2.5},
                                      {"ndc_min": 0}, {"precision": 11}, {"decision_metric": "all"}])

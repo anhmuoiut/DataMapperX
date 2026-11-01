@@ -11,9 +11,11 @@ from datamapperx.statistics.checks import (
     CAUTION,
     INFO,
     OK,
+    Check,
     anderson_darling_normal,
     capability_checks,
     describe_layouts,
+    findings,
     grr_amount_checks,
     grr_guidelines,
     i_mr_signals,
@@ -22,6 +24,7 @@ from datamapperx.statistics.checks import (
     normality_check,
     result_checks,
     stability_check,
+    status_label,
 )
 
 
@@ -89,7 +92,8 @@ def metrics(sv=None, tol=None, vg=None, vt=None, ndc=None):
                                         (30.01, "above 30 %")])
 def test_the_study_variation_guideline_bands(value, word):
     (check,) = grr_guidelines(metrics(sv=value))
-    assert check.topic == "%Study Var" and word in check.message and check.status == INFO  # a guideline, never a verdict colour
+    assert check.topic == "%Study Var" and word in check.message and check.status == (OK if word == "below 10 %" else INFO)
+    assert status_label(check, guideline=True) == ("OK" if check.status == OK else "Review")  # never an Issue, never PASS or FAIL
 
 
 def test_the_contribution_and_distinct_category_guidelines():
@@ -213,21 +217,75 @@ def test_capability_checks_report_amount_stability_and_normality():
 
 
 # ----------------------------------------------------------------------------- the real results
+def test_a_status_is_ok_review_or_issue_and_a_guideline_is_never_an_issue():
+    checks = [Check("x", status, "message") for status in (OK, INFO, CAUTION)]
+    assert [status_label(c) for c in checks] == ["OK", "Review", "Issue"]
+    assert [status_label(c, guideline=True) for c in checks] == ["OK", "Review", "Review"]
+
+
+def test_a_negative_variance_estimate_is_a_data_check_apart_from_the_guidelines():
+    base = (5.00, 5.02, 5.04)  # every part gets the same three readings: the parts do not differ at all
+    same = [Observation("F", f"P{part}", base[(trial + part) % 3], 4, 6, trial=str(trial + 1)) for part in range(12) for trial in range(3)]
+    checks, guidelines = result_checks(analyze(same, AnalysisConfig(method="grr"))[0], order_known=False)
+    assert [(c.topic, c.status) for c in checks] == [("Variance estimate", CAUTION)]
+    assert checks[0].short == "Negative part-to-part variance estimate set to 0." and status_label(checks[0]) == "Issue"
+    assert [g.topic for g in guidelines][:1] == ["Parts"] and all(status_label(g, guideline=True) in ("OK", "Review") for g in guidelines)
+    spread = [Observation("F", f"P{part}", part * 0.1 + 5 + 0.01 * ((part * 7 + trial * 3) % 5), 4, 9, trial=str(trial + 1))
+              for part in range(12) for trial in range(3)]
+    assert result_checks(analyze(spread, AnalysisConfig(method="grr"))[0], order_known=False)[0] == []  # nothing found, nothing listed
+
+
 def test_result_checks_for_a_crossed_study_and_for_capability():
     # give the readings some spread so that the study can be analysed
     noisy = [Observation(o.test_item, o.sample_id, o.value + 0.01 * ((i * 7) % 5), 0, 20, trial=o.trial, operator=o.operator)
              for i, o in enumerate(rows(parts=10))]
     crossed = analyze(noisy, AnalysisConfig(method="grr", assign_trials=True))[0]
     checks, guidelines = result_checks(crossed, order_known=False)
-    assert [c.topic for c in checks] == ["Parts", "Operators"] and checks[1].status == INFO  # 3 operators, 10 parts
+    assert [c.topic for c in guidelines[:2]] == ["Parts", "Operators"] and guidelines[1].status == INFO  # 3 operators, 10 parts
     assert {g.topic for g in guidelines} >= {"%Study Var", "%Contribution"}
+    assert {c.topic for c in checks} <= {"Variance estimate", "Repeatability"}  # the data checks: only what the analysis reported
 
     rng = random.Random(5)
     cap_rows = [Observation("C", f"S{i}", rng.gauss(50, 1), 40, 60) for i in range(40)]
     capability = analyze(cap_rows, AnalysisConfig(method="capability"))[0]
     checks, guidelines = result_checks(capability, order_known=False, order_note=" Order note.")
-    assert guidelines == [] and {c.topic for c in checks} == {"Stability", "Normality", "Amount of data"}
+    assert {c.topic for c in checks} == {"Stability", "Normality"} and [g.topic for g in guidelines] == ["Amount of data"]
     assert "Order note." in next(c for c in checks if c.topic == "Stability").message
 
     broken = analyze([Observation("B", "S1", "n/a", 0, 1)], AnalysisConfig(method="capability"))[0]
     assert result_checks(broken, order_known=False)[0][0].topic == "Data"
+
+
+# ----------------------------------------------------------------------------- the short lines of a capability item
+def test_findings_leave_out_a_check_that_passed_and_keep_the_figures_in_one_short_line():
+    steady = quantiles(120, seed=1)
+    assert findings(capability_checks(steady, individuals=True, order_known=True)) == ([], [])  # nothing to say
+    issues, limitations = findings(capability_checks(steady[:30], individuals=True, order_known=True))
+    assert [c.topic for c in issues] == ["Amount of data"] and limitations == []
+    assert issues[0].short == "Limited (N = 30; 100 or more recommended)." and "Only 30 observations" in issues[0].message
+    pooled_issues, pooled_notes = findings(capability_checks(steady, individuals=False, order_known=True))
+    assert pooled_issues == [] and [c.short for c in pooled_notes] == ["Not assessed for subgroup data (use an Xbar-S chart)."]
+
+
+def test_the_normality_line_gives_the_p_value_and_the_threshold():
+    rng = random.Random(0)
+    skewed = [rng.expovariate(1.0) for _ in range(30)]
+    check = normality_check(skewed)
+    assert check.status == CAUTION and check.short == "Failed (Anderson–Darling p = 0.006, below 0.05)."
+    assert normality_check([math.exp(i / 3) for i in range(40)]).short == "Failed (Anderson–Darling p < 0.001)."
+    assert normality_check(quantiles(40, seed=2)).short.startswith("Passed (Anderson–Darling p")
+    assert normality_check([1.0, 2.0, 3.0]).short == "Not tested (N = 3; at least 8 needed)."
+
+
+def test_sequence_signals_without_a_known_order_are_a_note_not_a_warning():
+    drifting = [10.0 + 0.1 * i for i in range(30)]
+    known = stability_check(drifting, order_known=True, order_note="")
+    assert known.status == CAUTION and known.short == "24 points beyond 3σ (first: reading 1); run of 9 or more (from reading 9)."
+    unknown = stability_check(drifting, order_known=False, order_note="")
+    assert unknown.status == INFO and not needs_attention([unknown])  # worksheet order is not evidence of drift over time
+    assert unknown.short == f"Worksheet order, not verified as time order: {known.short}"
+    assert "Possible instability" in unknown.message  # the full statement stays available
+    steady = [10.0, 10.1, 9.9, 10.05, 9.95, 10.0, 10.1, 9.9, 10.05, 9.95, 10.0, 10.1]
+    assert stability_check(steady, order_known=False, order_note="").short == (
+        "Worksheet order, not verified as time order; stability over time not assessed.")
+    assert stability_check(steady, order_known=True, order_note="").status == OK  # verified order, no signal: nothing to show

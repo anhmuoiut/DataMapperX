@@ -12,12 +12,15 @@ from openpyxl import load_workbook
 from datamapperx.stat_charts import ChartSeries, ChartSpec, chart_primitives, charts_for_result, draw_tk_chart
 from datamapperx.stat_reports import (
     ReportContext,
+    capability_details,
     capability_indices,
     capability_ppm,
     capability_tables,
+    detail_cell,
     display_number,
     export_statistical_report,
     format_value,
+    grr_details,
     grr_tables,
     item_label,
     session_text,
@@ -543,3 +546,77 @@ def test_packaged_smoke_check_fails_when_pdf_dependency_is_missing(tmp_path, mon
     monkeypatch.setattr(reports, "_export_pdf", missing_dependency)
     with pytest.raises(ModuleNotFoundError, match="reportlab"):
         _check_statistical_reports(tmp_path / "reports")
+
+
+# ----------------------------------------------------------------------------- the Details table of a capability item
+def test_capability_details_group_the_figures_and_use_the_same_values_as_the_report():
+    result = capability()  # limits 0 and 6
+    groups = dict(capability_details(result, 2))
+    assert list(groups) == ["Specification", "Variation", "Capability", "Advanced Details"]
+    assert [name for name, _ in groups["Specification"]] == ["LSL", "USL"]
+    assert [name for name, _ in groups["Variation"]] == ["Sample N", "Mean", "Within SD", "Overall SD"]
+    assert [name for name, _ in groups["Capability"]] == ["Cp", "Cpk", "Pp", "Ppk"]
+    shown = {name: value for rows in groups.values() for name, value in rows}
+    assert shown["Sample N"] == "40" and shown["LSL"] == "0.00" and shown["USL"] == "6.00"
+    assert all(shown[key.capitalize()] == f"{result.metrics[key]:.2f}" for key in ("cp", "cpk", "pp", "ppk"))
+    idx = capability_indices(result.mean, result.lsl, result.usl, result.metrics["sigma_within"], result.metrics["sigma_overall"])
+    assert shown["CPL"] == f"{idx['cpl']:.2f}" and shown["PPU"] == f"{idx['ppu']:.2f}"
+    ppm = capability_ppm(result)
+    assert shown["Observed PPM Total"] == f"{ppm['observed'][2]:.2f}" and shown["Expected Within PPM Total"] == f"{ppm['within'][2]:.2f}"
+    assert [name for name, _ in groups["Advanced Details"]] == [
+        "CPL", "CPU", "PPL", "PPU", *(f"{kind} PPM {side}" for kind in ("Observed", "Expected Within", "Expected Overall")
+                                      for side in ("< LSL", "> USL", "Total"))]
+
+
+def test_capability_details_follow_the_decimals_and_say_n_a_for_what_is_not_defined():
+    result = capability()
+    assert dict(dict(capability_details(result, 4))["Capability"])["Cpk"] == f"{result.metrics['cpk']:.4f}"
+    one_sided = analyze([Observation("C", str(i), 2.5 + (i % 7) * 0.4, 0, None, source=f"log{i}.txt") for i in range(40)], AnalysisConfig())[0]
+    shown = {name: value for _, rows in capability_details(one_sided) for name, value in rows}
+    assert shown["USL"] == "N/A" and shown["Cp"] == "N/A" and shown["Pp"] == "N/A" and shown["CPU"] == "N/A"
+    assert shown["Cpk"] != "N/A" and shown["Observed PPM > USL"] == "N/A" and shown["Observed PPM < LSL"] != "N/A"
+
+
+def test_grr_details_are_the_three_tables_of_the_report_with_the_essential_columns_first():
+    result = grr()
+    tables = grr_details(result, 2)
+    assert [t.title for t in tables] == ["One-Way ANOVA", "Variance Components", "Gage Evaluation"]  # ANOVA, components, evaluation: apart
+    assert [t.headers for t in tables] == [("Source", "DF", "MS", "F", "P"), ("Source", "VarComp", "%Contribution"),
+                                           ("Source", "StdDev (SD)", "%Study Var", "%Tolerance")]
+    full = grr_details(result, 2, all_columns=True)
+    assert full[0].headers == ("Source", "DF", "SS", "MS", "F", "P") and full[1].headers == tables[1].headers
+    assert full[2].headers == ("Source", "StdDev (SD)", "Study Var (6 × SD)", "%Study Var", "%Tolerance")
+    for table, report in zip(full, grr_tables(result), strict=True):  # the same figures, row for row, as the report prints
+        assert [row[0] for row in table.rows] == [row[0] for row in report.rows]
+        for shown_row, printed_row in zip(table.rows, report.cells(2), strict=True):
+            for shown, printed in zip(shown_row, printed_row, strict=True):
+                assert shown == printed or (shown == "N/A" and printed == "*") or (shown.startswith("<") and float(printed) == 0), (shown, printed)
+    assert [row[0] for row in tables[2].rows] == ["Total Gage R&R", "  Repeatability", "Part-To-Part", "Total Variation"]
+    assert dict((row[0], row[2]) for row in tables[1].rows)["Total Variation"] == "100.00"
+    assert tables[0].rows[-1] == ("Total", str(result.details["anova"][-1]["df"]), "", "", "")  # the cells that are blank stay blank
+
+
+def test_a_gage_evaluation_without_tolerance_has_no_tolerance_column_and_k_names_the_study_variation():
+    result = grr(low=None, high=None)
+    assert "%Tolerance" not in grr_details(result)[2].headers
+    sixes = grr_details(result, 2, all_columns=True)[2].headers
+    assert "Study Var (6 × SD)" in sixes
+
+
+def test_grr_details_never_show_a_small_figure_as_zero():
+    assert detail_cell(1.84897e-06, "var", 2) == "0.00000185" and detail_cell(0.0005278, "var", 2) == "0.0005278"
+    assert detail_cell(1e-12, "var", 2) == "1.000e-12" and detail_cell(0.0, "var", 2) == "0.0000000"  # a real zero stays zero
+    assert detail_cell(0.0004, "p") == "<0.001" and detail_cell(0.0123, "p") == "0.012" and detail_cell(0.004, "pct") == "<0.01"
+    assert detail_cell(None, "var") == "N/A" and detail_cell("", "var") == "" and detail_cell(9, "int") == "9"
+    for table in grr_details(tiny_grr(), 2, all_columns=True):
+        for row in table.rows:
+            for cell in row[1:]:
+                assert cell in ("", "N/A") or cell.startswith("<") or float(cell) != 0, (table.title, row)
+
+
+def test_capability_details_never_round_a_small_measurement_to_zero_or_use_e_notation():
+    tiny = analyze([Observation("T", str(i), 5e-6 + (i % 5) * 2e-7, 0.0, 1e-5, source=f"log{i}.txt") for i in range(30)], AnalysisConfig())[0]
+    shown = {name: value for _, rows in capability_details(tiny, 2) for name, value in rows}
+    for name in ("Mean", "Within SD", "Overall SD", "USL"):
+        assert not SCIENTIFIC.search(shown[name]) and float(shown[name]) != 0, (name, shown[name])
+    assert shown["LSL"] == "0.00"  # zero stays zero

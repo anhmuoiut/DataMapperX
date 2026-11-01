@@ -43,12 +43,15 @@ class StatisticalOptions:
     expected_repeats: int | None = None
     assign_trials: bool = False
     interaction_alpha: float = 0.05
+    confidence: float = 0.95
 
     def relevant(self) -> dict[str, Any]:
         """The options that can change what the chosen method reports; changing any other one cannot.
 
         ``assign_trials`` counts for both methods because every result echoes it in its details.
         """
+        if self.method == "attribute":
+            return {name: getattr(self, name) for name in ("method", "confidence")}
         names = (("method", "within_method", "use_unbiasing", "assign_trials") if self.method == "capability" else
                  ("method", "study_factor", "expected_repeats", "assign_trials", "interaction_alpha"))
         return {name: getattr(self, name) for name in names}
@@ -59,8 +62,8 @@ class StatisticalOptions:
 
 def validate_statistical_options(options) -> None:
     """The statistical checks of ``validate_config`` (it accepts a config or ``StatisticalOptions``), same messages."""
-    if options.method not in {"capability", "grr"}:
-        raise ValueError("Select capability or grr; attribute studies are unsupported.")
+    if options.method not in {"capability", "grr", "attribute"}:
+        raise ValueError("Select capability, grr or attribute.")
     if options.within_method not in {"individuals", "pooled"}:
         raise ValueError("Within sigma method must be individuals or pooled.")
     value = options.study_factor
@@ -72,6 +75,9 @@ def validate_statistical_options(options) -> None:
     repeats = options.expected_repeats
     if repeats is not None and (not isinstance(repeats, int) or isinstance(repeats, bool) or repeats < 2):
         raise ValueError("Expected repetitions must be an integer of at least two.")
+    confidence = options.confidence
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 < confidence < 1:
+        raise ValueError("confidence must be greater than 0 and less than 1.")
 
 
 # ----------------------------------------------------------------------------- method verification
@@ -88,10 +94,13 @@ METHOD_VERIFICATION: dict[str, str] = {
     "grr_crossed_interaction_retained": PENDING_VERIFICATION,
     "capability_individuals": PENDING_VERIFICATION,
     "capability_pooled": PENDING_VERIFICATION,
+    "attribute_agreement": PENDING_VERIFICATION,
 }
 
 
 def method_key(stat: StatisticsResult, options: StatisticalOptions) -> str:
+    if options.method == "attribute":
+        return "attribute_agreement"
     if options.method == "capability":
         return f"capability_{options.within_method}"
     if not stat.facts.get("crossed"):

@@ -9,11 +9,13 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import replace
 
+from .attribute import attribute_calculation
 from .capability import capability_calculation
 from .crossed import crossed_grr_calculation
 from .evaluation import evaluate_one
 from .grr import grr_calculation
 from .models import (
+    ATTRIBUTE_METRICS,
     GRR_METRICS,
     AnalysisConfig,
     AnalysisResult,
@@ -54,7 +56,9 @@ def _compute(observations: Sequence[Observation], config: AnalysisConfig) -> lis
     """The statistics. ``config`` is read only for the statistical options; the caller has validated it."""
     grouped: dict[tuple, list[Observation]] = defaultdict(list)
     for row in observations:
-        grouped[(str(row.test_item).strip(), str(row.tester).strip(), str(row.operator).strip(), str(row.slot).strip())].append(row)
+        # An attribute study keeps its appraisers (the Operator of each rating) together: they are analysed side by side.
+        operator = "" if config.method == "attribute" else str(row.operator).strip()
+        grouped[(str(row.test_item).strip(), str(row.tester).strip(), operator, str(row.slot).strip())].append(row)
     if config.method == "grr":
         grouped = _merge_crossed(grouped)
     # A missing system identifier must not become an apparently valid unnamed system.
@@ -68,7 +72,10 @@ def _compute(observations: Sequence[Observation], config: AnalysisConfig) -> lis
         crossed = isinstance(operator, tuple)
         operator_label = ("Operators", ", ".join(operator)) if crossed else ("Operator", operator)
         system = " | ".join(f"{name}={value}" for name, value in (("Tester", tester), operator_label, ("Slot", slot)) if value)
-        values, low, high, issues = common_validation(rows)
+        if config.method == "attribute":
+            values, low, high, issues = [], None, None, []  # categorical ratings: nothing numeric to validate
+        else:
+            values, low, high, issues = common_validation(rows)
         if config.method == "grr" and config.assign_trials and all(not str(row.trial).strip() for row in rows):
             # Assign identities in the analysis snapshot; retain every original raw observation.
             trial_counts: dict[tuple[str, str], int] = defaultdict(int)
@@ -101,13 +108,19 @@ def _compute(observations: Sequence[Observation], config: AnalysisConfig) -> lis
                     mean, minimum, maximum = scaled_data(values).mean, min(values), max(values)
                 if config.method == "capability":
                     calculate = capability_calculation
+                elif config.method == "attribute":
+                    calculate = attribute_calculation
                 else:
                     calculate = crossed_grr_calculation if crossed else grr_calculation
                 metrics, details, extra = calculate(rows, values, low, high, config)
                 issues.extend(extra)
             except (ArithmeticError, ValueError) as exc:
                 issues.append(Issue("error", f"Analysis could not be estimated: {exc}"))
-        expected_metrics = ("sigma_within", "sigma_overall", "cp", "cpk", "pp", "ppk") if config.method == "capability" else GRR_METRICS
+        if config.method == "attribute":
+            repeats = details.get("trials", repeats)  # the trials of one appraiser, not of every appraiser together
+            expected_metrics = ATTRIBUTE_METRICS
+        else:
+            expected_metrics = ("sigma_within", "sigma_overall", "cp", "cpk", "pp", "ppk") if config.method == "capability" else GRR_METRICS
         for key in expected_metrics:
             metrics.setdefault(key, None)
         facts = {"sample_count": len(counts), "measurement_count": len(rows), "valid_numeric_count": len(values),

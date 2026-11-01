@@ -36,6 +36,8 @@ def operator_names(design: Mapping[str, Any]) -> tuple[str, ...]:
 
 def relevant_design(design: Mapping[str, Any], method: str) -> dict[str, Any]:
     """The part of the design that can change the statistics of ``method``."""
+    if method == "attribute":
+        return {}  # the ratings are analysed as given
     if method == "capability":
         return {"subgroup_from_sample": bool(design.get("subgroup_from_sample"))}
     return {"operators": list(operator_names(design)), "operator_order": design.get("operator_order", "by_operator"),
@@ -44,6 +46,8 @@ def relevant_design(design: Mapping[str, Any], method: str) -> dict[str, Any]:
 
 def describe_design(design: Mapping[str, Any], method: str) -> tuple[str, ...]:
     """The design in words, for the plan line and the report."""
+    if method == "attribute":
+        return ("Ratings are analysed as given: each appraiser's trials of each sample are compared with each other and with the Standard.",)
     if method == "capability":
         return (("Sample ID is used as the subgroup. Repeated readings of one sample are not rational subgroups; "
                  "this is only appropriate if that is the sampling design.") if design.get("subgroup_from_sample")
@@ -75,6 +79,8 @@ def auto_within_method(observations: Sequence[Observation]) -> str:
 def apply_design(observations: Sequence[Observation], design: Mapping[str, Any], method: str) -> tuple[Observation, ...]:
     """The observations to analyse. Returns the input unchanged when the design asks for nothing."""
     rows = tuple(observations)
+    if method == "attribute":
+        return rows
     if method == "capability":
         if design.get("subgroup_from_sample"):
             return tuple(replace(row, subgroup=safe_text(row.sample_id)) for row in rows)

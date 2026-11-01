@@ -1,7 +1,7 @@
 """An immutable dataset snapshot, with a statistical fingerprint kept apart from provenance.
 
 The **statistical fingerprint** identifies what the numbers depend on: for each test item, its observations in order
-(sample, value, limits, trial, tester, operator, slot, unit, subgroup). It does not depend on where the data came
+(sample, value, limits, trial, tester, operator, slot, unit, subgroup, and the Standard when there is one). It does not depend on where the data came
 from: not on object ids, file paths, sheet or row, timestamps or the description. Two sources holding the same data in
 the same order therefore have the same fingerprint, and the same statistics.
 
@@ -47,6 +47,8 @@ def _item_digest(name: str, rows: Sequence[Observation]) -> str:
         fields = (safe_text(row.sample_id), _canonical_value(row.value), _canonical_value(row.lsl),
                   _canonical_value(row.usl), safe_text(row.trial), safe_text(row.tester), safe_text(row.operator),
                   safe_text(row.slot), safe_text(row.unit), safe_text(row.subgroup), source)
+        if standard := safe_text(row.standard):  # data without a Standard keep the fingerprint they have always had
+            fields += (standard,)
         digest.update(("\x1f".join(_escape(item) for item in fields) + "\x1e").encode())
     return digest.hexdigest()
 

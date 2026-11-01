@@ -177,3 +177,14 @@ def test_the_guide_for_capability_follows_the_within_method_and_keeps_the_two_de
     assert "σ_within = s_p" in guide_text(method_guide(AnalysisConfig(method="capability", within_method="pooled", use_unbiasing=False)))
     for text in (individuals, pooled):
         assert "not interchangeable" in text and "σ_overall" in text and "σ_within" in text
+
+
+def test_the_guide_for_attribute_agreement_is_its_own_and_follows_the_settings():
+    guide = method_guide(AnalysisConfig(method="attribute", confidence=0.90, agreement_min=85))
+    assert guide.title == "Attribute Agreement Analysis" and [s.title for s in guide.sections][:3] == ["Purpose", "Required input", "Formulas used"]
+    text = guide_text(guide)
+    assert "alpha = 0.1" in text and "(85 %)" in text and "Clopper-Pearson" in text and "Fleiss' kappa" in text
+    assert "Cpk" not in text and "ANOVA" not in text  # nothing of the other methods
+    assert "not calculated" in text and "#Mixed" in text  # what is left out is said
+    off = guide_text(method_guide(AnalysisConfig(method="attribute")))
+    assert "No acceptance is applied" in off and "(95 %)" not in off and "95 %" in off

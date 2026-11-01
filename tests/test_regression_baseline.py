@@ -20,6 +20,7 @@ from datamapperx.statistics import analyze, explain_method
 
 from .baseline_support import (
     FLOAT_REL_TOL,
+    config_error_case,
     config_from_dict,
     first_difference,
     observation_from_dict,
@@ -50,9 +51,10 @@ def test_analyze_output_is_unchanged(case):
 @pytest.mark.parametrize("case", BASELINE["config_errors"], ids=lambda case: case["name"])
 def test_invalid_configuration_messages_are_unchanged(case):
     assert case["message"] is not None
+    config, message = config_error_case(case)
     with pytest.raises(ValueError) as caught:
-        analyze([], config_from_dict(case["config"]))
-    assert str(caught.value) == case["message"]
+        analyze([], config)
+    assert str(caught.value) == message
 
 
 @pytest.mark.parametrize("case", BASELINE["explain"], ids=lambda case: case["name"])
