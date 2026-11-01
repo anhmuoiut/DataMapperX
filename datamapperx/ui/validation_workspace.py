@@ -3,6 +3,9 @@
 It never changes what Data Mapping scanned or exported. Its data is a snapshot: the Data Mapping results copied into an
 immutable ``Dataset`` (or a RawData.xlsx read from disk). Everything the numbers depend on lives in a ``Study``; a
 result computed from an earlier state of the study is shown as stale and cannot be reported.
+
+What the statistics are, what the tables say and what the reports print is decided by the core (``datamapperx.statistics``,
+``datamapperx.stat_reports``). This file keeps the settings, drives a ``Study`` and shows the answers.
 """
 
 from __future__ import annotations
@@ -10,17 +13,45 @@ from __future__ import annotations
 import logging
 import math
 import os
-import tkinter as tk
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
+
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCursor, QFont
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ..method_guide import method_guide
 from ..models import LogRecord
-from ..stat_charts import agreement_chart_note, draw_tk_charts, plain_number
+from ..palette import Palette
+from ..stat_charts import agreement_chart_note, plain_number
 from ..stat_reports import (
     ALL_SECTIONS,
     CONDITION_TITLES,
@@ -73,13 +104,10 @@ from ..statistics.ratings import (
 )
 from ..statistics.study import validate_statistical_options
 from ..workspace_data import MappingSource, build_mapping_dataset, int_field, reorder_dataset
-from .dialogs import ReportDialog, open_path
-from .method_dialog import MethodDialog
-from .ratings_import import RatingsImportDialog
+from .dialogs import ReportDialog, label, open_path
 from .tasks import TaskRunner
-from .theme import Palette
-from .validation import DATE_FORMAT, AssignmentDialog, CustomersDialog, DatePickerDialog
-from .widgets import ReadOnlyText
+from .variables import Var, bind_check, bind_combo, bind_edit, bind_label, bind_radios, bind_spin
+from .widgets import ChartPanel, DataTable, make_button, repolish
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +130,23 @@ ATTRIBUTE_PENDING = "Attribute Agreement can be set up here. Its results are sti
 ATTRIBUTE_REPORT_PENDING = "Reports for Attribute Agreement are not available yet."
 SORT_KEYS = {"Cpk": "cpk", "Ppk": "ppk", "%SV/Tol": "percent_tolerance", "%Study Var": "percent_study_var", "NDC": "ndc",
              "Within %": "within_percent", "vs Standard %": "standard_percent", "Kappa": "kappa_within"}  # the sort choice -> its metric
+ORDERS = {"worksheet": "Worksheet order", "filename": "File name order",
+          "filetime": "File time order (when each log file was saved)", "timestamp": "Timestamp order (File assignments)",
+          "confirmed": "Rows are in measurement order (I confirm)"}
+CHECK_TOPICS = {"Amount of data": "Sample Size", "Distinct categories": "NDC"}  # how the Checks tab names a check
+GRR_COLUMNS = 7  # the most columns of the tables of the Details: the ANOVA table has 6, Assessment Disagreement 7
+WARNING_MARK = "  ‼"  # after a Test Item whose data checks need a look: it says nothing about the acceptance result
+CHART_SCALES = (("auto", "Auto"), ("full", "Full Limits"))  # the horizontal scale of a capability histogram
+FILE_ORDERS = ("worksheet", "confirmed")  # a RawData.xlsx has no files of its own to order by
+STUDY_FACTORS = (1, 2, 3, 4, 5, 6)  # Study Variation = k x SD; 6 is the usual choice (+/- 3 sigma)
+PREVIEW_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "lsl", "usl", "unit", "source", "standard")  # all kept with each row
+PREVIEW_TITLES = {"test_item": "Test Item", "sample": "Sample ID", "operator": "Operator", "trial": "Trial", "value": "Value",
+                  "lsl": "LSL", "usl": "USL", "unit": "Unit", "source": "Source", "standard": "Standard"}
+DISPLAY_COLUMNS = ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")  # the ones the table shows
+ATTRIBUTE_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "standard")  # ratings have no limits or unit
+ALL_ITEMS = "All Test Items"
+SECTION_NAMES = {"charts": "Charts", "observations": "Observations used (Excel only)"}
+DATE_FORMAT = "%d-%m-%Y"  # DD-MM-YYYY, as the date of study is printed
 
 
 def attribute_runnable() -> bool:
@@ -112,29 +157,26 @@ def attribute_runnable() -> bool:
 def attribute_reportable() -> bool:
     """Whether its PDF and Excel report may be generated: when they are released, or when they are being checked on purpose."""
     return ATTRIBUTE_REPORTS_READY or os.environ.get(ATTRIBUTE_REPORTS_ENV) == "1"
-ORDERS = {"worksheet": "Worksheet order", "filename": "File name order",
-          "filetime": "File time order (when each log file was saved)", "timestamp": "Timestamp order (File assignments)",
-          "confirmed": "Rows are in measurement order (I confirm)"}
-CHECK_TOPICS = {"Amount of data": "Sample Size", "Distinct categories": "NDC"}  # how the Checks tab names a check
-GRR_COLUMNS = 7  # the most columns of the tables of the Details: the ANOVA table has 6, Assessment Disagreement 7
-WARNING_MARK = "  ⚠"  # after a Test Item whose data checks need a look: it says nothing about the acceptance result
-CHART_SCALES = (("auto", "Auto"), ("full", "Full Limits"))  # the horizontal scale of a capability histogram
-FILE_ORDERS = ("worksheet", "confirmed")  # a RawData.xlsx has no files of its own to order by
-STUDY_FACTORS = (1, 2, 3, 4, 5, 6)  # Study Variation = k x SD; 6 is the usual choice (+/- 3 sigma)
-PREVIEW_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "lsl", "usl", "unit", "source", "standard")  # all kept with each row
-DISPLAY_COLUMNS = ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")  # the ones the table shows
-ATTRIBUTE_COLUMNS = ("test_item", "sample", "operator", "trial", "value", "standard")  # ratings have no limits or unit
-ALL_ITEMS = "All Test Items"
-SECTION_NAMES = {"charts": "Charts", "observations": "Observations used (Excel only)"}
 
 
-class ValidationWorkspace(ttk.Frame):
+def _row(*widgets: QWidget | int, spacing: int = 8) -> QHBoxLayout:
+    row = QHBoxLayout()
+    row.setSpacing(spacing)
+    for item in widgets:
+        if isinstance(item, int):
+            row.addStretch(item)
+        else:
+            row.addWidget(item)
+    return row
+
+
+class ValidationWorkspace(QWidget):
     """Data → Analysis Setup → Results → Report, with Run analysis always at hand (Quick Analysis)."""
 
-    def __init__(self, parent, palette: Palette, *, settings=None, save_settings: Callable[[], None] | None = None,
-                 source: Callable[[], MappingSource | None] = lambda: None):
-        super().__init__(parent, style="Surface.TFrame", padding=12)
-        self.palette = palette
+    def __init__(self, palette: Palette, *, settings=None, save_settings: Callable[[], None] | None = None,
+                 source: Callable[[], MappingSource | None] = lambda: None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.palette_tokens = palette
         self.settings = settings
         self._save_settings = save_settings or (lambda: None)
         self._provider = source
@@ -157,8 +199,6 @@ class ValidationWorkspace(ttk.Frame):
         self.evaluated = None
         self._judge_state: tuple | None = None
         self._date_chosen = False  # the date of study stays as chosen; until then it is today
-        self._wide = False  # Results: the table beside the charts (wide window) or above them
-        self._sash_set = {False: False, True: False}
         self._auto_within_cache: tuple | None = None
         self.setup_error = ""
         self.last_report: Path | None = None
@@ -167,18 +207,19 @@ class ValidationWorkspace(ttk.Frame):
         self._dataset_generation = 0
         self._visible: list = []
         self._charts: list = []
-        self._marked: set[str] = set()  # the rows of the table with a warning mark
+        self._marked: set[int] = set()  # the rows of the table with a warning mark
         self._scaled = False  # the chart shown is a capability histogram, whose horizontal scale can be chosen
         self._advanced_open = False  # Details: whether the user left Advanced Details open
-        self._advanced_item = ""
+        self._filter_sync = False
         self.preparing = False
         self.running = False
         self.export_busy = False
 
         self._make_variables()
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
-        self._build()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 6)
+        outer.setSpacing(6)
+        self._build(outer)
         self._apply_method_layout()
         self._apply_judge_layout()
         self._apply_source_layout()
@@ -187,514 +228,497 @@ class ValidationWorkspace(ttk.Frame):
 
     # ------------------------------------------------------------------ variables
     def _make_variables(self) -> None:
-        self.source_var = tk.StringVar(value="mapping")
-        self.order_var = tk.StringVar(value=ORDERS["worksheet"])
-        self.item_filter_var = tk.StringVar(value=ALL_ITEMS)
-        self._filter_sync = False
-        self.method_var = tk.StringVar(value="grr")
-        self.study_factor_var = tk.StringVar(value="6")
-        self.assign_var = tk.BooleanVar(value=True)
-        self.repeats_var = tk.StringVar()
-        self.profile_var = tk.StringVar(value=NO_CRITERIA)
-        self.within_var = tk.StringVar(value=WITHIN_CHOICES["auto"])
-        self.judge_var = tk.BooleanVar(value=False)
-        self.subgroup_var = tk.BooleanVar(value=False)
-        self.index_var = tk.StringVar(value="cpk")
-        self.threshold_var = tk.StringVar(value="1.33")
-        self.precision_var = tk.StringVar(value="2")
-        self.search_var = tk.StringVar()
-        self.filter_var = tk.StringVar(value=STATUSES[0])
-        self.sort_var = tk.StringVar(value="Test Item")
-        self.gage_var = tk.StringVar()
-        self.date_var = tk.StringVar(value=date.today().strftime(DATE_FORMAT))  # the date of study: today unless chosen
-        self.by_var = tk.StringVar()
-        self.comments_var = tk.StringVar()
-        self.sections = {name: tk.BooleanVar(value=name == "charts") for name in ALL_SECTIONS}
-        self.message_var = tk.StringVar(value="Choose the data, then press Run analysis.")
-        self.dataset_var = tk.StringVar(value="No data yet.")
-        self.hint_var = tk.StringVar()
-        self.file_var = tk.StringVar(value="No file chosen.")
-        self.preview_note_var = tk.StringVar()
-        self.plan_var = tk.StringVar()
-        self.plan_title_var = tk.StringVar()
-        self.within_hint_var = tk.StringVar()
-        self.stale_var = tk.StringVar()
-        self.summary_var = tk.StringVar()
-        self.notes_var = tk.StringVar()
-        self.chart_scale_var = tk.StringVar(value=CHART_SCALES[0][0])
-        self.ndc_var = tk.StringVar()
-        self.tables_note_var = tk.StringVar()  # the one line under the tables of an Attribute Agreement item
-        self.confidence_var = tk.StringVar(value=CONFIDENCE_LEVELS[1])  # Attribute Agreement: 95 %
-        self.agreement_var = tk.StringVar(value="90")  # its minimum percent agreement, used only when acceptance is on
-        self.all_columns_var = tk.BooleanVar(value=False)  # Gage R&R Details: the essential columns, or all of them
-        self.review_var = tk.StringVar()
-        self.coverage_var = tk.StringVar()
-        self.report_var = tk.StringVar()
+        self.source_var = Var("mapping")
+        self.order_var = Var(ORDERS["worksheet"])
+        self.item_filter_var = Var(ALL_ITEMS)
+        self.method_var = Var("grr")
+        self.study_factor_var = Var("6")
+        self.assign_var = Var(True)
+        self.repeats_var = Var("")
+        self.profile_var = Var(NO_CRITERIA)
+        self.within_var = Var(WITHIN_CHOICES["auto"])
+        self.judge_var = Var(False)
+        self.subgroup_var = Var(False)
+        self.index_var = Var("cpk")
+        self.threshold_var = Var("1.33")
+        self.precision_var = Var("2")
+        self.search_var = Var("")
+        self.filter_var = Var(STATUSES[0])
+        self.sort_var = Var("Test Item")
+        self.gage_var = Var("")
+        self.date_var = Var(date.today().strftime(DATE_FORMAT))  # the date of study: today unless chosen
+        self.by_var = Var("")
+        self.comments_var = Var("")
+        self.sections = {name: Var(name == "charts") for name in ALL_SECTIONS}
+        self.message_var = Var("Choose the data, then press Run analysis.")
+        self.dataset_var = Var("No data yet.")
+        self.hint_var = Var("")
+        self.file_var = Var("No file chosen.")
+        self.preview_note_var = Var("")
+        self.plan_var = Var("")
+        self.plan_title_var = Var("")
+        self.within_hint_var = Var("")
+        self.stale_var = Var("")
+        self.summary_var = Var("")
+        self.notes_var = Var("")
+        self.selected_var = Var("")
+        self.chart_scale_var = Var(CHART_SCALES[0][0])
+        self.ndc_var = Var("")
+        self.tables_note_var = Var("")  # the one line under the tables of an Attribute Agreement item
+        self.confidence_var = Var(CONFIDENCE_LEVELS[1])  # Attribute Agreement: 95 %
+        self.agreement_var = Var("90")  # its minimum percent agreement, used only when acceptance is on
+        self.all_columns_var = Var(False)  # Gage R&R Details: the essential columns, or all of them
+        self.review_var = Var("")
+        self.coverage_var = Var("")
+        self.report_var = Var("")
 
     def _wire(self) -> None:
-        setup = (self.method_var, self.study_factor_var, self.assign_var, self.repeats_var,
-                 self.profile_var, self.within_var, self.subgroup_var, self.index_var, self.threshold_var, self.judge_var,
-                 self.confidence_var, self.agreement_var)
+        setup = (self.method_var, self.study_factor_var, self.assign_var, self.repeats_var, self.profile_var, self.within_var,
+                 self.subgroup_var, self.index_var, self.threshold_var, self.judge_var, self.confidence_var, self.agreement_var)
         for variable in setup:
-            variable.trace_add("write", self._settings_changed)
-        self.method_var.trace_add("write", lambda *_: self._apply_method_layout())
-        self.judge_var.trace_add("write", lambda *_: self._apply_judge_layout())
-        self.source_var.trace_add("write", lambda *_: self._source_kind_changed())
-        self.order_var.trace_add("write", lambda *_: self.data_edited())
-        self.item_filter_var.trace_add("write", lambda *_: None if self._filter_sync else self._refresh_data_view())
+            variable.trace(self._settings_changed)
+        self.method_var.trace(self._apply_method_layout)
+        self.judge_var.trace(self._apply_judge_layout)
+        self.source_var.trace(self._source_kind_changed)
+        self.order_var.trace(self.data_edited)
+        self.item_filter_var.trace(lambda: None if self._filter_sync else self._refresh_data_view())
         for variable in (self.filter_var, self.search_var, self.sort_var, self.precision_var):
-            variable.trace_add("write", lambda *_: self._refresh_table())
+            variable.trace(self._refresh_table)
         for variable in (self.gage_var, self.date_var, self.by_var, self.comments_var):
-            variable.trace_add("write", lambda *_: self._info_changed())
+            variable.trace(self._info_changed)
+        self.all_columns_var.trace(lambda: self._show_details(self.selected_result()))
+        self.chart_scale_var.trace(self._draw_chart)
 
     # ------------------------------------------------------------------ construction
-    def _build(self) -> None:
-        strip = ttk.Frame(self, style="Surface.TFrame")
-        strip.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        strip.columnconfigure(1, weight=1)
-        self.run_button = ttk.Button(strip, text="Run analysis", style="Accent.TButton", command=self.run_analysis)
-        self.run_button.grid(row=0, column=0)
-        self.message_label = ttk.Label(strip, textvariable=self.message_var, style="SurfaceHint.TLabel", wraplength=700, justify="left")
-        self.message_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(strip, text="Decimals", style="SurfaceHint.TLabel").grid(row=0, column=2, padx=(12, 4))
-        ttk.Spinbox(strip, from_=2, to=8, textvariable=self.precision_var, width=3).grid(row=0, column=3)
-        self.about_button = ttk.Button(strip, text="About the method", command=self.show_about)
-        self.about_button.grid(row=0, column=4, padx=(10, 0))
-        strip.bind("<Configure>", lambda e: self.message_label.configure(wraplength=max(200, e.width - 420)))
+    def _build(self, outer: QVBoxLayout) -> None:
+        strip = QHBoxLayout()
+        strip.setSpacing(10)
+        self.run_button = make_button("Run analysis", self.run_analysis, primary=True)
+        self.message_label = label("", "muted", wrap=True)
+        bind_label(self.message_label, self.message_var)
+        strip.addWidget(self.run_button)
+        strip.addWidget(self.message_label, 1)
+        strip.addWidget(label("Decimals", "muted"))
+        self.precision_spin = QSpinBox()
+        self.precision_spin.setRange(2, 8)
+        bind_spin(self.precision_spin, self.precision_var)
+        strip.addWidget(self.precision_spin)
+        self.about_button = make_button("About the method", self.show_about)
+        strip.addWidget(self.about_button)
+        outer.addLayout(strip)
 
-        self.stale_banner = ttk.Frame(self, style="Banner.TFrame", padding=(12, 6))
-        self.stale_banner.columnconfigure(0, weight=1)
-        self.stale_label = ttk.Label(self.stale_banner, textvariable=self.stale_var, style="Banner.TLabel", wraplength=700, justify="left")
-        self.stale_label.grid(row=0, column=0, sticky="w")
-        self.update_button = ttk.Button(self.stale_banner, text="Update results", style="Accent.TButton", command=self.run_analysis)
-        self.update_button.grid(row=0, column=1, padx=(12, 0))
-        self.stale_banner.bind("<Configure>", lambda e: self.stale_label.configure(wraplength=max(200, e.width - 200)))
+        self.stale_banner = QFrame()
+        self.stale_banner.setObjectName("banner")
+        banner = QHBoxLayout(self.stale_banner)
+        banner.setContentsMargins(12, 6, 12, 6)
+        self.stale_label = QLabel()
+        self.stale_label.setWordWrap(True)
+        bind_label(self.stale_label, self.stale_var)
+        banner.addWidget(self.stale_label, 1)
+        self.update_button = make_button("Update results", self.run_analysis, primary=True)
+        banner.addWidget(self.update_button)
+        self.stale_banner.hide()
+        outer.addWidget(self.stale_banner)
 
-        self.tabs = ttk.Notebook(self)
-        self.tabs.grid(row=2, column=0, sticky="nsew")
-        self.data_tab = self._tab("Data")
-        self.setup_tab = self._tab("Analysis")
-        self.results_tab = self._tab("Results")
-        self.report_tab = self._tab("Report")
+        self.tabs = QTabWidget()
+        self.data_tab, self.setup_tab, self.results_tab, self.report_tab = (QWidget() for _ in range(4))
+        for tab, title in ((self.data_tab, "Data"), (self.setup_tab, "Analysis"), (self.results_tab, "Results"), (self.report_tab, "Report")):
+            self.tabs.addTab(tab, title)
         self._build_data()
         self._build_setup()
         self._build_results()
         self._build_report()
-
-    def _tab(self, title: str) -> ttk.Frame:
-        frame = ttk.Frame(self.tabs, style="Surface.TFrame", padding=12)
-        frame.columnconfigure(0, weight=1)
-        self.tabs.add(frame, text=title)
-        return frame
+        outer.addWidget(self.tabs, 1)
 
     def _build_data(self) -> None:
-        tab = self.data_tab
-        tab.rowconfigure(4, weight=1)
-        top = ttk.Frame(tab, style="Surface.TFrame")
-        top.grid(row=0, column=0, sticky="ew")
-        kinds = ttk.Frame(top, style="Surface.TFrame")
-        kinds.pack(side="left")
-        ttk.Radiobutton(kinds, text="Use Data Mapping results", variable=self.source_var, value="mapping",
-                        style="Surface.TRadiobutton").pack(side="left", padx=(0, 16))
-        ttk.Radiobutton(kinds, text="Import RawData.xlsx", variable=self.source_var, value="file",
-                        style="Surface.TRadiobutton").pack(side="left", padx=(0, 16))
-        ttk.Radiobutton(kinds, text="Import ratings (CSV/XLSX)", variable=self.source_var, value="ratings",
-                        style="Surface.TRadiobutton").pack(side="left")
-        self.settings_button = ttk.Menubutton(top, text="Settings ▾")
-        self.settings_button.pack(side="right")
-        self.order_menu = tk.Menu(self.settings_button, tearoff=0)  # the order of the readings; filled by _apply_source_layout
-        self.settings_button.configure(menu=self.order_menu)
-        self.mapping_controls = ttk.Frame(top, style="Surface.TFrame")
-        self.assignments_button = ttk.Button(self.mapping_controls, text="File assignments…", command=lambda: AssignmentDialog(self))
-        self.assignments_button.pack(side="left")
-        self.file_controls = ttk.Frame(top, style="Surface.TFrame")
-        self.file_button = ttk.Button(self.file_controls, text="Choose file…", command=self.choose_file)
-        self.file_button.pack(side="left")
-        ttk.Label(self.file_controls, textvariable=self.file_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
-        ttk.Label(tab, textvariable=self.dataset_var, style="Section.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.hint_label = ttk.Label(tab, textvariable=self.hint_var, style="SurfaceHint.TLabel", foreground=self.palette.warn,
-                                    wraplength=800, justify="left")
-        self.hint_label.grid(row=2, column=0, sticky="w")
-        self.hint_label.grid_remove()
-        tab.bind("<Configure>", lambda e: self.hint_label.configure(wraplength=max(200, e.width - 40)))
-        chooser = ttk.Frame(tab, style="Surface.TFrame")
-        chooser.grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(chooser, text="Test Item", style="SurfaceHint.TLabel").pack(side="left")
-        self.item_filter = ttk.Combobox(chooser, textvariable=self.item_filter_var, state="readonly", width=42, values=[ALL_ITEMS])
-        self.item_filter.pack(side="left", padx=8)
+        layout = QVBoxLayout(self.data_tab)
+        layout.setContentsMargins(12, 12, 12, 8)
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        group = QButtonGroup(self)
+        self.source_radios = {
+            "mapping": QRadioButton("Use Data Mapping results"), "file": QRadioButton("Import RawData.xlsx"),
+            "ratings": QRadioButton("Import ratings (CSV/XLSX)")}
+        for button in self.source_radios.values():
+            top.addWidget(button)
+        bind_radios(self.source_radios, self.source_var, group)
+        self.mapping_controls = QWidget()
+        mapping_row = QHBoxLayout(self.mapping_controls)
+        mapping_row.setContentsMargins(0, 0, 0, 0)
+        self.assignments_button = make_button("File assignments…", self.open_assignments)
+        mapping_row.addWidget(self.assignments_button)
+        self.file_controls = QWidget()
+        file_row = QHBoxLayout(self.file_controls)
+        file_row.setContentsMargins(0, 0, 0, 0)
+        self.file_button = make_button("Choose file…", self.choose_file)
+        self.file_label = label("", "muted")
+        bind_label(self.file_label, self.file_var)
+        file_row.addWidget(self.file_button)
+        file_row.addWidget(self.file_label)
+        top.addWidget(self.mapping_controls)
+        top.addWidget(self.file_controls)
+        top.addStretch(1)
+        self.settings_button = QToolButton()
+        self.settings_button.setText("Settings ▼")
+        self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.order_menu = QMenu(self.settings_button)  # the order of the readings; filled by _apply_source_layout
+        self.order_group = QActionGroup(self.order_menu)
+        self.settings_button.setMenu(self.order_menu)
+        top.addWidget(self.settings_button)
+        layout.addLayout(top)
 
-        frame = ttk.Frame(tab, style="Surface.TFrame")
-        frame.grid(row=4, column=0, sticky="nsew", pady=(6, 0))
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-        self.preview = ttk.Treeview(frame, columns=PREVIEW_COLUMNS, displaycolumns=DISPLAY_COLUMNS, show="headings", selectmode="browse")
-        for column, (title, width, anchor) in {"test_item": ("Test Item", 220, "w"), "sample": ("Sample ID", 140, "w"),
-                                               "operator": ("Operator", 80, "w"), "trial": ("Trial", 60, "center"),
-                                               "value": ("Value", 120, "e"), "lsl": ("LSL", 100, "e"), "usl": ("USL", 100, "e"),
-                                               "unit": ("Unit", 60, "center"), "source": ("Source", 200, "w"),
-                                               "standard": ("Standard", 90, "w")}.items():
-            self.preview.heading(column, text=title, anchor=anchor)
-            self.preview.column(column, width=width, minwidth=50, anchor=anchor, stretch=column == "test_item")
-        self.preview.tag_configure("inferred", foreground=self.palette.muted)  # a Trial counted from the row order, not read from the data
-        self.preview.grid(row=0, column=0, sticky="nsew")
-        ys = ttk.Scrollbar(frame, orient="vertical", command=self.preview.yview)
-        ys.grid(row=0, column=1, sticky="ns")
-        self.preview.configure(yscrollcommand=ys.set)
-        ttk.Label(tab, textvariable=self.preview_note_var, style="SurfaceHint.TLabel", wraplength=800, justify="left").grid(
-            row=5, column=0, sticky="w", pady=(4, 0))
+        self.dataset_label = label("", "heading")
+        bind_label(self.dataset_label, self.dataset_var)
+        layout.addWidget(self.dataset_label)
+        self.hint_label = label("", "warn", wrap=True)
+        bind_label(self.hint_label, self.hint_var, hide_empty=True)
+        layout.addWidget(self.hint_label)
+        chooser = QHBoxLayout()
+        chooser.addWidget(label("Test Item", "muted"))
+        self.item_filter = QComboBox()
+        self.item_filter.setMinimumWidth(300)
+        self.item_filter.addItem(ALL_ITEMS)
+        bind_combo(self.item_filter, self.item_filter_var)
+        chooser.addWidget(self.item_filter)
+        chooser.addStretch(1)
+        layout.addLayout(chooser)
+        self.preview = DataTable(self.palette_tokens)
+        self.preview.set_table([PREVIEW_TITLES[c] for c in PREVIEW_COLUMNS], [], aligns=["w", "w", "w", "center", "e", "e", "e", "center", "w", "w"],
+                               stretch=0)
+        self._show_preview_columns(DISPLAY_COLUMNS)
+        layout.addWidget(self.preview, 1)
+        self.preview_note = label("", "muted", wrap=True)
+        bind_label(self.preview_note, self.preview_note_var)
+        layout.addWidget(self.preview_note)
+
+    def _show_preview_columns(self, shown: Sequence[str]) -> None:
+        for index, key in enumerate(PREVIEW_COLUMNS):
+            self.preview.setColumnHidden(index, key not in shown)
 
     def _build_setup(self) -> None:
-        tab = self.setup_tab
-        ttk.Label(tab, text="Plan", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(tab, textvariable=self.plan_title_var, style="Surface.TLabel", font=("Segoe UI Semibold", 11)).grid(
-            row=1, column=0, sticky="w", pady=(2, 0))
-        self.plan_label = ttk.Label(tab, textvariable=self.plan_var, style="SurfaceHint.TLabel")  # e.g. 8 Test Items · 10 Samples
-        self.plan_label.grid(row=2, column=0, sticky="w", pady=(0, 12))
-        ttk.Label(tab, text="Study purpose", style="Section.TLabel").grid(row=3, column=0, sticky="w")
-        ttk.Radiobutton(tab, text="MSA – Variable Gage R&R", variable=self.method_var,
-                        value="grr", style="Surface.TRadiobutton").grid(row=4, column=0, sticky="w", pady=(4, 0))
-        ttk.Radiobutton(tab, text="Process Capability – Cp/Cpk, Pp/Ppk",
-                        variable=self.method_var, value="capability", style="Surface.TRadiobutton").grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(tab, text="Attribute Agreement – PASS/FAIL ratings",
-                        variable=self.method_var, value="attribute", style="Surface.TRadiobutton").grid(row=6, column=0, sticky="w")
+        layout = QVBoxLayout(self.setup_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(4)
+        layout.addWidget(label("Plan", "heading"))
+        self.plan_title = label("", "heading")
+        bind_label(self.plan_title, self.plan_title_var)
+        self.plan_label = label("", "muted")  # e.g. 8 Test Items · 10 Samples
+        bind_label(self.plan_label, self.plan_var)
+        layout.addWidget(self.plan_title)
+        layout.addWidget(self.plan_label)
+        layout.addSpacing(8)
+        layout.addWidget(label("Study purpose", "heading"))
+        group = QButtonGroup(self)
+        self.method_radios = {"grr": QRadioButton("MSA – Variable Gage R&R"),
+                              "capability": QRadioButton("Process Capability – Cp/Cpk, Pp/Ppk"),
+                              "attribute": QRadioButton("Attribute Agreement – PASS/FAIL ratings")}
+        for button in self.method_radios.values():
+            layout.addWidget(button)
+        bind_radios(self.method_radios, self.method_var, group)
 
-        self.grr_setup = ttk.Frame(tab, style="Surface.TFrame")
-        self.cap_setup = ttk.Frame(tab, style="Surface.TFrame")
-        self.attr_setup = ttk.Frame(tab, style="Surface.TFrame")
-        for frame in (self.grr_setup, self.cap_setup, self.attr_setup):
-            frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
-            frame.columnconfigure(1, weight=1)
+        # Gage R&R
+        self.grr_setup = QWidget()
+        grr = QGridLayout(self.grr_setup)
+        grr.setContentsMargins(0, 10, 0, 0)
+        grr.setColumnStretch(1, 1)
+        grr.setVerticalSpacing(8)
+        self.study_factor_combo = QComboBox()
+        self.study_factor_combo.addItems([str(k) for k in STUDY_FACTORS])
+        bind_combo(self.study_factor_combo, self.study_factor_var)
+        grr.addWidget(label("Study variation (k)"), 0, 0)
+        grr.addLayout(_row(self.study_factor_combo, label("Study Var = k × SD. The usual choice is 6 (±3σ).", "muted"), 1), 0, 1)
+        self.assign_check = QCheckBox("Label the repeated readings of a sample as trials 1, 2, 3… when the data have no Trial")
+        bind_check(self.assign_check, self.assign_var)
+        grr.addWidget(self.assign_check, 1, 0, 1, 2)
+        grr.addWidget(label("Only to organise the data in rows. It is not taken as the order of measurement.", "muted"), 2, 1)
+        self.repeats_edit = QLineEdit()
+        self.repeats_edit.setMaximumWidth(60)
+        bind_edit(self.repeats_edit, self.repeats_var)
+        grr.addWidget(label("Readings per sample"), 3, 0)
+        grr.addLayout(_row(self.repeats_edit, label("optional: samples with another count are flagged", "muted"), 1), 3, 1)
+        self.customer_combo = QComboBox()
+        self.customer_combo.setMinimumWidth(180)
+        self.customer_combo.addItems([NO_CRITERIA, *self.customers])
+        bind_combo(self.customer_combo, self.profile_var)
+        self.criteria_button = make_button("Customers…", self.open_customers)
+        grr.addWidget(label("Acceptance criteria"), 4, 0)
+        grr.addLayout(_row(self.customer_combo, self.criteria_button, label("optional: adds PASS / FAIL, never changes a figure", "muted"),
+                           1), 4, 1)
+        layout.addWidget(self.grr_setup)
 
-        def hint(parent, text, row, column=1, **grid):
-            label = ttk.Label(parent, text=text, style="SurfaceHint.TLabel", justify="left")
-            label.grid(row=row, column=column, sticky="w", **grid)
-            return label
+        # Process capability
+        self.cap_setup = QWidget()
+        cap = QVBoxLayout(self.cap_setup)
+        cap.setContentsMargins(0, 10, 0, 0)
+        self.subgroup_check = QCheckBox("Group readings by Sample ID")
+        bind_check(self.subgroup_check, self.subgroup_var)
+        self.judge_check = QCheckBox("Enable acceptance criteria")
+        bind_check(self.judge_check, self.judge_var)
+        cap.addWidget(self.subgroup_check)
+        cap.addWidget(self.judge_check)
+        self.criteria_row = QWidget()
+        criteria = QHBoxLayout(self.criteria_row)
+        criteria.setContentsMargins(24, 0, 0, 0)
+        index_group = QButtonGroup(self)
+        self.index_radios = {"cpk": QRadioButton("Cpk (Within)"), "ppk": QRadioButton("Ppk (Overall)")}
+        for button in self.index_radios.values():
+            criteria.addWidget(button)
+        bind_radios(self.index_radios, self.index_var, index_group)
+        criteria.addWidget(label("must exceed", "muted"))
+        self.threshold_edit = QLineEdit()
+        self.threshold_edit.setMaximumWidth(70)
+        bind_edit(self.threshold_edit, self.threshold_var)
+        criteria.addWidget(self.threshold_edit)
+        criteria.addStretch(1)
+        cap.addWidget(self.criteria_row)
+        self.advanced_button = make_button("Advanced Settings ►", self._toggle_advanced)
+        cap.addWidget(self.advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced = QWidget()
+        advanced = QHBoxLayout(self.advanced)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        advanced.addWidget(label("Within sigma"))
+        self.within_combo = QComboBox()
+        self.within_combo.addItems(list(WITHIN_CHOICES.values()))
+        self.within_combo.setMinimumWidth(380)
+        bind_combo(self.within_combo, self.within_var)
+        advanced.addWidget(self.within_combo)
+        self.within_hint = label("", "muted")
+        bind_label(self.within_hint, self.within_hint_var)
+        advanced.addWidget(self.within_hint)
+        advanced.addStretch(1)
+        self.advanced.hide()
+        cap.addWidget(self.advanced)
+        layout.addWidget(self.cap_setup)
 
-        grr = self.grr_setup
-        ttk.Label(grr, text="Study variation (k)", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
-        factor = ttk.Frame(grr, style="Surface.TFrame")
-        factor.grid(row=0, column=1, sticky="w", pady=3)
-        self.study_factor_combo = ttk.Combobox(factor, textvariable=self.study_factor_var, state="readonly", width=4,
-                                               values=[str(k) for k in STUDY_FACTORS])
-        self.study_factor_combo.pack(side="left")
-        ttk.Label(factor, text="Study Var = k × SD. The usual choice is 6 (±3σ).", style="SurfaceHint.TLabel").pack(side="left", padx=8)
-        ttk.Checkbutton(grr, text="Label the repeated readings of a sample as trials 1, 2, 3… when the data have no Trial",
-                        variable=self.assign_var, style="Surface.TCheckbutton").grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        hint(grr, "Only to organise the data in rows. It is not taken as the order of measurement.", 5)
-        ttk.Label(grr, text="Readings per sample", style="Surface.TLabel").grid(row=6, column=0, sticky="w", pady=(6, 3), padx=(0, 12))
-        reading = ttk.Frame(grr, style="Surface.TFrame")
-        reading.grid(row=6, column=1, sticky="w", pady=(6, 3))
-        ttk.Entry(reading, textvariable=self.repeats_var, width=6).pack(side="left")
-        ttk.Label(reading, text="optional: samples with another count are flagged", style="SurfaceHint.TLabel").pack(side="left", padx=8)
-        ttk.Label(grr, text="Acceptance criteria", style="Surface.TLabel").grid(row=7, column=0, sticky="w", pady=3, padx=(0, 12))
-        customer = ttk.Frame(grr, style="Surface.TFrame")
-        customer.grid(row=7, column=1, sticky="w", pady=3)
-        self.customer_combo = ttk.Combobox(customer, textvariable=self.profile_var, values=[NO_CRITERIA, *self.customers],
-                                           state="readonly", width=22)
-        self.customer_combo.pack(side="left")
-        self.criteria_button = ttk.Button(customer, text="Customers…", command=lambda: CustomersDialog(self))
-        self.criteria_button.pack(side="left", padx=8)
-        ttk.Label(customer, text="optional: adds PASS / FAIL, never changes a figure", style="SurfaceHint.TLabel").pack(side="left")
-
-        cap = self.cap_setup
-        ttk.Checkbutton(cap, text="Group readings by Sample ID", variable=self.subgroup_var,
-                        style="Surface.TCheckbutton").grid(row=0, column=0, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(cap, text="Enable acceptance criteria", variable=self.judge_var,
-                        style="Surface.TCheckbutton").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.criteria_row = ttk.Frame(cap, style="Surface.TFrame")  # only while the criteria are enabled
-        self.criteria_row.grid(row=2, column=0, sticky="w", padx=(24, 0), pady=(2, 3))
-        ttk.Radiobutton(self.criteria_row, text="Cpk (Within)", variable=self.index_var, value="cpk",
-                        style="Surface.TRadiobutton").pack(side="left")
-        ttk.Radiobutton(self.criteria_row, text="Ppk (Overall)", variable=self.index_var, value="ppk",
-                        style="Surface.TRadiobutton").pack(side="left", padx=10)
-        ttk.Label(self.criteria_row, text="must exceed", style="SurfaceHint.TLabel").pack(side="left", padx=(8, 4))
-        ttk.Entry(self.criteria_row, textvariable=self.threshold_var, width=7).pack(side="left")
-        self.advanced_button = ttk.Button(cap, text="Advanced Settings ▸", command=self._toggle_advanced)
-        self.advanced_button.grid(row=3, column=0, sticky="w", pady=(12, 0))
-        self.advanced = ttk.Frame(cap, style="Surface.TFrame")
-        self.advanced.grid(row=4, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(self.advanced, text="Within sigma", style="Surface.TLabel").pack(side="left", padx=(0, 12))
-        ttk.Combobox(self.advanced, textvariable=self.within_var, values=list(WITHIN_CHOICES.values()), state="readonly",
-                     width=48).pack(side="left")
-        ttk.Label(self.advanced, textvariable=self.within_hint_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
-        self.advanced.grid_remove()
-
-        attr = self.attr_setup
-        ttk.Label(attr, text="Confidence level", style="Surface.TLabel").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 12))
-        level = ttk.Frame(attr, style="Surface.TFrame")
-        level.grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Combobox(level, textvariable=self.confidence_var, values=CONFIDENCE_LEVELS, state="readonly", width=6).pack(side="left")
-        ttk.Label(level, text="for the interval of each percent agreement", style="SurfaceHint.TLabel").pack(side="left", padx=8)
-        ttk.Checkbutton(attr, text="Enable acceptance criteria", variable=self.judge_var,
-                        style="Surface.TCheckbutton").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.agreement_row = ttk.Frame(attr, style="Surface.TFrame")  # only while the criteria are enabled
-        self.agreement_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(2, 3))
-        ttk.Label(self.agreement_row, text="Minimum agreement", style="SurfaceHint.TLabel").pack(side="left")
-        ttk.Entry(self.agreement_row, textvariable=self.agreement_var, width=6).pack(side="left", padx=(8, 4))
-        ttk.Label(self.agreement_row, text="% for Within Appraisers and vs Standard, each on its own", style="SurfaceHint.TLabel").pack(side="left")
+        # Attribute Agreement
+        self.attr_setup = QWidget()
+        attr = QVBoxLayout(self.attr_setup)
+        attr.setContentsMargins(0, 10, 0, 0)
+        self.confidence_combo = QComboBox()
+        self.confidence_combo.addItems(CONFIDENCE_LEVELS)
+        bind_combo(self.confidence_combo, self.confidence_var)
+        attr.addLayout(_row(label("Confidence level"), self.confidence_combo, label("for the interval of each percent agreement", "muted"), 1))
+        self.attr_judge_check = QCheckBox("Enable acceptance criteria")
+        bind_check(self.attr_judge_check, self.judge_var)
+        attr.addWidget(self.attr_judge_check)
+        self.agreement_row = QWidget()
+        agreement = QHBoxLayout(self.agreement_row)
+        agreement.setContentsMargins(24, 0, 0, 0)
+        agreement.addWidget(label("Minimum agreement", "muted"))
+        self.agreement_edit = QLineEdit()
+        self.agreement_edit.setMaximumWidth(60)
+        bind_edit(self.agreement_edit, self.agreement_var)
+        agreement.addWidget(self.agreement_edit)
+        agreement.addWidget(label("% for Within Appraisers and vs Standard, each on its own", "muted"))
+        agreement.addStretch(1)
+        attr.addWidget(self.agreement_row)
+        layout.addWidget(self.attr_setup)
+        layout.addStretch(1)
 
     def _build_results(self) -> None:
-        tab = self.results_tab
-        tab.rowconfigure(1, weight=1)
-        head = ttk.Frame(tab, style="Surface.TFrame")
-        head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        head.columnconfigure(1, weight=1)
-        ttk.Label(head, textvariable=self.summary_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.notes_bar = ttk.Frame(head, style="Surface.TFrame")  # what to keep in mind, beside the summary, only when there is something
-        self.notes_bar.grid(row=0, column=1, sticky="w", padx=(16, 0))
-        self.notes_label = ttk.Label(self.notes_bar, textvariable=self.notes_var, style="Surface.TLabel",
-                                     foreground=self.palette.warn, wraplength=500, justify="left")
-        self.notes_label.grid(row=0, column=0, sticky="w")
-        self.notes_button = ttk.Button(self.notes_bar, text="Read the notes…", command=self.show_notes)
-        self.notes_button.grid(row=0, column=1, padx=(10, 0))
-        head.bind("<Configure>", lambda e: self.notes_label.configure(wraplength=max(200, e.width - 560)))
-        self.notes_bar.grid_remove()
+        layout = QVBoxLayout(self.results_tab)
+        layout.setContentsMargins(12, 12, 12, 8)
+        head = QHBoxLayout()
+        self.summary_label = label("", "heading")
+        bind_label(self.summary_label, self.summary_var)
+        head.addWidget(self.summary_label)
+        self.notes_bar = QWidget()
+        notes = QHBoxLayout(self.notes_bar)
+        notes.setContentsMargins(16, 0, 0, 0)
+        self.notes_label = label("", "warn", wrap=True)
+        bind_label(self.notes_label, self.notes_var)
+        self.notes_button = make_button("Read the notes…", self.show_notes)
+        notes.addWidget(self.notes_label, 1)
+        notes.addWidget(self.notes_button)
+        self.notes_bar.hide()
+        head.addWidget(self.notes_bar, 1)
+        layout.addLayout(head)
 
-        # Two panes, in one of two paned windows: above each other, or side by side when the window is wide enough
-        self.split_rows = ttk.PanedWindow(tab, orient="vertical")
-        self.split_cols = ttk.PanedWindow(tab, orient="horizontal")
-        self.split = self.split_rows
-        self.split.grid(row=1, column=0, sticky="nsew")
-        for paned in (self.split_rows, self.split_cols):  # the divider is placed once the paned window has its real size
-            paned.bind("<Configure>", lambda _e: None if self._sash_set[self._wide] else self._place_sash())
-        tab.bind("<Configure>", self._arrange_results)
-        table_page = self.table_page = ttk.Frame(tab, style="Surface.TFrame")
-        table_page.columnconfigure(0, weight=1)
-        table_page.rowconfigure(1, weight=1)
-        filters = ttk.Frame(table_page, style="Surface.TFrame")
-        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        filters.columnconfigure(1, weight=1)
-        ttk.Label(filters, text="Search", style="SurfaceHint.TLabel").grid(row=0, column=0, padx=(0, 4))
-        ttk.Entry(filters, textvariable=self.search_var, width=8).grid(row=0, column=1, sticky="ew")
-        self.filter_combo = ttk.Combobox(filters, textvariable=self.filter_var, values=STATUSES, state="readonly", width=15)
-        self.sort_combo = ttk.Combobox(filters, textvariable=self.sort_var, state="readonly", width=10,
-                                       values=("Test Item", "%SV/Tol", "%Study Var", "NDC", "Cpk"))
-        self.sort_combo.grid(row=0, column=3, padx=(6, 0))
-        self.filters = filters
-        self.table = ttk.Treeview(table_page, show="headings", selectmode="browse", height=3)
-        self.table.grid(row=1, column=0, sticky="nsew")
-        ys = ttk.Scrollbar(table_page, orient="vertical", command=self.table.yview)
-        ys.grid(row=1, column=1, sticky="ns")
-        xs = ttk.Scrollbar(table_page, orient="horizontal", command=self.table.xview)
-        xs.grid(row=2, column=0, sticky="ew")
-        self.table_bars = (ys, xs)
-        self.table.configure(yscrollcommand=lambda lo, hi: self._scrolled(ys, lo, hi), xscrollcommand=lambda lo, hi: self._scrolled(xs, lo, hi))
-        self.table.bind("<<TreeviewSelect>>", self._select_result)
-        self.table.bind("<Button-1>", self._table_click, add="+")  # the warning mark leads to the Checks
-        self.table.bind("<Motion>", self._table_hover)
-        self.review_label = ttk.Label(table_page, textvariable=self.review_var, style="SurfaceHint.TLabel", wraplength=700, justify="left")
-        self.review_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.review_label.grid_remove()
-        table_page.bind("<Configure>", lambda e: self.review_label.configure(wraplength=max(200, e.width - 24)))
+        # Two panes: above each other, or side by side when the window is wide enough
+        self.split = QSplitter(Qt.Orientation.Vertical)
+        self.table_page = QWidget()
+        table = QVBoxLayout(self.table_page)
+        table.setContentsMargins(0, 0, 0, 0)
+        filters = QHBoxLayout()
+        filters.addWidget(label("Search", "muted"))
+        self.search_edit = QLineEdit()
+        bind_edit(self.search_edit, self.search_var)
+        filters.addWidget(self.search_edit, 1)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(STATUSES)
+        bind_combo(self.filter_combo, self.filter_var)
+        self.filter_combo.hide()
+        filters.addWidget(self.filter_combo)
+        self.sort_combo = QComboBox()
+        filters.addWidget(self.sort_combo)
+        table.addLayout(filters)
+        self.table = DataTable(self.palette_tokens)
+        self.table.rowSelected.connect(self._select_result)
+        self.table.cellPressed.connect(self._table_click)
+        self.table.cellHover.connect(self._table_hover)
+        table.addWidget(self.table, 1)
+        self.review_label = label("", "warn", wrap=True)
+        bind_label(self.review_label, self.review_var, hide_empty=True)
+        table.addWidget(self.review_label)
 
-        right = self.right_pane = ttk.Frame(tab, style="Surface.TFrame")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-        self.selected_var = tk.StringVar()
-        self.selected_label = ttk.Label(right, textvariable=self.selected_var, style="Section.TLabel")  # which item the charts are of
-        self.selected_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.selected_label.grid_remove()
-        self.result_tabs = ttk.Notebook(right)
-        self.result_tabs.grid(row=1, column=0, sticky="nsew")
-        self.split.add(table_page, weight=1)
-        self.split.add(right, weight=3)
-        chart_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
-        chart_page.columnconfigure(0, weight=1)
-        chart_page.rowconfigure(1, weight=1)
-        self.result_tabs.add(chart_page, text="Charts")
-        self.chart_tools = ttk.Frame(chart_page, style="Surface.TFrame")  # only for a capability histogram
-        self.chart_tools.grid(row=0, column=0, columnspan=2, sticky="e", pady=(0, 2))
-        for column, (value, text) in enumerate(CHART_SCALES):
-            ttk.Radiobutton(self.chart_tools, text=text, value=value, variable=self.chart_scale_var, style="Toolbutton",
-                            command=self._draw_chart).grid(row=0, column=column, padx=(0 if column == 0 else 2, 0))
-        self.chart_tools.grid_remove()
-        self.chart_canvas = tk.Canvas(chart_page, bg="white", highlightthickness=0, height=200)
-        self.chart_canvas.grid(row=1, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(chart_page, orient="vertical", command=self.chart_canvas.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
-        self.chart_canvas.configure(yscrollcommand=lambda lo, hi: self._scrolled(scroll, lo, hi))
-        self.chart_canvas.bind("<Configure>", lambda _e: self._draw_chart())
-        self.chart_canvas.bind("<MouseWheel>", lambda e: self.chart_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.right_pane = QWidget()
+        right = QVBoxLayout(self.right_pane)
+        right.setContentsMargins(0, 0, 0, 0)
+        self.selected_label = label("", "heading")
+        bind_label(self.selected_label, self.selected_var, hide_empty=True)
+        right.addWidget(self.selected_label)
+        self.result_tabs = QTabWidget()
+        right.addWidget(self.result_tabs, 1)
+        self.split.addWidget(self.table_page)
+        self.split.addWidget(self.right_pane)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 3)
+        layout.addWidget(self.split, 1)
 
-        session_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
-        session_page.columnconfigure(0, weight=1)
-        session_page.rowconfigure(0, weight=1)
-        self.result_tabs.add(session_page, text="Details")
-        self.session = ReadOnlyText(session_page, self.palette, height=8, width=60)  # an item that could not be analysed: why
-        self.session.text.configure(font=("Consolas", 10), wrap="none")
-        self.session.grid(row=0, column=0, sticky="nsew")
-        self.details_frame = ttk.Frame(session_page, style="Surface.TFrame")  # a capability item: its figures as a table
-        self.details_frame.grid(row=0, column=0, sticky="nsew")
-        self.details_frame.columnconfigure(0, weight=1)
-        self.details_frame.rowconfigure(0, weight=1)
-        self.details = ttk.Treeview(self.details_frame, columns=("value",), show="tree headings", selectmode="none", height=10,
-                                    style="Compact.Treeview")
-        self.details.heading("#0", text="Metric", anchor="w")
-        self.details.heading("value", text="Value", anchor="e")
-        self.details.column("#0", width=200, minwidth=120, stretch=True)
-        self.details.column("value", width=130, minwidth=80, stretch=False, anchor="e")
-        self.details.tag_configure("group", font=("Segoe UI Semibold", 10))
-        details_bar = ttk.Scrollbar(self.details_frame, orient="vertical", command=self.details.yview)
-        details_bar.grid(row=0, column=1, sticky="ns")
-        self.details.configure(yscrollcommand=lambda lo, hi: self._scrolled(details_bar, lo, hi))
-        self.details.grid(row=0, column=0, sticky="nsew")
-        self.details.bind("<Button-1>", self._details_click, add="+")
-        for event in ("<<TreeviewOpen>>", "<<TreeviewClose>>"):
-            self.details.bind(event, lambda _e: self.after_idle(self._remember_advanced))
-        self.details_frame.grid_remove()
+        # Charts
+        chart_page = QWidget()
+        charts = QVBoxLayout(chart_page)
+        charts.setContentsMargins(4, 4, 4, 4)
+        self.chart_tools = QWidget()  # only for a capability histogram
+        tools = QHBoxLayout(self.chart_tools)
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.addStretch(1)
+        self.chart_scale_buttons = {}
+        scale_group = QButtonGroup(self)
+        for value, text in CHART_SCALES:
+            button = QToolButton()
+            button.setText(text)
+            button.setCheckable(True)
+            tools.addWidget(button)
+            self.chart_scale_buttons[value] = button
+        bind_radios(self.chart_scale_buttons, self.chart_scale_var, scale_group)
+        self.chart_tools.hide()
+        charts.addWidget(self.chart_tools)
+        self.chart_panel = ChartPanel()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.chart_panel)
+        charts.addWidget(scroll, 1)
+        self.result_tabs.addTab(chart_page, "Charts")
 
-        self.grr_frame = ttk.Frame(session_page, style="Surface.TFrame")  # a Gage R&R item: its tables, NDC above them
-        self.grr_frame.grid(row=0, column=0, sticky="nsew")
-        self.grr_frame.columnconfigure(0, weight=1)
-        self.grr_frame.rowconfigure(1, weight=1)
-        headline = self.grr_headline = ttk.Frame(self.grr_frame, style="Surface.TFrame")  # NDC and the column choice: Gage R&R only
-        headline.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        headline.columnconfigure(2, weight=1)
-        ttk.Label(headline, text="Number of Distinct Categories (NDC)", style="Surface.TLabel").grid(row=0, column=0)
-        self.ndc_label = ttk.Label(headline, textvariable=self.ndc_var, style="Section.TLabel")
-        self.ndc_label.grid(row=0, column=1, padx=(8, 0))
-        ttk.Checkbutton(headline, text="All columns", variable=self.all_columns_var, style="Toolbutton",
-                        command=lambda: self._show_details(self.selected_result())).grid(row=0, column=3, sticky="e")
-        names = tuple(f"c{i}" for i in range(GRR_COLUMNS))
-        self.grr_tree = ttk.Treeview(self.grr_frame, columns=names, show=(), selectmode="none", height=10, style="Compact.Treeview")
-        self.grr_tree.column("c0", width=230, minwidth=170, stretch=True, anchor="w")
-        for name in names[1:]:
-            self.grr_tree.column(name, width=96, minwidth=70, stretch=False, anchor="e")
-        grr_y = ttk.Scrollbar(self.grr_frame, orient="vertical", command=self.grr_tree.yview)
-        grr_y.grid(row=1, column=1, sticky="ns")
-        grr_x = ttk.Scrollbar(self.grr_frame, orient="horizontal", command=self.grr_tree.xview)
-        grr_x.grid(row=2, column=0, sticky="ew")
-        self.grr_tree.configure(yscrollcommand=lambda lo, hi: self._scrolled(grr_y, lo, hi),
-                                xscrollcommand=lambda lo, hi: self._scrolled(grr_x, lo, hi))
-        self.grr_tree.grid(row=1, column=0, sticky="nsew")
-        self.tables_note = ttk.Label(self.grr_frame, textvariable=self.tables_note_var, style="SurfaceHint.TLabel", wraplength=640,
-                                     justify="left")
-        self.tables_note.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.tables_note.grid_remove()
-        self.grr_frame.grid_remove()
+        # Details: an item that could not be analysed says why; Capability is a tree of figures; Gage R&R and Attribute are tables
+        self.details_stack = QStackedWidget()
+        self.session = ReadOnlyTextView()
+        self.details = QTreeWidget()  # a capability item: its figures as a table
+        self.details.setHeaderLabels(["Metric", "Value"])
+        self.details.setRootIsDecorated(True)
+        self.details.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.details.setColumnWidth(0, 260)
+        self.details.itemClicked.connect(self._details_click)
+        self.details.itemExpanded.connect(lambda _item: self._remember_advanced())
+        self.details.itemCollapsed.connect(lambda _item: self._remember_advanced())
+        self.grr_frame = QWidget()  # a Gage R&R item: its tables, NDC above them
+        grr = QVBoxLayout(self.grr_frame)
+        grr.setContentsMargins(0, 0, 0, 0)
+        self.grr_headline = QWidget()  # NDC and the column choice: Gage R&R only
+        headline = QHBoxLayout(self.grr_headline)
+        headline.setContentsMargins(0, 0, 0, 0)
+        headline.addWidget(label("Number of Distinct Categories (NDC)"))
+        self.ndc_label = label("", "heading")
+        bind_label(self.ndc_label, self.ndc_var)
+        headline.addWidget(self.ndc_label)
+        headline.addStretch(1)
+        self.all_columns_check = QCheckBox("All columns")
+        bind_check(self.all_columns_check, self.all_columns_var)
+        headline.addWidget(self.all_columns_check)
+        grr.addWidget(self.grr_headline)
+        self.grr_tree = DataTable(self.palette_tokens)
+        self.grr_tree.horizontalHeader().hide()
+        self.grr_tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        grr.addWidget(self.grr_tree, 1)
+        self.tables_note = label("", "muted", wrap=True)
+        bind_label(self.tables_note, self.tables_note_var, hide_empty=True)
+        grr.addWidget(self.tables_note)
+        for page in (self.session, self.details, self.grr_frame):
+            self.details_stack.addWidget(page)
+        self.result_tabs.addTab(self.details_stack, "Details")
 
-        checks_page = self.checks_page = ttk.Frame(self.result_tabs, style="Surface.TFrame", padding=4)
-        checks_page.columnconfigure(0, weight=1)
-        checks_page.rowconfigure(0, weight=1)
-        self.result_tabs.add(checks_page, text="Checks")
-        self.checks_tree = ttk.Treeview(checks_page, columns=("result", "status"), show="tree headings", selectmode="none", height=8,
-                                        style="Compact.Treeview")  # Check | Result | Status, a section for the data and one for the guidelines
-        for column, text, width, anchor, stretch in (("#0", "Check", 150, "w", False), ("result", "Result", 300, "w", True),
-                                                      ("status", "Status", 70, "w", False)):
-            self.checks_tree.heading(column, text=text, anchor="w")
-            self.checks_tree.column(column, width=width, minwidth=60, stretch=stretch, anchor=anchor)
-        self.checks_tree.tag_configure("group", font=("Segoe UI Semibold", 10))
-        checks_y = ttk.Scrollbar(checks_page, orient="vertical", command=self.checks_tree.yview)
-        checks_y.grid(row=0, column=1, sticky="ns")
-        self.checks_tree.configure(yscrollcommand=lambda lo, hi: self._scrolled(checks_y, lo, hi))
-        self.checks_tree.grid(row=0, column=0, sticky="nsew")
-        self.notes_link = ttk.Button(checks_page, text="Notes on this analysis…", command=self.show_notes)  # what the report says about the readings
-        self.notes_link.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.notes_link.grid_remove()
-
-    @staticmethod
-    def _scrolled(bar: ttk.Scrollbar, low: str, high: str) -> None:
-        """A scrollbar that is there only while there is something to scroll: the room goes to the data."""
-        if float(low) <= 0.0 and float(high) >= 1.0:
-            bar.grid_remove()
-        else:
-            bar.grid()
-        bar.set(low, high)
-
-    def _arrange_results(self, event=None) -> None:
-        """Wide window: the table beside the charts, each with the full height. Narrower: the table above, with a few rows."""
-        width, height = self.results_tab.winfo_width(), self.results_tab.winfo_height()
-        if width < 200 or height < 200:
-            return
-        wide = width >= WIDE_RESULTS
-        if wide != self._wide or self.split.winfo_manager() == "":
-            old, new = (self.split_rows, self.split_cols) if wide else (self.split_cols, self.split_rows)
-            for pane in (self.table_page, self.right_pane):
-                if str(pane) in old.panes():
-                    old.forget(pane)
-            old.grid_remove()
-            new.add(self.table_page, weight=1)
-            new.add(self.right_pane, weight=2 if wide else 3)
-            new.grid(row=1, column=0, sticky="nsew")
-            self.split, self._wide = new, wide
-            self._sash_set[wide] = False
-            (self.selected_label.grid if wide else self.selected_label.grid_remove)()
-            self.update_idletasks()  # a divider can only be placed once the panes have been laid out
-        if not self._sash_set[wide]:
-            self._place_sash()
-
-    def _place_sash(self) -> None:
-        """The table gets a third of a wide window (but not less than its columns need), or a few rows of a narrow one; the user can drag."""
-        wide = self._wide
-        size = self.split.winfo_width() if wide else self.split.winfo_height()
-        if size < (400 if wide else 260):
-            return
-        target = max(380, min(560, size * 36 // 100)) if wide else 170 if size > 380 else 140
-        self.split.sashpos(0, target)
-        self._sash_set[wide] = abs(self.split.sashpos(0) - target) <= 3  # not placed yet: the next resize tries again
+        # Checks: Check | Result | Status, a section for the data and one for the guidelines
+        self.checks_page = QWidget()
+        checks = QVBoxLayout(self.checks_page)
+        checks.setContentsMargins(4, 4, 4, 4)
+        self.checks_tree = QTreeWidget()
+        self.checks_tree.setHeaderLabels(["Check", "Result", "Status"])
+        self.checks_tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.checks_tree.setColumnWidth(0, 150)
+        self.checks_tree.header().setStretchLastSection(False)
+        self.checks_tree.header().setSectionResizeMode(1, self.checks_tree.header().ResizeMode.Stretch)
+        checks.addWidget(self.checks_tree, 1)
+        self.notes_link = make_button("Notes on this analysis…", self.show_notes)  # what the report says about the readings
+        self.notes_link.hide()
+        checks.addWidget(self.notes_link, 0, Qt.AlignmentFlag.AlignLeft)
+        self.result_tabs.addTab(self.checks_page, "Checks")
+        self.sort_combo.currentTextChanged.connect(lambda text: self.sort_var.set(text) if text else None)
 
     def _build_report(self) -> None:
-        tab = self.report_tab
-        tab.columnconfigure(2, weight=1)
-        tab.rowconfigure(2, weight=1)
-        left = ttk.Frame(tab, style="Surface.TFrame")
-        left.grid(row=0, column=0, sticky="nw", padx=(0, 40))
-        ttk.Label(left, text="Study information (optional)", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        self.info_entries = {}
+        layout = QVBoxLayout(self.report_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        columns = QHBoxLayout()
+        columns.setSpacing(40)
+        left = QGridLayout()
+        left.setVerticalSpacing(8)
+        left.addWidget(label("Study information (optional)", "heading"), 0, 0, 1, 2)
+        self.info_entries: dict[str, QLineEdit] = {}
         fields = (("Gage name", self.gage_var), ("Date of study", self.date_var), ("Reported by", self.by_var), ("Misc", self.comments_var))
-        for row, (label, variable) in enumerate(fields, start=1):
-            ttk.Label(left, text=label, style="Surface.TLabel").grid(row=row, column=0, sticky="w", pady=3, padx=(0, 10))
+        for row, (title, variable) in enumerate(fields, start=1):
+            left.addWidget(label(title), row, 0)
+            entry = QLineEdit()
+            entry.setMinimumWidth(280)
+            bind_edit(entry, variable)
             if variable is self.date_var:  # chosen from a calendar, never typed
-                field = ttk.Frame(left, style="Surface.TFrame")
-                field.grid(row=row, column=1, sticky="w", pady=3)
-                entry = ttk.Entry(field, textvariable=variable, width=14, state="readonly")
-                entry.pack(side="left")
-                entry.bind("<Button-1>", lambda _e: self.choose_date())
-                self.date_button = ttk.Button(field, text="Choose date…", command=self.choose_date)
-                self.date_button.pack(side="left", padx=8)
+                entry.setReadOnly(True)
+                entry.setMaximumWidth(130)
+                self.date_button = make_button("Choose date…", self.choose_date)
+                left.addLayout(_row(entry, self.date_button, 1), row, 1)
             else:
-                entry = ttk.Entry(left, textvariable=variable, width=40)
-                entry.grid(row=row, column=1, sticky="w", pady=3)
-            self.info_entries[label] = entry
-        ttk.Label(left, text="Shown with each item when entered. The date of study is today unless you choose another day "
-                  "(DD-MM-YYYY).", style="SurfaceHint.TLabel",
-                  wraplength=360, justify="left").grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                left.addWidget(entry, row, 1)
+            self.info_entries[title] = entry
+        left.addWidget(label("Shown with each item when entered. The date of study is today unless you choose another day "
+                             "(DD-MM-YYYY).", "muted", wrap=True), len(fields) + 1, 0, 1, 2)
+        left.setRowStretch(len(fields) + 2, 1)
+        columns.addLayout(left)
 
-        right = ttk.Frame(tab, style="Surface.TFrame")
-        right.grid(row=0, column=1, sticky="nw")
-        ttk.Label(right, text="Include", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        checks = ttk.Frame(right, style="Surface.TFrame")
-        checks.grid(row=1, column=0, sticky="w")
+        right = QVBoxLayout()
+        right.addWidget(label("Include", "heading"))
+        self.section_checks = {}
         for name in ALL_SECTIONS:
-            ttk.Checkbutton(checks, text=SECTION_NAMES[name], variable=self.sections[name], style="Surface.TCheckbutton").pack(anchor="w")
-        items = ttk.Frame(right, style="Surface.TFrame")
-        items.grid(row=2, column=0, sticky="ew", pady=(10, 4))
-        items.columnconfigure(0, weight=1)
-        ttk.Label(items, textvariable=self.coverage_var, style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(items, text="None", width=6, command=lambda: self._select_items(False)).grid(row=0, column=1, padx=(0, 4))
-        ttk.Button(items, text="All", width=6, command=lambda: self._select_items(True)).grid(row=0, column=2)
-        box = ttk.Frame(right, style="Surface.TFrame")
-        box.grid(row=3, column=0, sticky="nw")
-        self.item_list = tk.Listbox(box, selectmode="extended", exportselection=False, height=8, width=46, activestyle="none",
-                                    relief="flat", highlightthickness=1)
-        self.item_list.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(box, orient="vertical", command=self.item_list.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.item_list.configure(yscrollcommand=scroll.set)
-        self.item_list.bind("<<ListboxSelect>>", lambda _e: self._update_coverage())
+            check = QCheckBox(SECTION_NAMES[name])
+            bind_check(check, self.sections[name])
+            right.addWidget(check)
+            self.section_checks[name] = check
+        items = QHBoxLayout()
+        self.coverage_label = label("", "heading")
+        bind_label(self.coverage_label, self.coverage_var)
+        items.addWidget(self.coverage_label, 1)
+        items.addWidget(make_button("None", lambda: self._select_items(False)))
+        items.addWidget(make_button("All", lambda: self._select_items(True)))
+        right.addLayout(items)
+        self.item_list = QListWidget()
+        self.item_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.item_list.setMinimumWidth(320)
+        self.item_list.itemSelectionChanged.connect(self._update_coverage)
+        right.addWidget(self.item_list, 1)
+        columns.addLayout(right, 1)
+        layout.addLayout(columns, 1)
 
-        actions = ttk.Frame(tab, style="Surface.TFrame")
-        actions.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(14, 0))
-        actions.columnconfigure(2, weight=1)
-        self.pdf_button = ttk.Button(actions, text="Generate PDF…", style="Accent.TButton", command=lambda: self.generate_report(".pdf"))
-        self.pdf_button.grid(row=0, column=0)
-        self.excel_button = ttk.Button(actions, text="Generate Excel…", command=lambda: self.generate_report(".xlsx"))
-        self.excel_button.grid(row=0, column=1, padx=6)
-        self.report_label = ttk.Label(actions, textvariable=self.report_var, style="SurfaceHint.TLabel", wraplength=500, justify="left")
-        self.report_label.grid(row=0, column=2, sticky="w", padx=10)
-        self.open_button = ttk.Button(actions, text="Open", command=self.open_report, state="disabled")
-        self.open_button.grid(row=0, column=3)
-        actions.bind("<Configure>", lambda e: self.report_label.configure(wraplength=max(160, e.width - 380)))
+        actions = QHBoxLayout()
+        self.pdf_button = make_button("Generate PDF…", lambda: self.generate_report(".pdf"), primary=True)
+        self.excel_button = make_button("Generate Excel…", lambda: self.generate_report(".xlsx"))
+        self.report_label = label("", "muted", wrap=True)
+        bind_label(self.report_label, self.report_var)
+        self.open_button = make_button("Open", self.open_report)
+        self.open_button.setEnabled(False)
+        actions.addWidget(self.pdf_button)
+        actions.addWidget(self.excel_button)
+        actions.addWidget(self.report_label, 1)
+        actions.addWidget(self.open_button)
+        layout.addLayout(actions)
 
     # ------------------------------------------------------------------ small helpers
     @property
@@ -709,12 +733,12 @@ class ValidationWorkspace(ttk.Frame):
     def results(self) -> list:
         return list(self.evaluated.results) if self.evaluated else []
 
-    def _dialog_parent(self):
-        return self.winfo_toplevel()
+    def _dialog_parent(self) -> QWidget:
+        return self.window()
 
     def _order_key(self) -> str:
-        label = self.order_var.get()
-        return next((key for key, text in ORDERS.items() if text == label), "worksheet")
+        label_text = self.order_var.get()
+        return next((key for key, text in ORDERS.items() if text == label_text), "worksheet")
 
     def set_customers(self, customers, selected=None) -> None:
         """Adopt the customers edited in the dialog and keep them for next time."""
@@ -722,76 +746,74 @@ class ValidationWorkspace(ttk.Frame):
         if self.settings is not None:
             self.settings.customer_criteria = customers_to_json(self.customers)
             self._save_settings()
-        self.customer_combo.configure(values=[NO_CRITERIA, *self.customers])
+        self.customer_combo.blockSignals(True)
+        self.customer_combo.clear()
+        self.customer_combo.addItems([NO_CRITERIA, *self.customers])
+        self.customer_combo.blockSignals(False)
         target = selected or self.profile_var.get()
         previous = self.profile_var.get()
         self.profile_var.set(target if target in self.customers else NO_CRITERIA)
+        bind_index = self.customer_combo.findText(self.profile_var.get())
+        self.customer_combo.setCurrentIndex(bind_index)
         if self.profile_var.get() == previous:
             self._settings_changed()  # the same customer with new limits
 
     def set_palette(self, palette: Palette) -> None:
-        self.palette = palette
-        self.notes_label.configure(foreground=palette.warn)
-        self.hint_label.configure(foreground=palette.warn)
-        self.preview.tag_configure("inferred", foreground=palette.muted)
-        self.review_label.configure(foreground=palette.warn)
-        for status, color in (("PASS", palette.ok), ("CONDITIONAL PASS", palette.warn), ("FAIL", palette.danger), ("N/A", palette.muted)):
-            self.table.tag_configure(status, foreground=color)
-        self.session.text.configure(bg=palette.surface, fg=palette.fg, insertbackground=palette.fg,
-                                    highlightbackground=palette.line, highlightcolor=palette.accent)
-        for status, color in (("Critical", palette.danger), ("Issue", palette.danger), ("Review", palette.warn), ("Info", palette.muted),
-                              ("OK", palette.muted)):  # a guideline is never a verdict colour
-            self.checks_tree.tag_configure(status, foreground=color)
-        for tree in (self.checks_tree, self.details):
-            tree.tag_configure("group", background=palette.soft)
-        self.grr_tree.tag_configure("section", background=palette.soft, foreground=palette.fg, font=("Segoe UI Semibold", 10))
-        self.grr_tree.tag_configure("head", foreground=palette.muted, font=("Segoe UI Semibold", 9))
-        self.item_list.configure(bg=palette.surface, fg=palette.fg, selectbackground=palette.accent,
-                                 selectforeground=palette.on_accent, highlightbackground=palette.line, highlightcolor=palette.accent)
+        self.palette_tokens = palette
+        for table in (self.preview, self.table, self.grr_tree):
+            table.set_palette(palette)
+        self._show_details(self.selected_result())
+        self._show_checks(self.selected_result())
+        self._draw_chart()
 
     # ------------------------------------------------------------------ layout switches
     def _apply_method_layout(self) -> None:
         method = self.method_var.get()
         for name, frame in (("grr", self.grr_setup), ("capability", self.cap_setup), ("attribute", self.attr_setup)):
-            (frame.grid if method == name else frame.grid_remove)()
-        self.sort_combo.configure(values={"capability": ("Test Item", "Cpk", "Ppk"),
-                                          "attribute": ("Test Item", "Within %", "vs Standard %", "Kappa")}.get(
-            method, ("Test Item", "%SV/Tol", "%Study Var", "NDC")))
-        if self.sort_var.get() not in self.sort_combo.cget("values"):
-            self.sort_var.set("Test Item")
+            frame.setVisible(method == name)
+        choices = {"capability": ("Test Item", "Cpk", "Ppk"), "attribute": ("Test Item", "Within %", "vs Standard %", "Kappa")}.get(
+            method, ("Test Item", "%SV/Tol", "%Study Var", "NDC"))
+        current = self.sort_var.get() if self.sort_var.get() in choices else "Test Item"
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.clear()
+        self.sort_combo.addItems(choices)
+        self.sort_combo.setCurrentText(current)
+        self.sort_combo.blockSignals(False)
+        if self.sort_var.get() != current:
+            self.sort_var.set(current)
         attribute = method == "attribute"  # ratings have a Rating and a Standard, no limits or unit
-        self.preview.configure(displaycolumns=ATTRIBUTE_COLUMNS if attribute else DISPLAY_COLUMNS)
-        self.preview.heading("value", text="Rating" if attribute else "Value")
-        self.preview.heading("operator", text="Appraiser" if attribute else "Operator")
+        self._show_preview_columns(ATTRIBUTE_COLUMNS if attribute else DISPLAY_COLUMNS)
+        titles = {**PREVIEW_TITLES, "value": "Rating" if attribute else "Value", "operator": "Appraiser" if attribute else "Operator"}
+        self.preview.table_model.set_headings([titles[c] for c in PREVIEW_COLUMNS])
 
     def _toggle_advanced(self) -> None:
-        if self.advanced.winfo_manager():
-            self.advanced.grid_remove()
-            self.advanced_button.configure(text="Advanced Settings ▸")
-        else:
-            self.advanced.grid()
-            self.advanced_button.configure(text="Advanced Settings ▾")
+        opened = self.advanced.isHidden()
+        self.advanced.setVisible(opened)
+        self.advanced_button.setText("Advanced Settings ▼" if opened else "Advanced Settings ►")
 
     def _apply_judge_layout(self) -> None:
         for row in (self.criteria_row, self.agreement_row):  # the threshold of the method on screen; the other one is hidden with its frame
-            (row.grid if self.judge_var.get() else row.grid_remove)()
+            row.setVisible(bool(self.judge_var.get()))
 
     def _apply_source_layout(self) -> None:
         """What belongs to the chosen source: File assignments only for Data Mapping results that exist; the choice file for an import."""
         mapping = self.source_var.get() == "mapping"
-        for frame, shown in ((self.mapping_controls, mapping and bool(self.grouped)), (self.file_controls, not mapping)):
-            if shown:
-                frame.pack(side="left", padx=(16, 0))
-            else:
-                frame.pack_forget()
-        self.file_button.configure(text="Import ratings…" if self.source_var.get() == "ratings" else "Choose file…")
+        self.mapping_controls.setVisible(mapping and bool(self.grouped))
+        self.file_controls.setVisible(not mapping)
+        self.file_button.setText("Import ratings…" if self.source_var.get() == "ratings" else "Choose file…")
         keys = list(ORDERS) if mapping else list(FILE_ORDERS)
-        self.order_menu.delete(0, "end")
-        self.order_menu.add_command(label="Order of the readings", state="disabled")
-        for key in keys:
-            self.order_menu.add_radiobutton(label=ORDERS[key], variable=self.order_var, value=ORDERS[key])
         if self._order_key() not in keys:
             self.order_var.set(ORDERS["worksheet"])
+        self.order_menu.clear()
+        for action in list(self.order_group.actions()):
+            self.order_group.removeAction(action)
+        self.order_menu.addAction("Order of the readings").setEnabled(False)
+        for key in keys:
+            action = QAction(ORDERS[key], self.order_menu, checkable=True)
+            action.setChecked(ORDERS[key] == self.order_var.get())
+            action.triggered.connect(lambda _checked=False, text=ORDERS[key]: self.order_var.set(text))
+            self.order_group.addAction(action)
+            self.order_menu.addAction(action)
 
     def _source_kind_changed(self) -> None:
         self._apply_source_layout()
@@ -800,7 +822,7 @@ class ValidationWorkspace(ttk.Frame):
     # ------------------------------------------------------------------ the data
     def source_changed(self) -> None:
         """Data Mapping's results changed (a scan, a selection, a duplicate choice). Picked up now if on screen, else on show."""
-        if self.winfo_ismapped():
+        if self.isVisible():
             self.on_show()
 
     def on_show(self) -> None:
@@ -831,8 +853,8 @@ class ValidationWorkspace(ttk.Frame):
             self._prepare_dataset()
 
     def choose_ratings(self) -> None:
-        path = filedialog.askopenfilename(parent=self._dialog_parent(), title="Choose a ratings table",
-                                          filetypes=[("CSV or Excel", "*.csv *.xlsx *.txt *.tsv"), ("All files", "*.*")])
+        path, _ = QFileDialog.getOpenFileName(self._dialog_parent(), "Choose a ratings table", "",
+                                              "CSV or Excel (*.csv *.xlsx *.txt *.tsv);;All files (*.*)")
         if not path:
             return
         name = Path(path).name
@@ -846,10 +868,12 @@ class ValidationWorkspace(ttk.Frame):
             self._refresh_state()
 
         def loaded(table):
+            from .ratings_import import RatingsImportDialog
+
             self.preparing = False
             self.message_var.set("Choose the columns of the ratings, then press Import.")
             self._refresh_state()
-            RatingsImportDialog(self._dialog_parent(), table, self._ratings_ready)
+            RatingsImportDialog(self._dialog_parent(), table, self._ratings_ready).present()
 
         self.tasks.run(lambda _report: read_ratings_table(path), on_success=loaded, on_error=failed)
 
@@ -869,10 +893,10 @@ class ValidationWorkspace(ttk.Frame):
     def choose_file(self) -> None:
         if self.source_var.get() == "ratings":
             return self.choose_ratings()
-        path = filedialog.askopenfilename(parent=self._dialog_parent(), title="Choose a RawData.xlsx",
-                                          filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")])
+        path, _ = QFileDialog.getOpenFileName(self._dialog_parent(), "Choose a RawData.xlsx", "", "Excel workbook (*.xlsx);;All files (*.*)")
         if path:
             self.open_file(Path(path))
+        return None
 
     def open_file(self, path: Path) -> None:
         self.message_var.set(f"Reading {path.name}…")
@@ -894,6 +918,16 @@ class ValidationWorkspace(ttk.Frame):
                 self._prepare_dataset()
 
         self.tasks.run(lambda _report: import_rawdata_xlsx(path), on_success=loaded, on_error=failed)
+
+    def open_assignments(self) -> None:
+        from .validation_dialogs import AssignmentDialog
+
+        AssignmentDialog(self).present()
+
+    def open_customers(self) -> None:
+        from .validation_dialogs import CustomersDialog
+
+        CustomersDialog(self).present()
 
     def data_edited(self) -> None:
         """File assignments or the order changed: take a new snapshot."""
@@ -942,8 +976,7 @@ class ValidationWorkspace(ttk.Frame):
         self.dataset = self.study = self.result_set = self.evaluated = None
         self.dataset_var.set("No data yet.")
         self.hint_var.set("")
-        self.hint_label.grid_remove()
-        self.preview.delete(*self.preview.get_children())
+        self.preview.table_model.set_rows([])
         self._fill_item_filter([])
         self.preview_note_var.set("")
         self._apply_source_layout()
@@ -1001,17 +1034,18 @@ class ValidationWorkspace(ttk.Frame):
         attribute = study.options.method == "attribute"
         self.dataset_var.set(attribute_summary(rows) if attribute else self._summary(rows))
         self.hint_var.set("  ".join(warnings))
-        (self.hint_label.grid if warnings else self.hint_label.grid_remove)()
         items = list(dict.fromkeys(str(row.test_item) for row in rows))
         self._fill_item_filter(items)
         chosen = self.item_filter_var.get()
         listed = [entry for entry in self._with_trials(rows) if chosen == ALL_ITEMS or str(entry[0].test_item) == chosen]
-        self.preview.delete(*self.preview.get_children())
-        for index, (row, trial, inferred) in enumerate(listed[:PREVIEW_ROWS]):
-            self.preview.insert("", "end", iid=str(index), tags=("inferred",) if inferred else (), values=(
-                row.test_item, row.sample_id, row.operator or ("1" if attribute else ""), trial, self._cell(row.value),
-                self._cell(row.lsl), self._cell(row.usl), row.unit, row.source, row.standard))
-        shown = min(PREVIEW_ROWS, len(listed))
+        shown_rows, tags = [], []
+        for row, trial, inferred in listed[:PREVIEW_ROWS]:
+            shown_rows.append((row.test_item, row.sample_id, row.operator or ("1" if attribute else ""), trial, self._cell(row.value),
+                               self._cell(row.lsl), self._cell(row.usl), row.unit, row.source, row.standard))
+            tags.append("inferred" if inferred else "")
+        self.preview.table_model.set_rows(shown_rows, tags)
+        self.preview.fit_columns(stretch=0, max_width=300)
+        shown = len(shown_rows)
         note = f"Showing the first {shown} of {len(listed)} readings." if shown < len(listed) else f"{len(listed)} readings."
         if any(inferred for _, _, inferred in listed[:shown]):
             note += " Trial numbers in grey are counted from the row order of each sample; they are not the order of measurement."
@@ -1038,10 +1072,16 @@ class ValidationWorkspace(ttk.Frame):
                 f"Total Readings {len(rows)}  ·  Trials per Sample {trials}")
 
     def _fill_item_filter(self, items: Sequence[str]) -> None:
-        self.item_filter.configure(values=[ALL_ITEMS, *items])
-        if self.item_filter_var.get() not in (ALL_ITEMS, *items):
-            self._filter_sync = True  # going back to all items is not a choice to redraw for: the table is being redrawn anyway
-            self.item_filter_var.set(ALL_ITEMS)
+        self._filter_sync = True  # rebuilding the list is not a choice to redraw for: the table is being redrawn anyway
+        try:
+            current = self.item_filter_var.get()
+            self.item_filter.blockSignals(True)
+            self.item_filter.clear()
+            self.item_filter.addItems([ALL_ITEMS, *items])
+            self.item_filter.blockSignals(False)
+            self.item_filter_var.set(current if current in (ALL_ITEMS, *items) else ALL_ITEMS)
+            self.item_filter.setCurrentText(self.item_filter_var.get())
+        finally:
             self._filter_sync = False
 
     def _with_trials(self, rows: Sequence) -> list[tuple]:
@@ -1065,8 +1105,8 @@ class ValidationWorkspace(ttk.Frame):
 
     # ------------------------------------------------------------------ the study
     def _within_key(self) -> str:
-        label = self.within_var.get()
-        return next((key for key, text in WITHIN_CHOICES.items() if text == label), "auto")
+        text = self.within_var.get()
+        return next((key for key, name in WITHIN_CHOICES.items() if name == text), "auto")
 
     def _auto_within(self, design: dict) -> str:
         """Within sigma chosen from the subgroup size (cached: it is read on every change of a setting)."""
@@ -1124,7 +1164,7 @@ class ValidationWorkspace(ttk.Frame):
             raise ValueError(f"{self.index_var.get().capitalize()} must exceed: enter a number such as 1.33.") from None
         return EvaluationSettings(cpk_threshold=threshold, decision_metric=self.index_var.get())
 
-    def _settings_changed(self, *_) -> None:
+    def _settings_changed(self) -> None:
         study = self.study
         if study is None:
             self._refresh_state()
@@ -1147,11 +1187,13 @@ class ValidationWorkspace(ttk.Frame):
         self._refresh_state()
 
     def choose_date(self) -> None:
+        from .validation_dialogs import DatePickerDialog
+
         try:
             current = datetime.strptime(self.date_var.get(), DATE_FORMAT).date()
         except ValueError:
             current = date.today()
-        DatePickerDialog(self._dialog_parent(), current, self._date_picked)
+        DatePickerDialog(self._dialog_parent(), current, self._date_picked).present()
 
     def _date_picked(self, day: date) -> None:
         self._date_chosen = True
@@ -1191,13 +1233,13 @@ class ValidationWorkspace(ttk.Frame):
         self._settings_changed()
         if self.setup_error:
             self.message_var.set(self.setup_error)
-            self.tabs.select(self.setup_tab)
+            self.tabs.setCurrentWidget(self.setup_tab)
             return
         try:
             plan = study.plan_statistics()  # the study is read here, on this thread
         except ValueError as exc:
             self.message_var.set(str(exc))
-            self.tabs.select(self.setup_tab)
+            self.tabs.setCurrentWidget(self.setup_tab)
             return
         self.running = True
         self.message_var.set("Analysing…")
@@ -1211,7 +1253,8 @@ class ValidationWorkspace(ttk.Frame):
             self._evaluate()
             self.message_var.set(f"{len(result_set.statistics)} item/system groups analysed.")
             self._refresh_state()
-            self.tabs.select(self.results_tab)
+            self.tabs.setCurrentWidget(self.results_tab)
+            return None
 
         def failed(exc):
             self.running = False
@@ -1257,8 +1300,8 @@ class ValidationWorkspace(ttk.Frame):
         if self.evaluated is None:
             return
         lines = []
-        for label, message in self._problems():
-            lines += [f"Not analysed: {label}", message, ""]
+        for item_name, message in self._problems():
+            lines += [f"Not analysed: {item_name}", message, ""]
         for condition in self.evaluated.record.validation.conditions:
             kind = "Warning" if condition.severity.value == "warning" else "Information"
             lines += [f"{CONDITION_TITLES.get(condition.code, condition.code)} ({kind})", condition.message, ""]
@@ -1267,7 +1310,8 @@ class ValidationWorkspace(ttk.Frame):
                       "(Anderson-Darling) on the readings. Those checks are an aid: they are not printed in the report, so the "
                       "notes above stand in the report as they are.", ""]
         lines.append("These notes do not block a result or a report; the report prints them.")
-        ReportDialog(self._dialog_parent(), "Notes on this analysis", "What to keep in mind when reading the results", "\n".join(lines))
+        ReportDialog(self._dialog_parent(), "Notes on this analysis", "What to keep in mind when reading the results",
+                     "\n".join(lines)).present()
 
     # ------------------------------------------------------------------ what is enabled and said
     def _refresh_state(self) -> None:
@@ -1276,9 +1320,9 @@ class ValidationWorkspace(ttk.Frame):
         stale = self.stale
         pending = ATTRIBUTE_PENDING if self.method_var.get() == "attribute" and not attribute_runnable() else ""
         blocked = self.setup_error or pending
-        self.run_button.configure(state="normal" if has_data and not blocked and not self.busy else "disabled")
+        self.run_button.setEnabled(has_data and not blocked and not self.busy)
         for tab, enabled in ((self.setup_tab, has_data), (self.results_tab, has_result), (self.report_tab, has_result)):
-            self.tabs.tab(tab, state="normal" if enabled else "disabled")
+            self.tabs.setTabEnabled(self.tabs.indexOf(tab), enabled)
         if blocked:
             self.message_var.set(blocked)
         self.plan_var.set(self._plan_text())
@@ -1287,14 +1331,14 @@ class ValidationWorkspace(ttk.Frame):
         if stale and not self.running:
             self.stale_var.set("The data or the study settings changed since these results were computed. They are shown for reference "
                                "only and cannot be reported. Update the results to continue.")
-            self.stale_banner.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+            self.stale_banner.show()
         else:
-            self.stale_banner.grid_remove()
-        self.update_button.configure(state="normal" if has_data and not blocked and not self.busy else "disabled")
+            self.stale_banner.hide()
+        self.update_button.setEnabled(has_data and not blocked and not self.busy)
         withheld = has_result and self.evaluated.record.method == "attribute" and not attribute_reportable()
         reportable = has_result and not stale and not self.busy and not withheld
         for button in (self.pdf_button, self.excel_button):
-            button.configure(state="normal" if reportable else "disabled")
+            button.setEnabled(reportable)
         self._refresh_notes()
         if withheld:
             self.report_var.set(ATTRIBUTE_REPORT_PENDING)
@@ -1311,37 +1355,32 @@ class ValidationWorkspace(ttk.Frame):
         return [(stat.label, issue.message) for stat in self.result_set.statistics for issue in stat.issues if issue.severity == "error"]
 
     def _refresh_notes(self) -> None:
-        failed = {label for label, _ in self._problems()}
+        failed = {item_name for item_name, _ in self._problems()}
         if failed:  # what has to be fixed; every other note is on the Checks tab
             self.notes_var.set(f"{len(failed)} item{'s' if len(failed) != 1 else ''} could not be analysed. Read the notes to see what to fix.")
-            self.notes_label.configure(foreground=self.palette.warn)
-            self.notes_bar.grid()
+            self.notes_bar.show()
         else:
             self.notes_var.set("")
-            self.notes_bar.grid_remove()
+            self.notes_bar.hide()
 
     # ------------------------------------------------------------------ results
     def _refresh_table(self) -> None:
-        self.table.delete(*self.table.get_children())
         evaluated = self.evaluated
         results = list(evaluated.results) if evaluated else []
         if not results:
+            self.table.table_model.set_rows([])
             self._visible, self._charts = [], []
             self.summary_var.set("")
             self.selected_var.set("")
             self.review_var.set("")
-            self.review_label.grid_remove()
-            self.chart_canvas.delete("all")
+            self.chart_panel.set_specs([])
             self._marked = set()
             self._show_details(None)
             self._show_checks(None)
             return
         judged = evaluated.record.judged
         self.summary_var.set(summary_line(results, judged, sum(1 for result in results if self._needs_review(result))))
-        if judged and not self.filter_combo.winfo_manager():
-            self.filter_combo.grid(row=0, column=2, padx=(6, 0))  # filtering by result needs criteria
-        elif not judged:
-            self.filter_combo.grid_remove()
+        self.filter_combo.setVisible(judged)  # filtering by result needs criteria
         flagged = [r for r in results if r.details.get("acceptance_conflicts")]
         if flagged:
             names = ", ".join(dict.fromkeys(review_note(r) for r in flagged))
@@ -1349,46 +1388,36 @@ class ValidationWorkspace(ttk.Frame):
                 f"Review needed: {len(flagged)} of {len(results)} results are acceptable for the applied criteria, but a metric that "
                 f"is not applied would fail on its own limits ({names}; see the Review column). The measurement system may not "
                 "distinguish the sampled parts, or the tolerance is much wider than the process spread.")
-            self.review_label.grid()
         else:
             self.review_var.set("")
-            self.review_label.grid_remove()
         query, wanted = self.search_var.get().casefold(), self.filter_var.get() if judged else STATUSES[0]
         self._visible = [r for r in results if query in r.label.casefold() and (wanted == STATUSES[0] or r.status == wanted)]
         metric = SORT_KEYS.get(self.sort_var.get())
         self._visible.sort(key=lambda r: (r.metrics.get(metric) is None, r.metrics.get(metric) or 0) if metric else (r.test_item, r.system))
         if not self._visible:
+            self.table.table_model.set_rows([])
             self._charts = []
-            self.chart_canvas.delete("all")
+            self.chart_panel.set_specs([])
             return
         all_headers, all_rows = summary_rows(self._visible, judged)
         left_out = {"Mean", "Min", "Max", "Decision Metric"} | (set() if any(r.system for r in self._visible) else {"System"})
         keep = [i for i, h in enumerate(all_headers) if h not in left_out]  # the rest is in Calculation details and the report
         headers = [all_headers[i] for i in keep]
-        self.table.configure(columns=tuple(str(i) for i in range(len(headers))))
         status_column = next((i for i, h in enumerate(headers) if h in ("Result", "Acceptance Result")), None)
         precision = self._precision()
-        self._marked, shown = set(), []
+        self._marked, shown, tags = set(), [], []
         for i, row in enumerate(all_rows):
             values = [summary_number(row[k], all_headers[k], precision, self._visible[i].method) for k in keep]
             if self._needs_review(self._visible[i]):
                 values[0] += WARNING_MARK
-                self._marked.add(str(i))
+                self._marked.add(i)
             if status_column is not None:
                 values[status_column] = self._visible[i].status
             shown.append(values)
-        body, heading_font = self._table_fonts()
-        for i, heading in enumerate(headers):  # a column is as wide as its heading and its widest figure need; text left, figures right
-            fit = max(heading_font.measure(heading) + 36, *(body.measure(values[i]) + 28 for values in shown))
-            anchor = "w" if i == 0 or i == status_column or heading == "Review" else "e"
-            self.table.heading(str(i), text=heading, anchor=anchor)
-            self.table.column(str(i), width=max(fit, 150 if i == 0 else 56), minwidth=max(fit, 120 if i == 0 else 56),
-                              stretch=i == 0, anchor=anchor)
-        for i, values in enumerate(shown):
-            self.table.insert("", "end", iid=str(i), values=values, tags=(values[status_column],) if status_column is not None else ())
-        self.set_palette(self.palette)
-        self.table.selection_set("0")
-        self._select_result()
+            tags.append(values[status_column] if status_column is not None else "")
+        aligns = ["w" if i == 0 or i == status_column or heading == "Review" else "e" for i, heading in enumerate(headers)]
+        self.table.set_table(headers, shown, tags, aligns=aligns, stretch=0)
+        self.table.select_row(0)
 
     def _precision(self) -> int:
         try:
@@ -1397,39 +1426,28 @@ class ValidationWorkspace(ttk.Frame):
             return 2
 
     def selected_result(self):
-        selected = self.table.selection()
-        return self._visible[int(selected[0])] if selected and int(selected[0]) < len(self._visible) else None
+        index = self.table.currentIndex()  # already moved when the row signal arrives; the selection model is not yet
+        row = index.row() if index.isValid() else None
+        return self._visible[row] if row is not None and row < len(self._visible) else None
 
-    def _select_result(self, *_) -> None:
+    def _select_result(self, *_args) -> None:
         result = self.selected_result()
         self._charts = report_charts(result, titled=True) if result else []
         self._scaled = result is not None and result.method == "capability"
-        (self.chart_tools.grid if self._scaled else self.chart_tools.grid_remove)()
+        self.chart_tools.setVisible(self._scaled)
         self._draw_chart()
         self.selected_var.set(item_label(result) if result else "")
         self._show_details(result)
         self._show_checks(result)
 
-    def _table_click(self, event) -> None:
-        row = self.table.identify_row(event.y)
-        if self.table.identify_column(event.x) == "#1" and self._on_mark(row, event.x):
-            self.table.selection_set(row)
-            self.result_tabs.select(self.checks_page)
+    def _table_click(self, row: int, column: int, x: int) -> None:
+        if column == 0 and self._on_mark(row, x):
+            self.table.select_row(row)
+            self.result_tabs.setCurrentWidget(self.checks_page)
 
-    def _table_hover(self, event) -> None:
-        self.table.configure(cursor="hand2" if self.table.identify_column(event.x) == "#1"
-                             and self._on_mark(self.table.identify_row(event.y), event.x) else "")
-
-    def _table_fonts(self) -> tuple[tkfont.Font, tkfont.Font]:
-        """The fonts of the cells and of the headings of a table, to size its columns by."""
-        style = ttk.Style(self)
-
-        def font(element: str, fallback: str) -> tkfont.Font:
-            try:
-                return tkfont.Font(root=self, font=style.lookup(element, "font") or fallback)
-            except tk.TclError:
-                return tkfont.nametofont("TkDefaultFont", root=self)
-        return font("Treeview", "TkDefaultFont"), font("Treeview.Heading", "TkHeadingFont")
+    def _table_hover(self, row: int, column: int, x: int) -> None:
+        hot = column == 0 and self._on_mark(row, x)
+        self.table.viewport().setCursor(QCursor(Qt.CursorShape.PointingHandCursor if hot else Qt.CursorShape.ArrowCursor))
 
     def _needs_review(self, result) -> bool:
         """Does a data check, or a guideline about the amount of data, ask for a look at this item? (The AIAG bands do not.)
@@ -1438,127 +1456,151 @@ class ValidationWorkspace(ttk.Frame):
         checks, guidelines = self._checks.get(result.label, ([], []))
         return needs_attention([*checks, *guidelines]) or (result.valid and any(check.status == CRITICAL for check in checks))
 
-    def _on_mark(self, row: str, x: int) -> bool:
+    def _on_mark(self, row: int, x: int) -> bool:
         """Is the pointer on the warning mark that ends the Test Item of this row?"""
-        cell = self.table.bbox(row, "0") if row in self._marked else None
-        if not cell:
+        if row not in self._marked or row >= self.table.table_model.rowCount():
             return False
-        font = self._table_fonts()[0]
-        text = str(self.table.set(row, "0"))
-        return cell[0] + font.measure(text.removesuffix(WARNING_MARK)) <= x <= cell[0] + font.measure(text) + 12
+        metrics = self.table.fontMetrics()
+        text = self.table.table_model.row_text(row)[0]
+        start = 6 + metrics.horizontalAdvance(text.removesuffix(WARNING_MARK))  # the cell's left padding, then the name
+        return start <= x <= 6 + metrics.horizontalAdvance(text) + 12
 
     def _show_details(self, result) -> None:
         """The figures of the item as tables: Process Capability in groups, Gage R&R as its ANOVA table, Variance Components
         and Gage Evaluation. An item that could not be analysed says why, as text."""
         shown = result.method if result is not None and result.valid else ""
-        tables = "grr" if shown == "attribute" else shown  # Gage R&R and Attribute Agreement share one table view
-        for name, frame in (("capability", self.details_frame), ("grr", self.grr_frame)):
-            (frame.grid if tables == name else frame.grid_remove)()
-        (self.session.grid_remove if shown else self.session.grid)()
         if not shown:
+            self.details_stack.setCurrentWidget(self.session)
             self.session.set_text(session_text(result, self._precision()) if result else "")
             return
         if shown == "grr":
+            self.details_stack.setCurrentWidget(self.grr_frame)
             self._fill_grr_details(result)
             return
         if shown == "attribute":
+            self.details_stack.setCurrentWidget(self.grr_frame)
             self._fill_attribute_details(result)
             return
-        self.details.delete(*self.details.get_children())
+        self.details_stack.setCurrentWidget(self.details)
+        self.details.clear()
+        bold = QFont(self.details.font())
+        bold.setBold(True)
         for group, rows in capability_details(result, self._precision()):
             advanced = group == "Advanced Details"
-            parent = self.details.insert("", "end", text=group, tags=("group",), open=self._advanced_open if advanced else True)
-            if advanced:
-                self._advanced_item = parent
+            parent = QTreeWidgetItem(self.details, [group])
+            parent.setFont(0, bold)
+            parent.setBackground(0, QBrush(QColor(self.palette_tokens.soft)))
+            parent.setBackground(1, QBrush(QColor(self.palette_tokens.soft)))
             for metric, value in rows:
-                self.details.insert(parent, "end", text=metric, values=(value,))
+                child = QTreeWidgetItem(parent, [metric, value])
+                child.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            parent.setExpanded(self._advanced_open if advanced else True)
+            if advanced:
+                parent.setData(0, Qt.ItemDataRole.UserRole, "advanced")
+        self.details.resizeColumnToContents(1)
 
     def _insert_tables(self, tables) -> None:
         """A title row, the column names in the columns they name, then the figures, for each table."""
-        self.grr_tree.delete(*self.grr_tree.get_children())
+        rows, tags = [], []
         blank = ("",) * (GRR_COLUMNS - 1)
         for table in tables:
-            self.grr_tree.insert("", "end", values=(table.title, *blank), tags=("section",))
-            self.grr_tree.insert("", "end", values=table.headers, tags=("head",))
+            rows.append((table.title, *blank))
+            tags.append("section")
+            rows.append(tuple(table.headers) + ("",) * (GRR_COLUMNS - len(table.headers)))
+            tags.append("head")
             for row in table.rows:
-                self.grr_tree.insert("", "end", values=row)
+                rows.append(tuple(row) + ("",) * (GRR_COLUMNS - len(row)))
+                tags.append("")
+        self.grr_tree.table_model.set_table([""] * GRR_COLUMNS, rows, tags, ["w", *["e"] * (GRR_COLUMNS - 1)])
+        self.grr_tree.fit_columns(stretch=0, max_width=260)
 
     def _fill_grr_details(self, result) -> None:
         self.ndc_var.set(detail_cell(result.metrics.get("ndc"), "int"))
-        self.grr_headline.grid()
-        self.tables_note.grid_remove()
-        self.grr_tree.column("c4", width=96)
+        self.grr_headline.show()
+        self.tables_note_var.set("")
         self._insert_tables(grr_details(result, self._precision(), self.all_columns_var.get()))
 
     def _fill_attribute_details(self, result) -> None:
         tables, notes = attribute_details(result, self._precision())
-        self.grr_headline.grid_remove()
-        self.grr_tree.column("c4", width=130)  # the confidence interval
+        self.grr_headline.hide()
         self._insert_tables(tables)
         self.tables_note_var.set("  ".join(notes))
-        (self.tables_note.grid if notes else self.tables_note.grid_remove)()
 
-    def _details_click(self, event) -> None:
+    def _details_click(self, item, _column: int) -> None:
         """A group opens and closes by its name as well as by its arrow."""
-        row = self.details.identify_row(event.y)
-        if row and self.details.get_children(row) and "indicator" not in self.details.identify_element(event.x, event.y):
-            self.details.item(row, open=not self.details.item(row, "open"))
-            self._remember_advanced()
+        if item.childCount():
+            item.setExpanded(not item.isExpanded())
 
     def _remember_advanced(self) -> None:
-        if self._advanced_item and self.details.exists(self._advanced_item):
-            self._advanced_open = bool(self.details.item(self._advanced_item, "open"))
+        for index in range(self.details.topLevelItemCount()):
+            item = self.details.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == "advanced":
+                self._advanced_open = item.isExpanded()
 
     def _show_checks(self, result) -> None:
         """Check | Result | Status. First what the checks found in the data (nothing is listed for a check that passed), then the
         guidelines: published figures to compare with. A guideline is OK or Review, never a verdict. The longer explanations are
         in About the method."""
         tree = self.checks_tree
-        tree.delete(*tree.get_children())
+        tree.clear()
         attribute = result is not None and result.method == "attribute"
-        tree.heading("result", text="Finding" if attribute else "Result")
+        tree.setHeaderLabels(["Check", "Finding" if attribute else "Result", "Status"])
         if result is None:
-            self.notes_link.grid_remove()
+            self.notes_link.hide()
             return
         checks, guidelines = self._checks.get(result.label, ([], []))
         if attribute:
             self._show_attribute_checks(checks)
             return
         issues, limitations = findings(checks)
-        section = tree.insert("", "end", text="Data Checks", tags=("group",), open=True)
+        section = self._group_item("Data Checks")
         if not issues and not limitations:
-            tree.insert(section, "end", text="All checks", values=("No data issues detected.", "OK"), tags=("OK",))
+            self._status_item(section, "All checks", "No data issues detected.", "OK")
         for check in (*issues, *limitations):
             self._check_row(section, check, False)
         if guidelines:
-            section = tree.insert("", "end", text="Guidelines (reference only)", tags=("group",), open=True)
+            section = self._group_item("Guidelines (reference only)")
             for check in guidelines:
                 self._check_row(section, check, True)
+        tree.expandAll()
         notes = self.evaluated is not None and (self.evaluated.record.validation.conditions or self._problems())
-        (self.notes_link.grid if notes else self.notes_link.grid_remove)()
+        self.notes_link.setVisible(bool(notes))
 
     def _show_attribute_checks(self, checks) -> None:
         """Check | Finding | Status for an Attribute Agreement item: Critical (cannot be calculated), Review (a statistic is limited)
         or Info (an optional design choice). The findings are everything there is to say, so there is no link to more notes."""
-        section = self.checks_tree.insert("", "end", text="Data Checks", tags=("group",), open=True)
+        section = self._group_item("Data Checks")
         if not checks:
-            self.checks_tree.insert(section, "end", text="All checks", values=("No data issues detected.", "OK"), tags=("OK",))
+            self._status_item(section, "All checks", "No data issues detected.", "OK")
         for check in checks:
             self._check_row(section, check, False, attribute=True)
-        self.notes_link.grid_remove()
+        self.checks_tree.expandAll()
+        self.notes_link.hide()
 
-    def _check_row(self, parent: str, check, guideline: bool, attribute: bool = False) -> None:
+    def _group_item(self, title: str) -> QTreeWidgetItem:
+        item = QTreeWidgetItem(self.checks_tree, [title])
+        font = QFont(self.checks_tree.font())
+        font.setBold(True)
+        item.setFont(0, font)
+        for column in range(3):
+            item.setBackground(column, QBrush(QColor(self.palette_tokens.soft)))
+        return item
+
+    def _status_item(self, parent: QTreeWidgetItem, topic: str, finding: str, status: str) -> None:
+        item = QTreeWidgetItem(parent, [topic, finding, status])
+        p = self.palette_tokens
+        ink = {"Critical": p.danger, "Issue": p.danger, "Review": p.warn}.get(status, p.muted)  # a guideline is never a verdict colour
+        item.setForeground(2, QBrush(QColor(ink)))
+
+    def _check_row(self, parent: QTreeWidgetItem, check, guideline: bool, attribute: bool = False) -> None:
         status = attribute_status_label(check) if attribute else status_label(check, guideline)
-        self.checks_tree.insert(parent, "end", text=CHECK_TOPICS.get(check.topic, check.topic), values=(check.short.removesuffix("."), status), tags=(status,))
+        self._status_item(parent, CHECK_TOPICS.get(check.topic, check.topic), check.short.removesuffix("."), status)
 
     def _draw_chart(self) -> None:
-        draw_tk_charts(self.chart_canvas, self._charts, columns=1 if len(self._charts) == 1 else 2,
-                       x_scale=self.chart_scale_var.get() if self._scaled else None, compact=True)
         selected = self.selected_result()
         note = agreement_chart_note(selected) if selected is not None and selected.method == "attribute" else ""
-        if note and not self._charts:  # an analysed item that has no panel: which one it would need
-            self.chart_canvas.create_text(16, 16, anchor="nw", fill=self.palette.muted, font=("Segoe UI", 10), text=note,
-                                          width=max(200, self.chart_canvas.winfo_width() - 32))
+        self.chart_panel.set_specs(self._charts, x_scale=self.chart_scale_var.get() if self._scaled else None,
+                                   note=note if not self._charts else "", muted=self.palette_tokens.muted)
 
     # ------------------------------------------------------------------ explanations
     def _config(self):
@@ -1568,31 +1610,31 @@ class ValidationWorkspace(ttk.Frame):
 
     def show_about(self) -> None:
         from ..statistics import AnalysisConfig
+        from .method_dialog import MethodDialog
 
         config = self._config() or AnalysisConfig(method=self.method_var.get())
         result = self.selected_result()  # the values of the selected item end the guide
-        MethodDialog(self._dialog_parent(), method_guide(config, result if result is not None and result.method == config.method else None))
+        MethodDialog(self._dialog_parent(), method_guide(config, result if result is not None and result.method == config.method else None)
+                     ).present()
 
     # ------------------------------------------------------------------ report
     def _fill_items(self) -> None:
-        self.item_list.delete(0, "end")
-        for result in self.results:
-            self.item_list.insert("end", result.label)
+        self.item_list.clear()
+        self.item_list.addItems([result.label for result in self.results])
         self._select_items(True)
 
     def _select_items(self, everything: bool) -> None:
         if everything:
-            self.item_list.selection_set(0, "end")
+            self.item_list.selectAll()
         else:
-            self.item_list.selection_clear(0, "end")
+            self.item_list.clearSelection()
         self._update_coverage()
 
     def included(self) -> list[str]:
-        labels = [self.item_list.get(i) for i in self.item_list.curselection()]
-        return labels
+        return [item.text() for item in self.item_list.selectedItems()]
 
     def _update_coverage(self) -> None:
-        total, chosen = self.item_list.size(), len(self.item_list.curselection())
+        total, chosen = self.item_list.count(), len(self.item_list.selectedItems())
         self.coverage_var.set("" if not total else f"Included {chosen} of {total} items")
 
     def _context(self):
@@ -1622,17 +1664,16 @@ class ValidationWorkspace(ttk.Frame):
         except Exception as exc:
             self.report_var.set(str(exc))
             return
-        label = METHOD_NAMES[self.study.options.method]
-        path = filedialog.asksaveasfilename(
-            parent=self._dialog_parent(), title="Generate report", defaultextension=suffix,
-            filetypes=[("PDF report", "*.pdf")] if suffix == ".pdf" else [("Excel report", "*.xlsx")],
-            initialfile=f"{self.study.options.method}_report{suffix}")
+        method_name = METHOD_NAMES[self.study.options.method]
+        initial = f"{self.study.options.method}_report{suffix}"
+        path, _ = QFileDialog.getSaveFileName(self._dialog_parent(), "Generate report", initial,
+                                              "PDF report (*.pdf)" if suffix == ".pdf" else "Excel report (*.xlsx)")
         if not path:
             return
         results = self._report_results(included)
         decimals = self._precision()
         gage = self.gage_var.get().strip()
-        title = (f"{gage}: {label}" if gage else label) + (" (partial report)" if context.partial else "")
+        title = (f"{gage}: {method_name}" if gage else method_name) + (" (partial report)" if context.partial else "")
         self.export_busy = True
         self.report_var.set("Generating the report…")
         self._refresh_state()
@@ -1640,7 +1681,7 @@ class ValidationWorkspace(ttk.Frame):
         def finished(destination):
             self.export_busy = False
             self.last_report = Path(destination)
-            self.open_button.configure(state="normal")
+            self.open_button.setEnabled(True)
             self.report_var.set(f"Saved: {destination}")
             self._refresh_state()
 
@@ -1648,7 +1689,7 @@ class ValidationWorkspace(ttk.Frame):
             self.export_busy = False
             self.report_var.set("Report generation failed.")
             self._refresh_state()
-            messagebox.showerror("Report export failed", str(exc), parent=self._dialog_parent())
+            QMessageBox.critical(self._dialog_parent(), "Report export failed", str(exc))
 
         self.tasks.run(lambda _report: export_statistical_report(Path(path), results, decimals=decimals, title=title, context=context),
                        on_success=finished, on_error=failed)
@@ -1657,5 +1698,37 @@ class ValidationWorkspace(ttk.Frame):
         if self.last_report is not None:
             open_path(self.last_report)
 
+    def sizeHint(self) -> QSize:
+        return QSize(1100, 640)
 
-__all__ = ["MappingSource", "ValidationWorkspace", "build_mapping_dataset", "reorder_dataset"]
+    def resizeEvent(self, event) -> None:
+        """A wide window puts the table beside the charts, each with the full height; a narrower one puts the table above."""
+        super().resizeEvent(event)
+        wide = self.width() >= WIDE_RESULTS
+        orientation = Qt.Orientation.Horizontal if wide else Qt.Orientation.Vertical
+        if self.split.orientation() != orientation:
+            self.split.setOrientation(orientation)
+            self.split.setSizes([380, 700] if wide else [170, 440])
+        self.selected_label.setVisible(wide and bool(self.selected_var.get()))
+
+
+class ReadOnlyTextView(QWidget):
+    """The text of an item that could not be analysed: why, in monospace."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from .widgets import ReadOnlyText
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.text = ReadOnlyText(monospace=True)
+        layout.addWidget(self.text)
+
+    def set_text(self, content: str) -> None:
+        self.text.set_text(content)
+
+    def toPlainText(self) -> str:
+        return self.text.toPlainText()
+
+
+__all__ = ["MappingSource", "QCheckBox", "QPushButton", "ValidationWorkspace", "build_mapping_dataset", "reorder_dataset", "repolish"]

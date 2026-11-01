@@ -33,7 +33,7 @@ from .dialogs import Dialog, label
 from .widgets import make_button
 
 if TYPE_CHECKING:
-    from .validation_page import ValidationWorkspace
+    from .validation_workspace import ValidationWorkspace
 
 
 class AssignmentDialog(Dialog):

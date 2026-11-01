@@ -27,10 +27,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 def short_lived_widgets(window, pump, sample) -> None:
     """Open and close the dialogs and other widgets that come and go, so the collector meets them too."""
     from datamapperx import updater
-    from datamapperx.ui_qt.dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog
-    from datamapperx.ui_qt.profile_dialog import ProfileManager
-    from datamapperx.ui_qt.sample_wizard import SampleWizard
-    from datamapperx.ui_qt.update_dialog import UpdateDialog
+    from datamapperx.ui.dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog
+    from datamapperx.ui.profile_dialog import ProfileManager
+    from datamapperx.ui.sample_wizard import SampleWizard
+    from datamapperx.ui.update_dialog import UpdateDialog
 
     info = updater.parse_manifest({"version": "99.0.0", "sha256": "a" * 64, "notes": "- better"})
     dialogs = [AboutDialog(window), ReportDialog(window, "t", "h", "body"), ExportDoneDialog(window, sample),
@@ -49,14 +49,14 @@ def main(argv: list[str]) -> int:
     from PySide6.QtWidgets import QApplication
 
     from datamapperx.settings import Settings
-    from datamapperx.ui_qt.main_window import MainWindow
+    from datamapperx.ui.main_window import MainWindow
 
     folder, rounds = argv[1], int(argv[2]) if len(argv) > 2 else 15
     control = len(argv) > 3 and argv[3] == "control"
     app = QApplication.instance() or QApplication([])
     window = MainWindow(app, settings=Settings(theme="light", last_folder=folder, expected_samples="4", repeats="3"),
                         background_checks=False)
-    from datamapperx.ui_qt import tasks
+    from datamapperx.ui import tasks
 
     tasks.PAUSE_GC = False  # the second layer of defence is off: the ownership rule alone must hold
     window.profile_box.setCurrentText("ICT_I3070 Test Log")
@@ -97,7 +97,7 @@ def main(argv: list[str]) -> int:
         short_lived_widgets(window, pump, sample)
         if control:
             from datamapperx.palette import LIGHT
-            from datamapperx.ui_qt.widgets import ActionTable
+            from datamapperx.ui.widgets import ActionTable
 
             orphan = ActionTable(LIGHT, kind="add", name_heading="Component")  # nobody owns it but Python
             orphan.show()

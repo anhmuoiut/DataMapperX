@@ -140,113 +140,119 @@ def _check_customer_criteria() -> None:
 
 
 def _check_window(sample: Path) -> None:
+    from PySide6.QtWidgets import QApplication
+
     from .ui.main_window import MainWindow
     from .ui.profile_dialog import ProfileManager
     from .ui.sample_wizard import SampleWizard
 
-    app = MainWindow(background_checks=False)  # the build's check must not depend on GitHub, or on the owner's off switch
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(app, background_checks=False)  # the build's check must not depend on GitHub, or on the owner's off switch
     try:
-        app.update()
-        _require(bool(app.winfo_exists()), "the main window did not open")
-        _check_steps(app, sample.parent)
-        _check_customer_dialog(app)
-        manager = ProfileManager(app, app.profiles, lambda _name: None)
-        wizard = SampleWizard(app, lambda _name, _profile: None, sample=sample)
-        for _ in range(5):
-            app.update()
-        _require(wizard.kind == "excel", "the sample wizard did not read the sample")
-        wizard.destroy()
-        manager.destroy()
+        window.show()
+        app.processEvents()
+        _require(window.isVisible(), "the main window did not open")
+        _check_steps(app, window, sample.parent)
+        _check_customer_dialog(app, window)
+        manager = ProfileManager(window, window.profiles, lambda _name: None)
+        manager.present()
+        wizard = SampleWizard(manager, lambda _name, _profile: None, sample=sample)
+        wizard.present()
+        _wait(app, lambda: wizard.kind == "excel" and wizard.accept_button.isEnabled(), "the sample wizard to read the sample")
+        wizard.close()
+        manager.close()
+        app.processEvents()
     finally:
-        app.destroy()
+        window.close()
+        app.processEvents()
 
 
-def _check_customer_dialog(app) -> None:
+def _check_customer_dialog(app, window) -> None:
     """Open the customer criteria dialog, add a customer, apply a metric choice and save; then put everything back."""
-    from .ui.validation import CustomersDialog
+    from .ui.validation_dialogs import CustomersDialog
 
-    app._show_workspace("validation")
-    panel = app.validation
+    window._show_workspace("validation")
+    panel = window.validation
     original_customers, original_choice = dict(panel.customers), panel.profile_var.get()
     try:
         dialog = CustomersDialog(panel)
-        app.update()
-        dialog.new_var.set("Smoke customer")
+        dialog.present()
+        app.processEvents()
+        dialog.new_edit.setText("Smoke customer")
         dialog.add_customer()
         for metric, applied in (("percent_tolerance", True), ("percent_study_var", False), ("ndc", True)):
-            dialog.apply_vars[metric].set(applied)
-        dialog.pass_vars["percent_tolerance"].set("15")
-        dialog.fail_vars["percent_tolerance"].set("25")
-        app.update()
-        _require("PASS < 15%" in dialog.bands["percent_tolerance"].get(), "the dialog did not show the PASS/FAIL bands")
+            dialog.apply_checks[metric].setChecked(applied)
+        dialog.pass_edits["percent_tolerance"].setText("15")
+        dialog.fail_edits["percent_tolerance"].setText("25")
+        app.processEvents()
+        _require("PASS < 15%" in dialog.bands["percent_tolerance"].text(), "the dialog did not show the PASS/FAIL bands")
         dialog.save()
-        app.update()
+        app.processEvents()
         saved = panel.customers.get("Smoke customer")
         _require(saved is not None and [c.enabled for c in saved] == [True, False, True] and saved[0].pass_limit == 15,
                  "the customer criteria were not saved")
-        _require(panel.profile_var.get() == "Smoke customer" and "Smoke customer" in app.settings.customer_criteria,
+        _require(panel.profile_var.get() == "Smoke customer" and "Smoke customer" in window.settings.customer_criteria,
                  "the customer was not selected and remembered")
         _require(panel._evaluation_for("grr").criteria == saved, "the analysis does not use the customer's criteria")
     finally:
         panel.set_customers(original_customers, selected=original_choice)
-        app._show_workspace("mapping")
+        window._show_workspace("mapping")
 
 
 def _wait(app, condition, what: str, seconds: float = 30.0) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        app.update()
+        app.processEvents()
         if condition():
             return
         time.sleep(0.01)
     raise SmokeTestError(f"timed out waiting for {what}")
 
 
-def _check_steps(app, folder: Path) -> None:
+def _check_steps(app, window, folder: Path) -> None:
     """Scan the sample files, pick the component and walk through both steps of the window."""
-    from tkinter import messagebox
+    from PySide6.QtWidgets import QMessageBox
 
     def refuse(*args, **kwargs):  # a dialog nobody can answer would hang the run
-        raise SmokeTestError(f"the window showed a dialog: {args[1:2]}")
+        raise SmokeTestError(f"the window showed a dialog: {args[2:3]}")
 
     logs = folder / "steps"  # only the two sample logs: the export written by the logic check must not be scanned
     logs.mkdir(exist_ok=True)
     for source in folder.glob("VSE000SMOKE_*.xlsx"):
         shutil.copy(source, logs / source.name)
-    saved = {name: getattr(messagebox, name) for name in ("showinfo", "showwarning", "showerror", "askyesno")}
+    saved = {name: getattr(QMessageBox, name) for name in ("information", "warning", "critical", "question")}
     for name in saved:
-        setattr(messagebox, name, refuse)
+        setattr(QMessageBox, name, staticmethod(refuse))
     try:
-        app.profile_var.set("Function Test Log")
-        app.folder_var.set(str(logs))
-        app.expected_var.set("1")
-        app.repeats_var.set("2")
-        app.scan_logs()
-        _wait(app, lambda: not app.is_busy and app.scan_result is not None, "the scan")
-        _require(app.scan_result.total_sns == 1, "the scan found the wrong files")
-        app.clear_selected()  # the data folder may remember the choice from an earlier run
-        _require("R1" in app.available_list.items(), "the window did not list the components")
-        _require(app.available_list._values[0] != ("–", "–"), "the component list did not show the limits")
-        app.add_all_shown()
-        _require(app.selected_components == ["R1"] and app.review_button.instate(["!disabled"]), "the component was not selected")
-        app._show_step("review")
-        app.update()
-        _require(app.step == "review" and len(app.preview_grid.rows()) == 2, "the review did not show the data")
-        _require(len(app.limits_grid.rows()) == 1 and app.check_chips.chips(), "the review did not show the limits")
-        app._show_workspace("validation")  # Validation & Reports analyses a copy of what was scanned
-        workspace = app.validation
+        window.profile_box.setCurrentText("Function Test Log")
+        window.folder_edit.setText(str(logs))
+        window.expected_edit.setText("1")
+        window.repeats_edit.setText("2")
+        window.scan_logs()
+        _wait(app, lambda: not window.is_busy and window.scan_result is not None, "the scan")
+        _require(window.scan_result.total_sns == 1, "the scan found the wrong files")
+        window.clear_selected()  # the data folder may remember the choice from an earlier run
+        _require("R1" in window.available_list.items(), "the window did not list the components")
+        _require(window.available_list.table_model.row_text(0)[1:3] != ("–", "–"), "the component list did not show the limits")
+        window.add_all_shown()
+        _require(window.selected_components == ["R1"] and window.review_button.isEnabled(), "the component was not selected")
+        window._show_step("review")
+        app.processEvents()
+        _require(window.step == "review" and len(window.preview_grid.rows()) == 2, "the review did not show the data")
+        _require(len(window.limits_grid.rows()) == 1 and window.check_chips.chips(), "the review did not show the limits")
+        window._show_workspace("validation")  # Validation & Reports analyses a copy of what was scanned
+        workspace = window.validation
         _wait(app, lambda: workspace.dataset is not None and not workspace.busy, "the validation data")
-        workspace.run_button.invoke()
+        workspace.run_button.click()
         _wait(app, lambda: workspace.evaluated is not None and not workspace.running, "the validation analysis")
         _require(len(workspace.results) == 1 and workspace.results[0].test_item == "R1", "validation did not analyse the scan")
-        app._show_workspace("mapping")
+        window._show_workspace("mapping")
         for _ in range(2):  # dark and back again, so the setting it saves is the one it started with
-            app.dark_var.set(not app.dark_var.get())
-            app._on_theme_toggle()
-        app._show_step("select")
-        app.update()
-        _require(app.step == "select", "could not go back to the first step")
-        app.reset_workflow()
+            window._toggle_theme()
+        window._show_step("select")
+        app.processEvents()
+        _require(window.step == "select", "could not go back to the first step")
+        window.reset_workflow()
     finally:
         for name, original in saved.items():
-            setattr(messagebox, name, original)
+            setattr(QMessageBox, name, original)

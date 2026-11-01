@@ -2,7 +2,7 @@
 
 Cells are turned into text once, when the table is set; ``data()`` then only returns what Qt asks for, and only for the
 rows that are on screen. Row tags (``invalid``, ``missing``, ``out``, ``gap``) and cell tags (``pass``, ``caution``,
-``fail``) tint the background, as they do in the tkinter grid.
+``fail``) tint the background.
 """
 
 from __future__ import annotations

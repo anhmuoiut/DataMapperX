@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from datamapperx.settings import Settings
-from datamapperx.ui_qt.main_window import MainWindow
+from datamapperx.ui.main_window import MainWindow
 
 from ..conftest import ict_block, write_ict_log
 

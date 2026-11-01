@@ -8,6 +8,7 @@ import random
 import pytest
 
 from datamapperx.stat_charts import (
+    MIN_CELL_WIDTH,
     ChartSeries,
     ChartSpec,
     _bin_width,
@@ -15,8 +16,6 @@ from datamapperx.stat_charts import (
     _text_units,
     chart_primitives,
     charts_for_result,
-    draw_tk_chart,
-    draw_tk_charts,
     reportlab_chart,
     short_labels,
 )
@@ -58,25 +57,10 @@ def test_component_labels_also_remain_complete():
 
 def test_tk_renderer_applies_rotation_to_all_sample_labels():
     samples, result = study(10)
-    texts = []
-
-    class Canvas:
-        def winfo_width(self):
-            return 375
-
-        def winfo_height(self):
-            return 218
-
-        def create_text(self, *args, **kwargs):
-            texts.append(kwargs)
-
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-
-    draw_tk_chart(Canvas(), charts_for_result(result)[1])
-    labels = [item for item in texts if item["text"] in samples]
+    primitives = chart_primitives(charts_for_result(result)[1], 375, 218)
+    labels = [style for kind, _coords, style in primitives if kind == "text" and style["text"] in samples]
     assert [item["text"] for item in labels] == samples
-    assert all(item["angle"] == 45 and isinstance(item["font"][1], int) for item in labels)
+    assert all(item["angle"] == 45 for item in labels)
 
 
 @pytest.mark.parametrize("count", [10, 30])
@@ -236,32 +220,19 @@ def test_the_names_of_the_sources_are_never_shortened():
 
 def test_charts_leave_a_column_only_when_each_has_room_on_screen():
     samples, result = study(10)
-    titles = {}
-
-    class Canvas:
-        def __init__(self, width):
-            self.width = width
-
-        def winfo_width(self):
-            return self.width
-
-        def winfo_height(self):
-            return 500
-
-        def winfo_fpixels(self, _unit):
-            return 1.333
-
-        def create_text(self, x, y, **kwargs):
-            titles.setdefault(kwargs["text"], x)
-
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-
     specs = charts_for_result(result)
-    draw_tk_charts(Canvas(500), specs, compact=True)
-    narrow = [titles[spec.title] for spec in specs]
-    titles.clear()
-    draw_tk_charts(Canvas(900), specs, compact=True)
-    wide = [titles[spec.title] for spec in specs]
+
+    def title_positions(width):
+        columns = max(1, min(2, int(width // MIN_CELL_WIDTH)))  # what the chart panel of the window does
+        cell = width / columns
+        found = {}
+        for index, spec in enumerate(specs):
+            x0 = (index % columns) * cell + 4
+            for kind, coords, style in chart_primitives(spec, cell - 8, 200, None, True, 1.333):
+                if kind == "text" and style["text"] == spec.title:
+                    found[spec.title] = x0 + coords[0]
+        return [found[spec.title] for spec in specs]
+
+    narrow, wide = title_positions(500), title_positions(900)
     assert max(narrow) < 150  # one column: every title at the left
     assert max(wide) > 450  # two: the second chart of a row starts at the middle

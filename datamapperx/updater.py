@@ -16,7 +16,7 @@ overwriting it, so the sequence is: download next to the exe -> verify SHA-256 -
 running exe to ``.old`` -> move the new file into place -> start it -> exit. ``.old`` is deleted
 on the next launch.
 
-Nothing in this module imports tkinter, so it can be tested without a display.
+Nothing in this module imports the window toolkit, so it can be tested without a display.
 """
 
 from __future__ import annotations

@@ -99,10 +99,9 @@ def test_the_ratings_study_record_is_part_of_what_the_results_depend_on():
     assert "ratings" not in ValidationWorkspace._mapping_record(stub)
 
 
-def test_nothing_imports_a_window_by_being_imported():
-    # Importing the workspace and the import dialog must not need a display: only constructing them does.
+def test_the_import_dialog_module_has_its_own_constants():
     from datamapperx.ui import ratings_import
 
     assert ratings_import.NONE == "(none)" and ratings_import.PREVIEW_LIMIT == 100
-    assert [key for key, *_ in ratings_import.PREVIEW_COLUMNS] == ["item", "sample", "appraiser", "trial", "rating", "standard"]
+    assert ratings_import.PREVIEW_HEADINGS == ("Test Item", "Sample ID", "Appraiser", "Trial", "Rating", "Standard")
     assert dataclasses.is_dataclass(StatisticalOptions)

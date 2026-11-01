@@ -12,10 +12,10 @@ import pytest
 from openpyxl import load_workbook
 from PySide6.QtWidgets import QFileDialog
 
-from datamapperx.ui_qt import validation_page as vp
-from datamapperx.ui_qt.dialogs import ReportDialog
-from datamapperx.ui_qt.method_dialog import MethodDialog
-from datamapperx.ui_qt.validation_dialogs import AssignmentDialog, CustomersDialog, DatePickerDialog
+from datamapperx.ui import validation_workspace as vp
+from datamapperx.ui.dialogs import ReportDialog
+from datamapperx.ui.method_dialog import MethodDialog
+from datamapperx.ui.validation_dialogs import AssignmentDialog, CustomersDialog, DatePickerDialog
 
 from ..conftest import ict_block, write_ict_log
 from .support import pump, ready_to_review, scan
@@ -191,7 +191,7 @@ def test_the_within_sigma_method_is_an_advanced_option_and_the_capability_setup_
     ws.judge_var.set(False)
     assert ws.criteria_row.isHidden() and not ws._judge_for("capability")
     ws.advanced_button.click()
-    assert not ws.advanced.isHidden() and "▾" in ws.advanced_button.text()
+    assert not ws.advanced.isHidden() and "▼" in ws.advanced_button.text()
     ws.advanced_button.click()
     assert ws.advanced.isHidden()
     ws.method_var.set("grr")
@@ -445,7 +445,7 @@ def test_a_warning_mark_leads_to_the_checks_and_never_changes_pass_or_fail(app, 
     ws.method_var.set("capability")
     run_validation(app, ws)
     marked = sorted(ws._marked)
-    assert marked and all(ws.table.rows()[row][0].endswith("  ⚠") for row in marked)
+    assert marked and all(ws.table.rows()[row][0].endswith(vp.WARNING_MARK) for row in marked)
     assert headings(ws) == ["Test Item", "N", "Cp", "Cpk", "Pp", "Ppk"]
     assert ws.summary_var.get() == f"3 items analyzed · Acceptance off · {len(marked)} Need Review"
     ws.judge_var.set(True)  # acceptance: the Cpk threshold only
@@ -675,7 +675,7 @@ def test_about_the_method_follows_the_analysis_and_the_selected_item(app, window
 
     ws = ready(app, window, tmp_path, "about_logs")
     shown = []
-    monkeypatch.setattr("datamapperx.ui_qt.method_dialog.MethodDialog", lambda parent, guide: type("D", (), {"present": lambda self: shown.append(guide)})())
+    monkeypatch.setattr("datamapperx.ui.method_dialog.MethodDialog", lambda parent, guide: type("D", (), {"present": lambda self: shown.append(guide)})())
     ws.method_var.set("capability")
     ws.about_button.click()
     assert shown[-1].title.startswith("Process Capability") and "1.128" in guide_text(shown[-1])
@@ -692,7 +692,7 @@ def test_about_the_method_follows_the_analysis_and_the_selected_item(app, window
 def test_the_about_dialog_draws_the_groups_of_formulas_and_they_can_be_closed(app, window):
     from datamapperx.method_guide import method_guide
     from datamapperx.statistics import AnalysisConfig
-    from datamapperx.ui_qt.math_view import MathView
+    from datamapperx.ui.math_view import MathView
 
     guide = method_guide(AnalysisConfig(method="grr"))
     dialog = MethodDialog(window, guide)

@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import re
-import tkinter as tk
 from collections.abc import Callable
-from tkinter import messagebox, ttk
 from typing import Any
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLineEdit,
+    QListWidget,
+    QMessageBox,
+    QScrollArea,
+    QStackedLayout,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ..config import APP_TITLE, EXCEL_FILE_EXTENSIONS, TEXT_FILE_EXTENSIONS
 from ..patterns import TemplateError, compile_template, sn_regex_from_example
@@ -17,9 +32,8 @@ from ..profiles import (
     save_profiles,
     validate_profile,
 )
-from .dialogs import Dialog
-from .sample_wizard import SampleWizard
-from .widgets import UndoableEntry
+from .dialogs import Dialog, label
+from .widgets import make_button
 
 REGEX_HELP = (
     "Most people never need this: press 'Set up from a sample…' instead.\n\n"
@@ -43,251 +57,248 @@ _PATTERN_TITLES = (("block", "Component line"), ("measure", "Measurement line"),
 _UNNAMED = "New profile"
 
 
+def _mono() -> QFont:
+    font = QFont("Consolas")
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    return font
+
+
 class ProfileManager(Dialog):
-    def __init__(self, parent: tk.Misc, profiles: dict[str, dict], on_changed: Callable[[str | None], None]):
+    def __init__(self, parent: QWidget, profiles: dict[str, dict], on_changed: Callable[[str | None], None]) -> None:
         """``profiles`` is edited in place. ``on_changed(name)`` runs after a save (name) or delete (None)."""
-        super().__init__(parent, "Manage profiles", modal=False, min_size=(780, 640))
+        super().__init__(parent, "Manage profiles", modal=False, size=(860, 640), min_size=(780, 600))
         self.profiles = profiles
         self.on_changed = on_changed
-
-        v = self.vars = {
-            name: tk.StringVar()
-            for name in (
-                "name", "type", "extensions", "sn_regex", *_TEXT_FIELDS, *(f for f, _ in _EXCEL_FIELDS),
-                "test_input",
-            )
-        }
-        self.skip_empty = tk.BooleanVar(value=True)
-        self.test_result = tk.StringVar(value="Result: ")
-        self.summary = tk.StringVar()
         self.original_name = ""
         self.extra: dict[str, Any] = {}  # fill-in-the-blank patterns and the example serial number of the loaded profile
-        self._entries: list[ttk.Entry] = []
-        self._combos: list[ttk.Combobox] = []
         self._loading = False
+        self._guarded: list[QWidget] = []  # the fields a built-in profile makes read-only
 
-        main = ttk.Frame(self, padding=14)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=1)
+        self.fields: dict[str, QLineEdit] = {}
+        for name in ("name", "extensions", "sn_regex", *_TEXT_FIELDS, *(f for f, _ in _EXCEL_FIELDS), "test_input"):
+            self.fields[name] = QLineEdit()
+        self.sn_regex_text = QLineEdit()  # the same value as fields["sn_regex"], shown among the regular expressions
+        for name in ("sn_regex", *_TEXT_FIELDS):
+            self.fields[name].setFont(_mono())
+        self.sn_regex_text.setFont(_mono())
+        self.type_box = QComboBox()
+        self.type_box.addItems(["text", "excel"])
+        self.skip_empty = QCheckBox("Ignore heading rows that have no result")
+        self.skip_empty.setChecked(True)
+        self.summary = label("", wrap=True)
+        self.summary.setFont(_mono())
+        self.test_result = label("Result: ", wrap=True)
 
-        # ---- left: list of profiles
-        left = ttk.Frame(main)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
-        left.rowconfigure(1, weight=1)
-        ttk.Label(left, text="Profiles", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.listbox = tk.Listbox(
-            left, width=26, exportselection=False, activestyle="none", relief="flat", borderwidth=0,
-            bg=self.palette.surface, fg=self.palette.fg, selectbackground=self.palette.accent,
-            selectforeground="#ffffff" if self.palette.mode == "light" else "#000000",
-            highlightthickness=1, highlightbackground=self.palette.line, font=("Segoe UI", 10),
-        )
-        self.listbox.grid(row=1, column=0, sticky="ns")
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-        actions = ttk.Frame(left)
-        actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        for col in range(3):
-            actions.columnconfigure(col, weight=1)
-        ttk.Button(actions, text="New", command=self._new_from_sample).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(actions, text="Duplicate", command=self._duplicate).grid(row=0, column=1, sticky="ew", padx=2)
-        ttk.Button(actions, text="Delete", command=self._delete).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        main = QHBoxLayout()
+        main.setSpacing(14)
+        main.addLayout(self._build_list())
+        main.addWidget(self._build_editor(), 1)
+        self.layout_root.addLayout(main, 1)
 
-        # ---- right: editor
-        right = ttk.LabelFrame(main, text="Edit profile", padding=12)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(1, weight=1)
-
-        self.notice = ttk.Label(right, text="", style="Muted.TLabel", wraplength=500, justify="left")
-        self.notice.grid(row=0, column=0, columnspan=2, sticky="w")
-
-        self.name_entry = self._entry(right, 1, "Profile name:", v["name"])
-        ttk.Label(right, text="Input type:").grid(row=2, column=0, sticky="w", pady=5)
-        self.type_combo = ttk.Combobox(right, textvariable=v["type"], values=["text", "excel"], state="readonly")
-        self.type_combo.grid(row=2, column=1, sticky="ew", pady=5)
-        self._combos.append(self.type_combo)
-        self._entry(right, 3, "File extensions:", v["extensions"])
-
-        wizard_row = ttk.Frame(right)
-        wizard_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-        wizard_row.columnconfigure(1, weight=1)
-        self.wizard_button = ttk.Button(wizard_row, text="Set up from a sample…", style="Accent.TButton", command=self._open_wizard)
-        self.wizard_button.grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            wizard_row, style="Hint.TLabel", wraplength=330, justify="left",
-            text="Pick one example log and the app works out where the data is. No regular expressions needed.",
-        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
-
-        self.text_frame = ttk.Frame(right)
-        self.excel_frame = ttk.Frame(right)
-        self._build_text_frame()
-        self._build_excel_frame()
-
-        footer = ttk.Frame(right)
-        footer.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        self.save_button = ttk.Button(footer, text="Save profile", style="Accent.TButton", command=self._save)
-        self.save_button.pack(side="right")
-
-        v["type"].trace_add("write", lambda *_: self._show_fields())
+        self.type_box.currentTextChanged.connect(lambda _text: self._show_fields())
+        self.sn_regex_text.textEdited.connect(lambda text: self.fields["sn_regex"].setText(text))
+        self.fields["sn_regex"].textChanged.connect(lambda text: self._mirror_sn_regex(text))
         for name in ("test_input", *_TEXT_FIELDS):
-            v[name].trace_add("write", lambda *_: self._evaluate_test())
+            self.fields[name].textChanged.connect(lambda _text: self._evaluate_test())
         for name in (*_TEXT_FIELDS, "sn_regex"):
-            v[name].trace_add("write", lambda *_: self._update_summary())
+            self.fields[name].textChanged.connect(lambda _text: self._update_summary())
 
         self._refresh_list()
         if self.profiles:
-            self.listbox.selection_set(0)
-            self._on_select()
-        self.present(width=860, height=620)
-        self.after_idle(self._fit_height)
+            self.listbox.setCurrentRow(0)
 
-    # ------------------------------------------------------------------ layout helpers
-    def _entry(self, parent, row: int, label: str, var: tk.StringVar, *, mono: bool = False) -> UndoableEntry:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
-        entry = UndoableEntry(parent, textvariable=var, **({"font": ("Consolas", 10)} if mono else {}))
-        entry.grid(row=row, column=1, sticky="ew", pady=5)
-        self._entries.append(entry)
-        return entry
+    # ------------------------------------------------------------------ layout
+    def _build_list(self) -> QVBoxLayout:
+        column = QVBoxLayout()
+        column.addWidget(label("Profiles", "heading"))
+        self.listbox = QListWidget()
+        self.listbox.setMinimumWidth(190)
+        self.listbox.currentRowChanged.connect(lambda _row: self._on_select())
+        column.addWidget(self.listbox, 1)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.new_button = make_button("New", self._new_from_sample)
+        self.duplicate_button = make_button("Duplicate", self._duplicate)
+        self.delete_button = make_button("Delete", self._delete)
+        for button in (self.new_button, self.duplicate_button, self.delete_button):
+            row.addWidget(button)
+        column.addLayout(row)
+        return column
 
-    def _build_text_frame(self) -> None:
-        f = self.text_frame
-        f.columnconfigure(0, weight=1)
-        ttk.Label(f, text="What this profile reads", font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=(6, 2))
-        ttk.Label(f, textvariable=self.summary, font=("Consolas", 10), justify="left", wraplength=560).grid(row=1, column=0, sticky="w")
+    def _build_editor(self) -> QGroupBox:
+        box = QGroupBox("Edit profile")
+        layout = QVBoxLayout(box)
+        self.notice = label("", "muted", wrap=True)
+        layout.addWidget(self.notice)
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        form.setColumnStretch(1, 1)
+        form.addWidget(label("Profile name:"), 0, 0)
+        form.addWidget(self.fields["name"], 0, 1)
+        form.addWidget(label("Input type:"), 1, 0)
+        form.addWidget(self.type_box, 1, 1)
+        form.addWidget(label("File extensions:"), 2, 0)
+        form.addWidget(self.fields["extensions"], 2, 1)
+        layout.addLayout(form)
+        wizard = QHBoxLayout()
+        self.wizard_button = make_button("Set up from a sample…", self._open_wizard, primary=True)
+        wizard.addWidget(self.wizard_button)
+        wizard.addWidget(label("Pick one example log and the app works out where the data is. No regular expressions needed.",
+                               "muted", wrap=True), 1)
+        layout.addLayout(wizard)
 
-        self.advanced_open = tk.BooleanVar(value=False)
-        self.advanced_toggle = ttk.Button(f, text="Advanced: regular expressions  ▸", command=self._toggle_advanced)
-        self.advanced_toggle.grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.stack_host = QWidget()
+        self.stack = QStackedLayout(self.stack_host)
+        self.text_frame, self.excel_frame = self._build_text_frame(), self._build_excel_frame()
+        self.stack.addWidget(self.text_frame)
+        self.stack.addWidget(self.excel_frame)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(self.stack_host)
+        layout.addWidget(scroll, 1)
 
-        adv = self.advanced_frame = ttk.Frame(f)
-        adv.columnconfigure(1, weight=1)
-        self._entry(adv, 0, "SN_Regex:", self.vars["sn_regex"], mono=True)
-        ttk.Button(adv, text="Regex guide", command=lambda: messagebox.showinfo("Regex guide", REGEX_HELP, parent=self)).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 6)
-        )
-        for row, (key, label) in enumerate(
-            (("block_regex", "Name_Regex:"), ("measure_regex", "Measure_Regex:"),
-             ("lim2_regex", "Min_Max_Regex1:"), ("lim3_regex", "Min_Max_Regex2:")),
-            start=2,
-        ):
-            self._entry(adv, row, label, self.vars[key], mono=True)
+        self.save_button = make_button("Save profile", self._save, primary=True)
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        footer.addWidget(self.save_button)
+        layout.addLayout(footer)
+        self._guarded = [*(self.fields[n] for n in ("name", "extensions", "sn_regex", *_TEXT_FIELDS,
+                                                      *(f for f, _ in _EXCEL_FIELDS))),
+                         self.sn_regex_text, self.type_box, self.save_button, self.wizard_button, self.skip_empty]
+        return box
 
-        tester = ttk.LabelFrame(adv, text="Live regex tester", padding=8)
-        tester.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        tester.columnconfigure(0, weight=1)
-        ttk.Label(tester, text="Paste a data row from a log:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(tester, textvariable=self.vars["test_input"]).grid(row=1, column=0, sticky="ew", pady=4)
-        ttk.Label(tester, textvariable=self.test_result, wraplength=520, justify="left", font=("Segoe UI Semibold", 9)).grid(
-            row=2, column=0, sticky="w"
-        )
+    def _build_text_frame(self) -> QWidget:
+        frame = QWidget()
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.addWidget(label("What this profile reads", "heading"))
+        layout.addWidget(self.summary)
+        self.advanced_toggle = make_button("Advanced: regular expressions  ►", self._toggle_advanced)
+        layout.addWidget(self.advanced_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced_frame = QWidget()
+        adv = QGridLayout(self.advanced_frame)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.setColumnStretch(1, 1)
+        adv.addWidget(label("SN_Regex:"), 0, 0)
+        adv.addWidget(self.sn_regex_text, 0, 1)
+        adv.addWidget(make_button("Regex guide", lambda: QMessageBox.information(self, "Regex guide", REGEX_HELP)), 1, 0, 1, 2,
+                      Qt.AlignmentFlag.AlignLeft)
+        for row, (key, title) in enumerate((("block_regex", "Name_Regex:"), ("measure_regex", "Measure_Regex:"),
+                                            ("lim2_regex", "Min_Max_Regex1:"), ("lim3_regex", "Min_Max_Regex2:")), start=2):
+            adv.addWidget(label(title), row, 0)
+            adv.addWidget(self.fields[key], row, 1)
+        tester = QGroupBox("Live regex tester")
+        tester_layout = QVBoxLayout(tester)
+        tester_layout.addWidget(label("Paste a data row from a log:"))
+        tester_layout.addWidget(self.fields["test_input"])
+        tester_layout.addWidget(self.test_result)
+        adv.addWidget(tester, 6, 0, 1, 2)
+        self.advanced_frame.setVisible(False)
+        layout.addWidget(self.advanced_frame)
+        layout.addStretch(1)
+        return frame
+
+    def _build_excel_frame(self) -> QWidget:
+        frame = QWidget()
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(0, 6, 0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setVerticalSpacing(8)
+        titles = {"sn_sheet": "SN_Sheet:", "data_sheet": "Data_Sheet:", "row_start": "Row_Start:", "component_col": "Component_Col:",
+                  "measure_col": "Measure_Col:", "min_col": "Min_Col:", "max_col": "Max_Col:", "unit_col": "Unit_Col (blank if none):"}
+        grid.addWidget(label("Serial number:"), 0, 0)
+        grid.addWidget(self.fields["sn_regex"], 0, 1)
+        grid.addWidget(label("A cell such as B1, or a pattern for the file name. Blank: search the file name and cells.", "muted",
+                             wrap=True), 1, 1)
+        for row, (key, _default) in enumerate(_EXCEL_FIELDS, start=2):
+            grid.addWidget(label(titles[key]), row, 0)
+            grid.addWidget(self.fields[key], row, 1)
+        grid.addWidget(self.skip_empty, 10, 1)
+        grid.setRowStretch(11, 1)
+        return frame
+
+    def _mirror_sn_regex(self, text: str) -> None:
+        if self.sn_regex_text.text() != text:
+            self.sn_regex_text.setText(text)
 
     def _toggle_advanced(self) -> None:
-        opened = not self.advanced_open.get()
-        self.advanced_open.set(opened)
-        if opened:
-            self.advanced_frame.grid(row=3, column=0, sticky="ew")
-        else:
-            self.advanced_frame.grid_remove()
-        self.advanced_toggle.configure(text="Advanced: regular expressions  " + ("▾" if opened else "▸"))
-        self.after_idle(self._fit_height)
-
-    def _fit_height(self) -> None:
-        """Grow (never shrink) so that the Save button stays visible, as far as the screen allows."""
-        if not self.winfo_exists():
-            return
-        self.update_idletasks()
-        needed = min(self.winfo_reqheight() + 8, self.winfo_screenheight() - 90)
-        if needed > self.winfo_height():
-            self.geometry(f"{self.winfo_width()}x{needed}")
-
-    def _build_excel_frame(self) -> None:
-        f = self.excel_frame
-        f.columnconfigure(1, weight=1)
-        labels = {
-            "sn_sheet": "SN_Sheet:", "data_sheet": "Data_Sheet:", "row_start": "Row_Start:",
-            "component_col": "Component_Col:", "measure_col": "Measure_Col:", "min_col": "Min_Col:",
-            "max_col": "Max_Col:", "unit_col": "Unit_Col (blank if none):",
-        }
-        self._entry(f, 0, "Serial number:", self.vars["sn_regex"])
-        ttk.Label(
-            f, text="A cell such as B1, or a pattern for the file name. Blank: search the file name and cells.",
-            style="Hint.TLabel", wraplength=420, justify="left",
-        ).grid(row=1, column=1, sticky="w", pady=(0, 4))
-        for row, (key, _default) in enumerate(_EXCEL_FIELDS, start=2):
-            self._entry(f, row, labels[key], self.vars[key])
-        self.skip_check = ttk.Checkbutton(f, text="Ignore heading rows that have no result", variable=self.skip_empty)
-        self.skip_check.grid(row=10, column=1, sticky="w", pady=(6, 0))
+        opened = not self.advanced_frame.isVisible()
+        self.advanced_frame.setVisible(opened)
+        self.advanced_toggle.setText("Advanced: regular expressions  " + ("▼" if opened else "►"))
 
     def _show_fields(self) -> None:
-        if self.vars["type"].get() == "excel":
-            self.text_frame.grid_remove()
-            self.excel_frame.grid(row=5, column=0, columnspan=2, sticky="ew")
-        else:
-            self.excel_frame.grid_remove()
-            self.text_frame.grid(row=5, column=0, columnspan=2, sticky="ew")
-        self.after_idle(self._fit_height)
+        self.stack.setCurrentWidget(self.excel_frame if self.type_box.currentText() == "excel" else self.text_frame)
 
     # ------------------------------------------------------------------ state
+    def selected_name(self) -> str | None:
+        item = self.listbox.currentItem()
+        return item.text() if item is not None else None
+
     def _refresh_list(self, select: str | None = None) -> None:
-        self.listbox.delete(0, tk.END)
-        for name in self.profiles:
-            self.listbox.insert(tk.END, name)
+        self.listbox.blockSignals(True)
+        self.listbox.clear()
+        self.listbox.addItems(list(self.profiles))
         if select and select in self.profiles:
-            index = list(self.profiles).index(select)
-            self.listbox.selection_set(index)
-            self.listbox.see(index)
+            self.listbox.setCurrentRow(list(self.profiles).index(select))
+        self.listbox.blockSignals(False)
 
     def _set_readonly(self, readonly: bool) -> None:
-        for entry in self._entries:
-            entry.configure(state="readonly" if readonly else "normal")
-        for combo in self._combos:
-            combo.configure(state="disabled" if readonly else "readonly")
-        state = "disabled" if readonly else "normal"
-        self.save_button.configure(state=state)
-        self.wizard_button.configure(state=state)
-        self.skip_check.configure(state=state)
+        for widget in self._guarded:
+            if isinstance(widget, QLineEdit):
+                widget.setReadOnly(readonly)
+            else:
+                widget.setEnabled(not readonly)
+
+    def set(self, name: str, value: str) -> None:
+        self.fields[name].setText(value)
+
+    def get(self, name: str) -> str:
+        return self.fields[name].text()
 
     def _load(self, name: str, data: dict) -> None:
         self._loading = True
-        v = self.vars
-        v["name"].set(name)
-        v["type"].set(data.get("type", "text"))
-        defaults = TEXT_FILE_EXTENSIONS if data.get("type", "text") == "text" else EXCEL_FILE_EXTENSIONS
+        self.set("name", name)
+        kind = data.get("type", "text")
+        self.type_box.setCurrentText(kind)
+        defaults = TEXT_FILE_EXTENSIONS if kind == "text" else EXCEL_FILE_EXTENSIONS
         raw_ext = data.get("file_extensions") or ",".join(defaults)
-        v["extensions"].set(raw_ext if isinstance(raw_ext, str) else ",".join(raw_ext))
-        v["sn_regex"].set(data.get("sn_regex", ""))
+        self.set("extensions", raw_ext if isinstance(raw_ext, str) else ",".join(raw_ext))
+        self.set("sn_regex", data.get("sn_regex", ""))
         for key in _TEXT_FIELDS:
-            v[key].set(data.get(key, ""))
+            self.set(key, data.get(key, ""))
         for key, default in _EXCEL_FIELDS:
-            v[key].set(str(data.get(key, default)))
-        self.skip_empty.set(data.get("skip_empty_rows", True) is not False)
+            self.set(key, str(data.get(key, default)))
+        self.skip_empty.setChecked(data.get("skip_empty_rows", True) is not False)
         self.extra = {k: data[k] for k in (*(f"{n}_template" for n in PATTERN_FIELDS), "sn_example") if data.get(k)}
-        v["test_input"].set("")
-        self.test_result.set("Result: ")
+        self.set("test_input", "")
+        self.test_result.setText("Result: ")
         self._loading = False
         self._update_summary()
         self._show_fields()
 
-    def _on_select(self, _event=None) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
+    def _on_select(self) -> None:
+        name = self.selected_name()
+        if name is None or name not in self.profiles:
             return
-        name = self.listbox.get(selection[0])
         self.original_name = name
         self._load(name, self.profiles[name])
         built_in = name in BUILT_IN_PROFILE_NAMES
         self._set_readonly(built_in)
-        self.notice.configure(
-            text="Built-in profile (read-only). Press Duplicate to make an editable copy." if built_in else ""
-        )
+        self.notice.setText("Built-in profile (read-only). Press Duplicate to make an editable copy." if built_in else "")
 
     def _new(self) -> None:
-        self.listbox.selection_clear(0, tk.END)
+        self.listbox.blockSignals(True)
+        self.listbox.setCurrentRow(-1)
+        self.listbox.clearSelection()
+        self.listbox.blockSignals(False)
         self.original_name = ""
         self._load(_UNNAMED, {"type": "text", "file_extensions": ",".join(TEXT_FILE_EXTENSIONS)})
         self._set_readonly(False)
-        self.notice.configure(text="")
-        self.name_entry.focus_set()
-        self.name_entry.select_range(0, tk.END)
+        self.notice.setText("")
+        self.fields["name"].setFocus()
+        self.fields["name"].selectAll()
 
     def _new_from_sample(self) -> None:
         """A blank profile, with the sample wizard on top. Cancelling the wizard leaves the blank form to fill in by hand."""
@@ -295,12 +306,14 @@ class ProfileManager(Dialog):
         self._open_wizard()
 
     def _duplicate(self) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            messagebox.showinfo(APP_TITLE, "Select a profile to duplicate first.", parent=self)
+        source = self.selected_name()
+        if source is None:
+            QMessageBox.information(self, APP_TITLE, "Select a profile to duplicate first.")
             return
-        source = self.listbox.get(selection[0])
-        self.listbox.selection_clear(0, tk.END)
+        self.listbox.blockSignals(True)
+        self.listbox.setCurrentRow(-1)
+        self.listbox.clearSelection()
+        self.listbox.blockSignals(False)
         self.original_name = ""
         base, n = f"{source} (copy)", 2
         new_name = base
@@ -308,18 +321,17 @@ class ProfileManager(Dialog):
             new_name, n = f"{base} {n}", n + 1
         self._load(new_name, self.profiles[source])
         self._set_readonly(False)
-        self.notice.configure(text="Editing a copy. Press Save profile to keep it.")
-        self.name_entry.focus_set()
+        self.notice.setText("Editing a copy. Press Save profile to keep it.")
+        self.fields["name"].setFocus()
 
     def _delete(self) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
+        name = self.selected_name()
+        if name is None:
             return
-        name = self.listbox.get(selection[0])
         if name in BUILT_IN_PROFILE_NAMES:
-            messagebox.showerror(APP_TITLE, "Built-in profiles cannot be deleted.", parent=self)
+            QMessageBox.critical(self, APP_TITLE, "Built-in profiles cannot be deleted.")
             return
-        if not messagebox.askyesno("Delete profile", f"Delete '{name}'?", parent=self):
+        if QMessageBox.question(self, "Delete profile", f"Delete '{name}'?") != QMessageBox.StandardButton.Yes:
             return
         del self.profiles[name]
         save_profiles(self.profiles)
@@ -327,30 +339,31 @@ class ProfileManager(Dialog):
         self.original_name = ""
         self.on_changed(None)
         if self.profiles:
-            self.listbox.selection_set(0)
-            self._on_select()
+            self.listbox.setCurrentRow(0)
 
     # ------------------------------------------------------------------ the sample wizard
     def _open_wizard(self) -> None:
-        if str(self.wizard_button.cget("state")) == "disabled":
-            messagebox.showinfo(APP_TITLE, "Built-in profiles cannot be changed. Press Duplicate first.", parent=self)
+        from .sample_wizard import SampleWizard
+
+        if not self.wizard_button.isEnabled():
+            QMessageBox.information(self, APP_TITLE, "Built-in profiles cannot be changed. Press Duplicate first.")
             return
-        name = self.vars["name"].get().strip()
+        name = self.get("name").strip()
         try:
             current: dict[str, Any] | None = self._collect()
             if not (current.get("block_regex") or current.get("measure_regex") or current.get("component_col")):
                 current = None
         except (KeyError, ValueError):
             current = None
-        SampleWizard(self, self._wizard_done, initial=current, initial_name="" if name in ("", _UNNAMED) else name)
+        SampleWizard(self, self._wizard_done, initial=current, initial_name="" if name in ("", _UNNAMED) else name).present()
 
     def _wizard_done(self, name: str, profile: dict[str, Any]) -> None:
-        keep_name = self.vars["name"].get().strip()
+        keep_name = self.get("name").strip()
         if keep_name in ("", _UNNAMED) or keep_name in BUILT_IN_PROFILE_NAMES:
             keep_name = self._unused_name(name)
         self._load(keep_name, profile)
         self._set_readonly(False)
-        self.notice.configure(text="Filled in from your sample. Check the name, then press Save profile.")
+        self.notice.setText("Filled in from your sample. Check the name, then press Save profile.")
 
     def _unused_name(self, wanted: str) -> str:
         if wanted not in self.profiles and wanted not in BUILT_IN_PROFILE_NAMES:
@@ -378,23 +391,22 @@ class ProfileManager(Dialog):
                 lines.append(f"{title}:  regular expression (see Advanced)")
         if data.get("sn_example"):
             lines.append(f"Serial number:  looks like {data['sn_example']}")
-        self.summary.set("\n".join(lines) if lines else "Nothing set up yet. Press 'Set up from a sample…'.")
+        self.summary.setText("\n".join(lines) if lines else "Nothing set up yet. Press 'Set up from a sample…'.")
 
     # ------------------------------------------------------------------ save
     def _collect(self) -> dict:
-        v = self.vars
-        data: dict = {"type": v["type"].get(), "sn_regex": v["sn_regex"].get()}
-        extensions = v["extensions"].get().strip()
+        data: dict = {"type": self.type_box.currentText(), "sn_regex": self.get("sn_regex")}
+        extensions = self.get("extensions").strip()
         if data["type"] == "text":
             data["file_extensions"] = extensions or ",".join(TEXT_FILE_EXTENSIONS)
             for key in _TEXT_FIELDS:
-                data[key] = v[key].get()
+                data[key] = self.get(key)
             self._keep_matching_patterns(data)
         else:
             data["file_extensions"] = extensions or ",".join(EXCEL_FILE_EXTENSIONS)
             for key, _default in _EXCEL_FIELDS:
-                data[key] = v[key].get()
-            data["skip_empty_rows"] = bool(self.skip_empty.get())
+                data[key] = self.get(key)
+            data["skip_empty_rows"] = self.skip_empty.isChecked()
             example = self.extra.get("sn_example")
             if example and self._sn_matches(example, data["sn_regex"]):
                 data["sn_example"] = example
@@ -421,66 +433,59 @@ class ProfileManager(Dialog):
             return False
 
     def _save(self) -> None:
-        name = self.vars["name"].get().strip()
+        name = self.get("name").strip()
         if not name:
-            messagebox.showwarning(APP_TITLE, "Profile name cannot be empty.", parent=self)
+            QMessageBox.warning(self, APP_TITLE, "Profile name cannot be empty.")
             return
         if name in BUILT_IN_PROFILE_NAMES:
-            messagebox.showwarning(APP_TITLE, "Cannot override built-in profiles. Choose another name.", parent=self)
+            QMessageBox.warning(self, APP_TITLE, "Cannot override built-in profiles. Choose another name.")
             return
-
         data = self._collect()
         try:
             validate_profile(data)
         except ValueError as exc:
-            messagebox.showerror(APP_TITLE, str(exc), parent=self)
+            QMessageBox.critical(self, APP_TITLE, str(exc))
             return
-
         replacing_other = name in self.profiles and name != self.original_name
-        if replacing_other and not messagebox.askyesno(
-            APP_TITLE, f"A profile named '{name}' already exists. Replace it?", parent=self
-        ):
+        if replacing_other and QMessageBox.question(
+                self, APP_TITLE, f"A profile named '{name}' already exists. Replace it?") != QMessageBox.StandardButton.Yes:
             return
         if self.original_name and self.original_name != name and self.original_name not in BUILT_IN_PROFILE_NAMES:
             self.profiles.pop(self.original_name, None)
-
         self.profiles[name] = data
         save_profiles(self.profiles)
         self.original_name = name
         self._refresh_list(select=name)
-        self.notice.configure(text="")
+        self.notice.setText("")
         self.on_changed(name)
-        messagebox.showinfo("Saved", f"Profile '{name}' saved.", parent=self)
+        QMessageBox.information(self, "Saved", f"Profile '{name}' saved.")
 
     # ------------------------------------------------------------------ live tester
     def _evaluate_test(self) -> None:
-        data = self.vars["test_input"].get().strip()
+        data = self.get("test_input").strip()
         if not data:
-            self.test_result.set("Result: No data")
+            self.test_result.setText("Result: No data")
             return
-        v = self.vars
         try:
-            block_pattern, measure_pattern = v["block_regex"].get().strip(), v["measure_regex"].get().strip()
+            block_pattern, measure_pattern = self.get("block_regex").strip(), self.get("measure_regex").strip()
             if block_pattern:
                 match = re.search(block_pattern, data, re.IGNORECASE)
                 if match:
                     if "component" in match.groupdict():
-                        self.test_result.set(f"Result: MATCHED BLOCK - Component: {match.group('component')}")
+                        self.test_result.setText(f"Result: MATCHED BLOCK - Component: {match.group('component')}")
                     elif match.groups():
-                        self.test_result.set(f"Result: MATCHED BLOCK - Component: {match.group(1)}")
+                        self.test_result.setText(f"Result: MATCHED BLOCK - Component: {match.group(1)}")
                     else:
-                        self.test_result.set("Result: Matched the block but found no component group")
+                        self.test_result.setText("Result: Matched the block but found no component group")
                     return
-
             if measure_pattern:
                 match = re.search(measure_pattern, data, re.IGNORECASE)
                 if match:
-                    self.test_result.set("Result: MATCHED MEASURE - " + self._describe_measure(match, data))
+                    self.test_result.setText("Result: MATCHED MEASURE - " + self._describe_measure(match, data))
                     return
-
-            self.test_result.set("Result: Format not recognized with the current regexes")
+            self.test_result.setText("Result: Format not recognized with the current regexes")
         except re.error as exc:
-            self.test_result.set(f"Result: Regex error - {exc}")
+            self.test_result.setText(f"Result: Regex error - {exc}")
 
     def _describe_measure(self, match: re.Match, data: str) -> str:
         groups = match.groupdict()
@@ -489,10 +494,9 @@ class ProfileManager(Dialog):
             parts.append(f"Measured: {match.group('measured')}")
         elif match.groups():
             parts.append(f"Measured: {match.group(1)}")
-
         tail = match.group("tail") if "tail" in groups else data
         limits_found = False
-        for pattern in (self.vars["lim2_regex"].get().strip(), self.vars["lim3_regex"].get().strip()):
+        for pattern in (self.get("lim2_regex").strip(), self.get("lim3_regex").strip()):
             if not pattern:
                 continue
             limit = re.search(pattern, tail or "")
@@ -502,7 +506,6 @@ class ProfileManager(Dialog):
                 parts.append(f"Min: {limit.group('min')}" if "min" in found else "Min: ?")
                 parts.append(f"Max: {limit.group('max')}" if "max" in found else "Max: ?")
                 break
-
         if not parts:
             parts.append("Matched, but no measured group found")
         if not limits_found:

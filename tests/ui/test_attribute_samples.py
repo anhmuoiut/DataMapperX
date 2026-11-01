@@ -1,9 +1,9 @@
-"""The one-time check in the real window (docs/attribute-gui-verification.md), rehearsed without a window.
+"""The one-time check in the real window (docs/attribute-gui-verification.md), rehearsed without a window on screen.
 
 The ten sample files of tools/make_attribute_samples.py are opened the way the Import dialog opens them (its own functions and
-its suggested mapping), run in the workspace on the recording Tk, and what the checklist expects is asserted. What this cannot
-show is how anything looks: that is the checklist. The nine Pass/Fail studies of tools/attribute_disagreement_cases.py are
-checked for what docs/attribute-minitab-comparison.md says about them.
+its suggested mapping), run in the Qt workspace, and what the checklist expects is asserted. What this cannot show is how
+anything looks: that is the checklist. The nine Pass/Fail studies of tools/attribute_disagreement_cases.py are checked for what
+docs/attribute-minitab-comparison.md says about them.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import load_workbook
+from PySide6.QtWidgets import QFileDialog
 
 from datamapperx.stat_charts import agreement_charts, agreement_extra_height
 from datamapperx.stat_reports import attribute_details, attribute_tables
@@ -25,9 +26,10 @@ from datamapperx.statistics.ratings import (
 )
 from datamapperx.ui import validation_workspace as workspace
 
-from .recorded_tk import build_workspace
+from .support import pump
+from .test_validation import check_rows
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def load_tool(name: str):
@@ -43,20 +45,25 @@ def samples(tmp_path_factory):
 
 
 @pytest.fixture
-def window(monkeypatch):
+def ws(app, window, monkeypatch):
     monkeypatch.setenv(workspace.ATTRIBUTE_PREVIEW_ENV, "1")
-    return build_workspace(monkeypatch)
+    window._show_workspace("validation")
+    pump(app, lambda: not window.validation.busy)
+    return window.validation
 
 
-def run_sample(ws, path, categories=()):
+def run_sample(app, ws, path, categories=()):
     """What choosing the file in the Import dialog and pressing Import, then Run, does."""
     table = read_ratings_table(path)
     ws._ratings_ready(build_ratings(table, RatingsMapping(**suggest_mapping(table.headers), categories=categories)))
+    pump(app, lambda: ws.dataset is not None and not ws.busy)
     ws.run_analysis()
-    group = ws.checks_tree.get_children()
-    return {"table": [row["values"] for row in ws.table.rows()], "summary": ws.summary_var.get(),
-            "checks": [(r["text"], r["values"][1]) for r in ws.checks_tree.rows(group[0])] if group else [],
-            "sections": [r["values"][0] for r in ws.grr_tree.rows() if r["tags"] == ("section",)], "result": ws.results[0]}
+    pump(app, lambda: not ws.running and ws.result_set is not None and not ws.stale)
+    rows = check_rows(ws)
+    return {"table": [tuple(row) for row in ws.table.rows()], "summary": ws.summary_var.get(),
+            "checks": [(row[1], row[3]) if row[1] != "All checks" else ("All checks", "OK") for row in rows],
+            "sections": [cells[0] for cells, tag in zip(ws.grr_tree.rows(), ws.grr_tree.tags(), strict=True) if tag == "section"],
+            "result": ws.results[0]}
 
 
 ONE = ["Within Appraisers", "Fleiss' Kappa Statistics", "Each Appraiser vs Standard", "Fleiss' Kappa Statistics vs Standard", "Assessment Disagreement"]
@@ -77,46 +84,42 @@ ANALYSED, REVIEW = "1 item analyzed · Acceptance off", "1 item analyzed · Acce
     ("8_one_category.csv", ("8_one_category" + workspace.WARNING_MARK, "30", "100.00", "100.00", "N/A"), [("Categories", "Review")], ONE[:4], REVIEW),
     ("9_workbook_two_sheets.xlsx", ("9_workbook_two_sheets", "30", "96.67", "96.67", "0.96"), OK, ONE, ANALYSED),
 ])
-def test_each_sample_file_gives_what_the_checklist_expects(window, samples, name, row, checks, sections, summary):
-    shown = run_sample(window[1], samples[name])
+def test_each_sample_file_gives_what_the_checklist_expects(app, ws, samples, name, row, checks, sections, summary):
+    shown = run_sample(app, ws, samples[name])
     assert shown["table"] == [row] and shown["summary"] == summary
     assert shown["checks"] == checks and shown["sections"] == sections
 
 
-def test_the_labels_p_and_f_are_kept_until_they_are_mapped_in_the_dialog(window, samples):
-    root, ws = window
-    kept = run_sample(ws, samples["7_labels_P_F.csv"])
+def test_the_labels_p_and_f_are_kept_until_they_are_mapped_in_the_dialog(app, ws, samples):
+    kept = run_sample(app, ws, samples["7_labels_P_F.csv"])
     assert kept["result"].details["levels"] == ("F", "P") and kept["table"][0][2:] == ("100.00", "100.00", "1.00")
-    mapped = run_sample(ws, samples["7_labels_P_F.csv"], category_mapping({"P": "PASS", "F": "FAIL"}))
+    mapped = run_sample(app, ws, samples["7_labels_P_F.csv"], category_mapping({"P": "PASS", "F": "FAIL"}))
     assert mapped["result"].details["levels"] == ("FAIL", "PASS") and mapped["table"][0][2:] == ("100.00", "100.00", "1.00")
     assert {r.value for r in ws.dataset.observations} == {"PASS", "FAIL"} and {r.standard for r in ws.dataset.observations} == {"PASS", "FAIL"}
 
 
-def test_the_figures_the_checklist_names(window, samples):
-    root, ws = window
-    d = run_sample(ws, samples["1_reference.csv"])["result"].details
+def test_the_figures_the_checklist_names(app, ws, samples):
+    d = run_sample(app, ws, samples["1_reference.csv"])["result"].details
     ann, = d["appraisers"]
     assert (ann["within"]["percent"], f"{ann['within']['lower']:.2f}", ann["within"]["upper"]) == (100.0, "90.50", 1.0 * 100)
     overall = ann["kappa_within"]["overall"]
     assert f"{overall['se']:.6f}" == "0.105409" and f"{overall['z']:.5f}" == "9.48683" and overall["p"] < 0.0001
     assert (ann["disagreement"]["different"], ann["disagreement"]["assessments"]) == (0, 90)
-    d = run_sample(ws, samples["2_one_inconsistent_sample.csv"])["result"].details
+    d = run_sample(app, ws, samples["2_one_inconsistent_sample.csv"])["result"].details
     assert (f"{d['appraisers'][0]['within']['lower']:.2f}", f"{d['appraisers'][0]['within']['upper']:.2f}") == ("82.78", "99.92")
 
 
-def test_three_appraisers_are_each_in_the_details_and_pooled_in_between_and_all_vs_standard(window, samples):
-    root, ws = window
-    d = run_sample(ws, samples["3_three_appraisers.csv"])["result"].details
+def test_three_appraisers_are_each_in_the_details_and_pooled_in_between_and_all_vs_standard(app, ws, samples):
+    d = run_sample(app, ws, samples["3_three_appraisers.csv"])["result"].details
     ann, ben, carla = d["appraisers"]
     assert [(a["name"], a["within"]["matched"], a["standard"]["matched"]) for a in (ann, ben, carla)] == [
         ("Ann", 30, 30), ("Ben", 25, 25), ("Carla", 30, 11)]  # Carla is consistent (within) but wrong on 19 samples
     assert d["between"]["matched"] == 11 and d["all_standard"]["matched"] == 11 and d["kappa_all_standard"]["reason"] == ""
-    assert [r["values"][0] for r in ws.grr_tree.rows() if r["tags"] == ("section",)] == MANY
+    assert [cells[0] for cells, tag in zip(ws.grr_tree.rows(), ws.grr_tree.tags(), strict=True) if tag == "section"] == MANY
 
 
-def test_twelve_long_names_are_each_in_the_tables_and_the_chart_panels_are_made_tall_enough(window, samples):
-    root, ws = window
-    shown = run_sample(ws, samples["10_twelve_long_names.csv"])
+def test_twelve_long_names_are_each_in_the_tables_and_the_chart_panels_are_made_tall_enough(app, ws, samples):
+    shown = run_sample(app, ws, samples["10_twelve_long_names.csv"])
     d = shown["result"].details
     assert [a["name"] for a in d["appraisers"]] == list(load_tool("make_attribute_samples").LONG_NAMES) and shown["table"][0][2:] == ("N/A", "N/A", "N/A")
     assert shown["sections"] == MANY and shown["summary"] == ANALYSED
@@ -140,13 +143,13 @@ SCREEN_TO_REPORT = {"Within Appraisers": "Within Appraisers: Assessment Agreemen
 
 
 def screen_tables(ws):
-    """The tables of the Details tab as the tree holds them: title -> rows of cell texts."""
+    """The tables of the Details tab as the grid holds them: title -> rows of cell texts (padded with blanks to the widest table)."""
     tables = {}
-    for row in ws.grr_tree.rows():
-        if row["tags"] == ("section",):
-            rows = tables.setdefault(row["values"][0], [])
-        elif row["tags"] != ("head",):
-            rows.append(list(row["values"]))
+    for cells, tag in zip(ws.grr_tree.rows(), ws.grr_tree.tags(), strict=True):
+        if tag == "section":
+            rows = tables.setdefault(cells[0], [])
+        elif tag != "head":
+            rows.append(list(cells))
     return tables
 
 
@@ -172,23 +175,24 @@ ALL_STUDIES = ["1_reference.csv", "2_one_inconsistent_sample.csv", "3_three_appr
 
 
 @pytest.mark.parametrize("name", ALL_STUDIES)
-def test_the_screen_the_pdf_and_the_workbook_hold_the_same_figures(window, samples, tmp_path, monkeypatch, name):
+def test_the_screen_the_pdf_and_the_workbook_hold_the_same_figures(app, ws, samples, tmp_path, monkeypatch, name):
     pypdf = pytest.importorskip("pypdf")
-    root, ws = window
     monkeypatch.setenv(workspace.ATTRIBUTE_REPORTS_ENV, "1")
     ws.judge_var.set(False)
-    result = run_sample(ws, samples[name])["result"]
+    result = run_sample(app, ws, samples[name])["result"]
     ws.judge_var.set(True)  # and with acceptance, which is a table of its own
-    chosen = {}
-    monkeypatch.setattr(workspace.filedialog, "asksaveasfilename", lambda **kw: chosen.setdefault(kw["defaultextension"], str(tmp_path / f"r{kw['defaultextension']}")))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda parent, title, initial, *a: (str(tmp_path / f"r{Path(initial).suffix}"), "")))
     for suffix in (".pdf", ".xlsx"):
         ws.generate_report(suffix)
+        pump(app, lambda: not ws.export_busy)
         assert ws.report_var.get().startswith("Saved:"), (name, suffix, ws.report_var.get())
     tables = {t.title: t for t in attribute_tables(result)}
     precision = ws._precision()
     # the screen: every table of the Details is a table of the report, with the same cell texts
     for title, rows in screen_tables(ws).items():
-        assert rows == tables[SCREEN_TO_REPORT.get(title, title)].cells(precision), (name, title)
+        expected = tables[SCREEN_TO_REPORT.get(title, title)].cells(precision)
+        assert [row[:len(want)] for row, want in zip(rows, expected, strict=True)] == expected, (name, title)
+        assert all(not any(row[len(want):]) for row, want in zip(rows, expected, strict=True)), (name, title)
     # the PDF: every row of every table is printed as the screen shows it
     pages = " ".join(" ".join(p.extract_text().split()) for p in pypdf.PdfReader(tmp_path / "r.pdf").pages)
     for title, table in tables.items():

@@ -3,6 +3,13 @@
 Each release's notes are shown to users in the update dialog, so write them for the people who use the app.
 A release cannot be published unless its version has a section here.
 
+## [Unreleased]
+
+### Improved
+- **A new window, built on Qt (PySide6).** Everything you could do before is still there, with the same steps, the same shortcuts and the same files: Data Mapping (Select, Review & Export), the profile manager and the sample wizard, the duplicate-reading review, the GRR pre-check, Validation & Reports and its PDF and Excel reports, the update dialog and the Help menu. The window starts in about half the time, tables and charts follow the window size, and scrolling no longer depends on drawing every cell yourself. Your settings, profiles and saved choices are read as they were.
+- The program no longer carries Tcl/Tk or the `sv-ttk` theme.
+- A large selection no longer freezes the Review: with about 1,200 components over 120 files the GRR pre-check and the data checks are worked out in the background (the window opens at once and fills in a moment later) instead of blocking it for about a second.
+
 ## [1.2.0] - 2026-10-28
 
 ### New

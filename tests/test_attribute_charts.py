@@ -7,7 +7,6 @@ values the graph shows, and whether anything overlaps or is clipped, can be meas
 from __future__ import annotations
 
 import dataclasses
-from types import SimpleNamespace
 
 import pytest
 
@@ -25,13 +24,11 @@ from datamapperx.stat_charts import (
     agreement_extra_height,
     chart_primitives,
     charts_for_result,
-    draw_tk_charts,
     reportlab_chart,
 )
 from datamapperx.stat_reports import report_charts
 from datamapperx.statistics import AnalysisConfig
 from datamapperx.statistics.attribute import agreement_interval
-from datamapperx.ui.validation_workspace import ValidationWorkspace
 
 from .test_attribute import ATTRIBUTE, only, rate, reference_rows
 
@@ -307,45 +304,3 @@ def test_a_few_short_names_and_every_other_panel_keep_the_height_they_are_given(
     na = ChartSpec("Appraiser vs Standard", "Appraiser", "Percent", (), note="N/A: the Standard is missing")
     other = ChartSpec("Components of Variation", "x", "Percent", (ChartSeries("a", ((1, 1.0), (2, 2.0)), "#0068A8", "line"),), categories=("A", "B"))
     assert agreement_extra_height(na, *SMALLEST_CELL, scale) == 0.0 and agreement_extra_height(other, *SMALLEST_CELL, scale) == 0.0
-
-
-def test_the_window_scrolls_a_tall_panel_and_keeps_the_percent_scale_readable():
-    class Scrolling(Canvas):
-        scrollregion = None
-
-        def configure(self, **kwargs):
-            self.scrollregion = kwargs.get("scrollregion", self.scrollregion)
-
-    result = only(appraisers_study(LONG_NAMES), ATTRIBUTE)
-    canvas = Scrolling(width=360, height=300)  # a small window: one column, each panel 210 pixels high at least
-    draw_tk_charts(canvas, agreement_charts(result), columns=2, compact=True)
-    assert canvas.scrollregion[3] > 2 * 210  # taller than two minimum panels: it scrolls
-    for panel in (0, 1):
-        ticks = sorted(y for x, y, text in canvas.texts if text["text"].isdigit() and text["anchor"] == "e" and text["angle"] == 0
-                       and panel * canvas.scrollregion[3] / 2 <= y < (panel + 1) * canvas.scrollregion[3] / 2)
-        assert len(ticks) >= 4 and min(b - a for a, b in zip(ticks, ticks[1:], strict=False)) >= 12  # the tick labels do not touch
-    few = Scrolling(width=360, height=300)
-    draw_tk_charts(few, agreement_charts(only(appraisers_study(("Ann", "Ben")), ATTRIBUTE)), columns=2, compact=True)
-    assert few.scrollregion[3] == 2 * max(210, 300 / 2)  # nothing changes for the usual study
-
-
-def test_the_window_draws_both_panels_side_by_side_and_says_why_when_there_is_none():
-    result = only(reference_rows(), ATTRIBUTE)
-    canvas = Canvas()
-    draw_tk_charts(canvas, agreement_charts(result), columns=2, compact=True)
-    titles = {text["text"]: x for x, _, text in canvas.texts if text["text"] in AGREEMENT_TITLES}
-    assert set(titles) == set(AGREEMENT_TITLES) and titles["Appraiser vs Standard"] > canvas.size[0] / 2  # in two columns
-    narrow = Canvas(width=500)
-    draw_tk_charts(narrow, agreement_charts(result), columns=2, compact=True)
-    assert max(x for x, _, text in narrow.texts if text["text"] in AGREEMENT_TITLES) < 150  # too narrow for two: one column
-
-    neither = only([dataclasses.replace(r, standard="") for r in reference_rows(trials=1)], ATTRIBUTE)
-    stub = SimpleNamespace(chart_canvas=Canvas(), _charts=[], chart_scale_var=SimpleNamespace(get=lambda: "auto"), _scaled=False,
-                           palette=SimpleNamespace(muted="#526174"), selected_result=lambda: neither)
-    ValidationWorkspace._draw_chart(stub)
-    assert [kwargs["text"] for _, _, kwargs in stub.chart_canvas.texts] == [agreement_chart_note(neither)]
-    stub.selected_result = lambda: result  # an item that has panels: no hint
-    stub._charts = agreement_charts(result)
-    stub.chart_canvas = Canvas()
-    ValidationWorkspace._draw_chart(stub)
-    assert "No chart applies" not in " ".join(kwargs["text"] for _, _, kwargs in stub.chart_canvas.texts)

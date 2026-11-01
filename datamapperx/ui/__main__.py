@@ -1,4 +1,4 @@
-"""``python -m datamapperx.ui_qt``"""
+"""``python -m datamapperx.ui``"""
 
 import sys
 

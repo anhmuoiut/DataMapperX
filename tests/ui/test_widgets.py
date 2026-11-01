@@ -11,10 +11,10 @@ from PySide6.QtWidgets import QStyleFactory
 from datamapperx.palette import DARK, LIGHT
 from datamapperx.stat_charts import chart_primitives, charts_for_result
 from datamapperx.statistics import AnalysisConfig, analyze, normalize_records
-from datamapperx.ui_qt.models import TableModel
-from datamapperx.ui_qt.tasks import TaskRunner
-from datamapperx.ui_qt.theme import apply_theme, make_palette, resolve_mode
-from datamapperx.ui_qt.widgets import ActionTable, ChartPanel
+from datamapperx.ui.models import TableModel
+from datamapperx.ui.tasks import TaskRunner
+from datamapperx.ui.theme import apply_theme, make_palette, resolve_mode
+from datamapperx.ui.widgets import CHART_SCALE, ActionTable, ChartPanel
 
 from ..conftest import ict_block, write_ict_log
 from .support import pump
@@ -148,3 +148,37 @@ def test_every_chart_of_an_item_is_painted(app, tmp_path):
     image = panel.grab().toImage()
     dark = sum(1 for x in range(0, image.width(), 3) for y in range(0, image.height(), 3) if image.pixelColor(QPoint(x, y)).lightness() < 200)
     assert dark > 200  # lines, bars and text were drawn on the white background
+
+
+def test_the_chart_panel_follows_the_width_and_grows_a_tall_agreement_panel_instead_of_squeezing_it(app):
+    from datamapperx.stat_charts import MIN_CELL_WIDTH, agreement_charts
+
+    from ..test_attribute import ATTRIBUTE, only, reference_rows
+    from ..test_attribute_charts import LONG_NAMES, appraisers_study
+
+    panels = agreement_charts(only(reference_rows(), ATTRIBUTE))
+    panel = ChartPanel()
+    panel.set_specs(panels)
+    panel.resize(900, 600)
+    assert panel._columns() == 2 and panel._layout()[0] == 2  # side by side when each gets room
+    panel.resize(int(MIN_CELL_WIDTH * 1.4), 600)
+    assert panel._columns() == 1  # too narrow for two: one column
+    tall = agreement_charts(only(appraisers_study(LONG_NAMES), ATTRIBUTE))
+    panel.set_specs(tall)
+    panel.resize(900, 300)
+    assert panel.minimumHeight() > 2 * 210  # many long names: the panel is made taller, and the window scrolls
+    short = ChartPanel()
+    short.set_specs(agreement_charts(only(appraisers_study(("Ann", "Ben")), ATTRIBUTE)))
+    short.show()  # a hidden widget is told its new size only when it is shown
+    short.resize(900, 300)
+    app.processEvents()
+    assert short.minimumHeight() == int(short._row_heights[0] * CHART_SCALE)  # nothing changes for the usual study
+
+
+def test_the_chart_panel_says_why_there_is_none():
+    panel = ChartPanel()
+    panel.resize(500, 200)
+    panel.set_specs([], note="No chart applies: the Standard is missing.")
+    image = panel.grab().toImage()
+    ink = sum(1 for x in range(0, image.width(), 2) for y in range(0, 60, 2) if image.pixelColor(QPoint(x, y)).lightness() < 200)
+    assert ink > 20 and panel.specs() == []

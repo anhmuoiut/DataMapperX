@@ -5,8 +5,8 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QFileDialog
 
 from datamapperx.parsing import parse_log_file
-from datamapperx.ui_qt.profile_dialog import ProfileManager
-from datamapperx.ui_qt.sample_wizard import SampleWizard
+from datamapperx.ui.profile_dialog import ProfileManager
+from datamapperx.ui.sample_wizard import SampleWizard
 
 from ..test_sampling import EOL_ROWS, make_ict_folder, write_results_workbook
 from .support import pump
@@ -116,7 +116,7 @@ def test_the_regular_expressions_are_hidden_until_asked_for(app, window):
     manager.present()
     assert not manager.advanced_frame.isVisibleTo(manager)
     manager._toggle_advanced()
-    assert manager.advanced_frame.isVisibleTo(manager) and manager.advanced_toggle.text().endswith("▾")
+    assert manager.advanced_frame.isVisibleTo(manager) and manager.advanced_toggle.text().endswith("▼")
     manager.sn_regex_text.setText("VSE\\d+")
     manager.sn_regex_text.textEdited.emit("VSE\\d+")
     assert manager.get("sn_regex") == "VSE\\d+"  # one value, shown in two places

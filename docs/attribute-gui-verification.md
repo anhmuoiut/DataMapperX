@@ -1,6 +1,6 @@
 # Attribute Agreement: one-time check in the real window
 
-Everything about Attribute Agreement that can be tested without a window has been (`tests/test_attribute*.py`, `tests/test_ratings.py`). The code of the workspace itself has also been run, with no window, on a Tk that records what it is told instead of drawing (`tests/test_workspace_recorded.py`, `tests/recorded_tk.py`): import, mapping, Run, the Results table, Details, Checks, the charts, sorting, switching between methods and making the reports, so a missing name or a wrong call would already have been found. What is left is what only the real Tk window shows: how the import dialog, the tables, the colours and the charts on the canvas look, whether Tk accepts every option the code gives it, and the PDF and Excel files opened in their own programs. This is the list to go through once. The readiness flags stay off until it has been done and approved.
+Everything about Attribute Agreement that can be tested without a window has been (`tests/test_attribute*.py`, `tests/test_ratings.py`). The code of the workspace itself has also been run in the real Qt workspace on Qt's offscreen platform, so no window opens and no focus is taken (`tests/ui/test_validation_attribute.py`): import, mapping, Run, the Results table, Details, Checks, the charts, sorting, switching between methods and making the reports, so a missing name or a wrong call would already have been found. What is left is what only the window on a screen shows: how the import dialog, the tables, the colours and the charts look, and the PDF and Excel files opened in their own programs. This is the list to go through once. The readiness flags stay off until it has been done and approved.
 
 Starting the application opens a window and takes the keyboard focus, so do this when that does not matter.
 
@@ -24,7 +24,7 @@ Run this once in the project folder (it writes ten files to `samples/attribute_g
 python tools\make_attribute_samples.py                  # Windows
 ```
 
-The first column of the table says what to expect. `tests/test_attribute_samples.py` opens the same ten files the way the Import dialog does, runs them in the workspace on a recording Tk (no window) and asserts the figures, Checks and tables below, so what is left for the window is how they look and behave.
+The first column of the table says what to expect. `tests/ui/test_attribute_samples.py` opens the same ten files the way the Import dialog does, runs them in the Qt workspace (headless) and asserts the figures, Checks and tables below, so what is left for the window is how they look and behave.
 
 | File | What it is | Expected |
 |---|---|---|
@@ -77,7 +77,7 @@ Tick each line; write down anything that differs from "expected".
 - [ ] Two panels side by side (one column when the window is narrow): Within Appraisers and Appraiser vs Standard, with a legend row (Percent, 95% CI) under each title; 1_reference shows a circle at 100 and X markers at 100 and 90.5 joined by a line.
 - [ ] Nothing overlaps or is cut off at several window sizes, with 1 and with 3 appraisers (3_three_appraisers); the percent scale ends at 100.
 - [ ] 4_no_standard shows only Within Appraisers; 6_single_trial only Appraiser vs Standard; 5_unusable_standard shows "N/A: The Standard is missing for 1 of 30 samples." in the second panel. An item with no panel says why.
-- [ ] 10_twelve_long_names: in a small window each panel is taller than usual and the canvas scrolls, so that the percent scale (ticks 60 to 100 or 90 to 100) stays readable; the rotated names may touch each other on a high-resolution screen in a very small window (a known limit: widen the window).
+- [ ] 10_twelve_long_names: in a small window each panel is taller than usual and the panel scrolls, so that the percent scale (ticks 60 to 100 or 90 to 100) stays readable; the rotated names may touch each other on a high-resolution screen in a very small window (a known limit: widen the window).
 - [ ] The charts stay on a white background in the dark theme, as the other charts do.
 
 **G. Reports** (Report tab; needs `DATAMAPPERX_ATTRIBUTE_REPORTS=1`)
@@ -97,7 +97,7 @@ Tick each line; write down anything that differs from "expected".
 
 ### What was checked without a window (2026-11-01)
 
-* The ten sample files and the nine Pass/Fail studies were run through the workspace on the recording Tk (`tests/test_attribute_samples.py`): the table, Details, Checks and summary of each are those of section 2. The Details, the PDF and the workbook hold the same figures (cell by cell for the workbook, row by row for the PDF).
+* The ten sample files and the nine Pass/Fail studies were run through the Qt workspace (`tests/ui/test_attribute_samples.py`): the table, Details, Checks and summary of each are those of section 2. The Details, the PDF and the workbook hold the same figures (cell by cell for the workbook, row by row for the PDF).
 * The 38 PDF and Excel files of those 19 studies (re-run after the Assessment Disagreement table was changed to Minitab's) open under strict pypdf and Ghostscript with no warning (portrait pages of tables, one landscape page of charts), and the workbooks pass zip, XML, content-type, relationship and chart-element-order checks and reload in openpyxl. Pages of 1_reference, 3_three_appraisers, 5_unusable_standard, F_multiple_appraisers and H_one_reference_category_absent were looked at as images: no overlap or clipping.
 * Not done: opening the files in Excel and in a PDF viewer, and everything that is how the window looks (section 3).
 

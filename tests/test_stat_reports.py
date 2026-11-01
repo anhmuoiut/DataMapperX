@@ -9,7 +9,7 @@ import re
 import pytest
 from openpyxl import load_workbook
 
-from datamapperx.stat_charts import ChartSeries, ChartSpec, chart_primitives, charts_for_result, draw_tk_chart
+from datamapperx.stat_charts import ChartSeries, ChartSpec, chart_primitives, charts_for_result
 from datamapperx.stat_reports import (
     ReportContext,
     capability_details,
@@ -474,24 +474,11 @@ def test_summary_rows_for_the_application_table():
         summary_rows([capability(), grr()])
 
 
-def test_tk_uses_portable_chart_geometry():
-    calls = []
-
-    class Canvas:
-        def winfo_width(self):
-            return 600
-
-        def winfo_height(self):
-            return 280
-
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: calls.append((name, args, kwargs))
-
-    draw_tk_chart(Canvas(), charts_for_result(capability())[0])
-    assert calls[0][:2] == ("delete", ("all",))
-    assert any(name == "create_rectangle" for name, *_ in calls)
-    assert any(name == "create_line" and kwargs.get("dash") for name, _, kwargs in calls)  # the Within curve and the limits are dashed
-    assert all(isinstance(kwargs["font"][1], int) for name, _, kwargs in calls if name == "create_text")
+def test_the_chart_geometry_is_portable_primitives():
+    primitives = chart_primitives(charts_for_result(capability())[0], 375, 280)
+    assert any(kind == "rect" for kind, _coords, _style in primitives)
+    assert any(kind == "line" and style.get("dash") for kind, _coords, style in primitives)  # the Within curve and the limits are dashed
+    assert all(isinstance(style.get("size", 9), (int, float)) for kind, _coords, style in primitives if kind == "text")
 
 
 def test_invalid_dataset_is_not_plotted_as_a_silently_reduced_subset():

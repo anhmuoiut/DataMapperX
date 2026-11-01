@@ -1,157 +1,98 @@
-"""Light / dark theming on top of the Sun Valley (Windows 11 style) ttk theme."""
+"""Light / dark theming: the Fusion style, a ``QPalette`` from the shared colour tokens, and a small stylesheet.
+
+The stylesheet only names the app's own widgets (cards, chips, the primary button, table headers). Everything else keeps
+Qt's native painting, because a stylesheet on a widget class replaces that class's native drawing and costs speed.
+"""
 
 from __future__ import annotations
 
-import ctypes
-import sys
-import tkinter as tk
-from tkinter import ttk
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QGuiApplication, QPalette
+from PySide6.QtWidgets import QApplication
 
-import sv_ttk
+from ..palette import DARK, LIGHT, Palette
 
-from ..palette import DARK as _DARK
-from ..palette import LIGHT as _LIGHT
-from ..palette import Palette
-
-
-def system_prefers_dark() -> bool:
-    """Read the Windows 'app mode' setting. Anything unexpected means light."""
-    if sys.platform != "win32":
-        return False
-    try:
-        import winreg
-
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-        ) as key:
-            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
-    except OSError:
-        return False
+# A glyph that the interface font lacks (a check mark, a warning sign, a sun) sends Windows looking through every font for it, once,
+# and that search takes about half a second and some 50 MB. Widgets that show such glyphs name the font that has them, and the
+# search never happens. Elsewhere only glyphs the interface font has are used: ▼ ► ‼ ● and the arrows, not ▾ ▸ ⚠ ◆ ✔.
+SYMBOL_FONT = "Segoe UI Symbol"
 
 
 def resolve_mode(setting: str) -> str:
+    """``"light"`` or ``"dark"``; ``"system"`` follows the operating system (Qt 6.5+ reports it on Windows and macOS)."""
     if setting in ("light", "dark"):
         return setting
-    return "dark" if system_prefers_dark() else "light"
+    return "dark" if QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark else "light"
 
 
-
-def work_area(root: tk.Misc, anchor: tuple[int, int] | None = None) -> tuple[int, int, int, int]:
-    """Return the nearest monitor's usable bounds, excluding taskbars and docked toolbars."""
-    fallback = (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
-    if sys.platform != "win32":
-        return fallback
-    try:
-        from ctypes import wintypes
-
-        class MonitorInfo(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.DWORD),
-                ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT),
-                ("dwFlags", wintypes.DWORD),
-            ]
-
-        user32 = ctypes.windll.user32
-        from_point = user32.MonitorFromPoint
-        from_point.argtypes = [wintypes.POINT, wintypes.DWORD]
-        from_point.restype = wintypes.HANDLE
-        from_window = user32.MonitorFromWindow
-        from_window.argtypes = [wintypes.HWND, wintypes.DWORD]
-        from_window.restype = wintypes.HANDLE
-        get_info = user32.GetMonitorInfoW
-        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
-        get_info.restype = wintypes.BOOL
-
-        # Selecting the nearest monitor also recovers positions saved before a monitor was disconnected.
-        nearest = 2  # MONITOR_DEFAULTTONEAREST
-        monitor = from_point(wintypes.POINT(*anchor), nearest) if anchor is not None else from_window(root.winfo_id(), nearest)
-        info = MonitorInfo()
-        info.cbSize = ctypes.sizeof(info)
-        if monitor and get_info(monitor, ctypes.byref(info)):
-            area = info.rcWork
-            if area.right > area.left and area.bottom > area.top:
-                return area.left, area.top, area.right, area.bottom
-    except (AttributeError, OSError, tk.TclError, TypeError, ValueError):
-        pass
-    return fallback
-
-
-def set_dark_titlebar(window: tk.Misc, dark: bool) -> None:
-    """Ask Windows 10/11 to draw the title bar in the matching colour. Cosmetic; failures are ignored."""
-    if sys.platform != "win32":
-        return
-    try:
-        window.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        value = ctypes.c_int(1 if dark else 0)
-        for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (19 on early Windows 10 builds)
-            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)) == 0:
-                break
-    except Exception:
-        pass
-
-
-def apply_theme(root: tk.Tk, setting: str) -> Palette:
-    palette = _DARK if resolve_mode(setting) == "dark" else _LIGHT
-    sv_ttk.set_theme(palette.mode, root=root)
-    configure_styles(root, palette)
-    root.configure(bg=palette.bg)
-    set_dark_titlebar(root, palette.mode == "dark")
+def make_palette(p: Palette) -> QPalette:
+    colour = QColor
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: p.bg, QPalette.ColorRole.WindowText: p.fg,
+        QPalette.ColorRole.Base: p.surface, QPalette.ColorRole.AlternateBase: p.soft,
+        QPalette.ColorRole.Text: p.fg, QPalette.ColorRole.Button: p.soft, QPalette.ColorRole.ButtonText: p.fg,
+        QPalette.ColorRole.Highlight: p.accent, QPalette.ColorRole.HighlightedText: p.on_accent,
+        QPalette.ColorRole.PlaceholderText: p.muted, QPalette.ColorRole.ToolTipBase: p.surface,
+        QPalette.ColorRole.ToolTipText: p.fg, QPalette.ColorRole.Link: p.accent, QPalette.ColorRole.BrightText: p.danger,
+    }
+    for role, value in roles.items():
+        palette.setColor(role, colour(value))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, colour(p.muted))
     return palette
 
 
-def configure_styles(root: tk.Tk, p: Palette) -> None:
-    """App-specific surfaces and type hierarchy, keeping native controls and focus states."""
-    style = ttk.Style(root)
-    style.configure(".", font=("Segoe UI", 10))
-    style.configure("TFrame", background=p.bg)
-    style.configure("TLabel", background=p.bg, foreground=p.fg)
-    style.configure("TLabelframe", background=p.bg)
-    style.configure("TLabelframe.Label", background=p.bg, foreground=p.fg)
-    style.configure("TPanedwindow", background=p.bg)
-    style.configure("TSeparator", background=p.line)
+def stylesheet(p: Palette) -> str:
+    return f"""
+QFrame#card {{ background: {p.surface}; border: 1px solid {p.line}; border-radius: 8px; }}
+QLabel {{ background: transparent; }}
+QLabel#appTitle {{ font-size: 18pt; font-weight: 600; }}
+QLabel#cardTitle {{ font-size: 11pt; font-weight: 600; }}
+QLabel[role="muted"] {{ color: {p.muted}; }}
+QLabel[role="title"] {{ font-size: 14pt; font-weight: 600; }}
+QLabel[role="heading"] {{ font-size: 11pt; font-weight: 600; }}
+QLabel[role="ok"] {{ color: {p.ok}; }}
+QLabel[role="warn"] {{ color: {p.warn}; }}
+QLabel[role="bad"] {{ color: {p.danger}; }}
+QLabel[role="pick"] {{ background: {p.pick}; border-radius: 6px; padding: 6px 10px; }}
+QFrame#banner {{ background: {p.banner_bg}; border: 1px solid {p.line}; border-radius: 8px; }}
+QFrame#banner QLabel {{ color: {p.banner_fg}; }}
+QLabel[role="metric"] {{ font-size: 16pt; font-weight: 600; }}
+QLabel[chip] {{ border: 1px solid transparent; border-radius: 10px; padding: 2px 10px; font-family: "{SYMBOL_FONT}"; }}
+QPushButton[glyphs="true"] {{ font-family: "{SYMBOL_FONT}"; }}
+QLabel[chip="ok"] {{ background: {p.ok_bg}; border-color: {p.ok_line}; color: {p.ok}; }}
+QLabel[chip="warn"] {{ background: {p.warn_bg}; border-color: {p.warn_line}; color: {p.warn}; }}
+QLabel[chip="bad"] {{ background: {p.bad_bg}; border-color: {p.bad_line}; color: {p.danger}; }}
+QLabel[chip="info"] {{ background: {p.banner_bg}; border-color: {p.line}; color: {p.banner_fg}; }}
+QPushButton[primary="true"] {{ background: {p.accent}; color: {p.on_accent}; border: 1px solid {p.accent};
+    border-radius: 6px; padding: 6px 16px; font-weight: 600; }}
+QPushButton[primary="true"]:hover {{ border-color: {p.fg}; }}
+QPushButton[primary="true"]:disabled {{ background: {p.line}; border-color: {p.line}; color: {p.muted}; }}
+QPushButton[step] {{ background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 6px 14px; color: {p.muted}; }}
+QPushButton[step="current"] {{ color: {p.accent}; border-bottom-color: {p.accent}; font-weight: 600; }}
+QPushButton[step="done"] {{ color: {p.fg}; }}
+QPushButton[step]:disabled {{ color: {p.line}; }}
+QTableView {{ background: {p.surface}; border: 1px solid {p.line}; gridline-color: {p.line};
+    selection-background-color: {p.pick}; selection-color: {p.fg}; outline: 0; }}
+QHeaderView::section {{ background: {p.soft}; color: {p.muted}; padding: 6px 10px; border: none;
+    border-bottom: 1px solid {p.line}; font-weight: 600; }}
+QProgressBar {{ background: {p.line}; border: none; border-radius: 3px; max-height: 6px; }}
+QProgressBar::chunk {{ background: {p.accent}; border-radius: 3px; }}
+QStatusBar {{ color: {p.muted}; }}
+QSplitter::handle {{ background: transparent; }}
+"""
 
-    style.configure("Surface.TFrame", background=p.surface)
-    style.configure("Surface.TLabel", background=p.surface, foreground=p.fg)
-    style.configure("SurfaceMuted.TLabel", background=p.surface, foreground=p.muted)
-    style.configure("SurfaceHint.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
-    style.configure("Surface.TLabelframe", background=p.surface, borderwidth=0, relief="flat")
-    style.configure("Surface.TLabelframe.Label", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 11))
-    style.configure("Surface.TSeparator", background=p.line)
-    style.configure("Surface.TCheckbutton", background=p.surface, foreground=p.fg)
-    style.configure("Surface.Switch.TCheckbutton", background=p.surface, foreground=p.fg)
-    style.configure("Surface.TRadiobutton", background=p.surface, foreground=p.fg)
 
-    style.configure("Title.TLabel", font=("Segoe UI Semibold", 18))
-    style.configure("Brand.TLabel", font=("Segoe UI Semibold", 20), foreground=p.fg)
-    style.configure("Subtitle.TLabel", foreground=p.muted, font=("Segoe UI", 10))
-    style.configure("Section.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 11))
-    style.configure("Step.TLabel", background=p.surface, foreground=p.accent, font=("Segoe UI Semibold", 10))
-    style.configure("Muted.TLabel", foreground=p.muted)
-    style.configure("Hint.TLabel", foreground=p.muted, font=("Segoe UI", 9))
-    style.configure("Metric.TLabel", background=p.surface, foreground=p.fg, font=("Segoe UI Semibold", 18))
-    style.configure("MetricCaption.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
-    style.configure("Stat.TLabel", font=("Segoe UI Semibold", 16))
-    style.configure("StatCaption.TLabel", foreground=p.muted, font=("Segoe UI", 9))
-    style.configure("Ok.TLabel", foreground=p.ok)
-    style.configure("Warn.TLabel", foreground=p.warn)
-    style.configure("Bad.TLabel", foreground=p.danger)
-    for name, color in (("Ok", p.ok), ("Warn", p.warn), ("Bad", p.danger)):
-        style.configure(f"Surface{name}.TLabel", background=p.surface, foreground=color)
-
-    style.configure("Banner.TFrame", background=p.banner_bg)
-    style.configure("Banner.TLabel", background=p.banner_bg, foreground=p.banner_fg)
-
-    # One button look for the whole app: the theme's own button, its filled "Accent" version for the main action of
-    # a screen, and a square "Icon" version (the same button, just narrower) for arrows and the pager.
-    style.configure("Icon.TButton", padding=(4, 4))
-    style.configure("Pick.TLabel", background=p.pick, foreground=p.fg, padding=(10, 6))
-
-    style.configure("Treeview", rowheight=28, background=p.surface, fieldbackground=p.surface, foreground=p.fg)
-    style.configure("Compact.Treeview", rowheight=24)  # the Details and Checks tables of the results
-    style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(10, 8))
-    style.map("Treeview", background=[("selected", p.accent)], foreground=[("selected", p.on_accent)])
-
-    # Placeholders blend into their actual control, including when a card uses a different surface.
-    style.configure("EntryHint.TLabel", background=style.lookup("TEntry", "fieldbackground") or p.surface, foreground=p.muted)
+def apply_theme(app: QApplication, setting: str) -> Palette:
+    """Style the whole application and return the colour tokens in use."""
+    mode = resolve_mode(setting)
+    palette = DARK if mode == "dark" else LIGHT
+    hints = QGuiApplication.styleHints()
+    if hasattr(hints, "setColorScheme"):  # Qt 6.8+: also makes the native title bar follow the choice
+        hints.setColorScheme(Qt.ColorScheme.Dark if mode == "dark" else Qt.ColorScheme.Light)
+    app.setStyle("Fusion")
+    app.setPalette(make_palette(palette))
+    app.setStyleSheet(stylesheet(palette))
+    return palette

@@ -17,11 +17,11 @@ from datamapperx import access, updater
 from datamapperx._version import __version__
 from datamapperx.config import PREVIEW_COLUMNS_PER_PAGE as PAGE
 from datamapperx.settings import load_settings
-from datamapperx.ui_qt import main_window as mw
-from datamapperx.ui_qt.access_dialog import AccessDialog
-from datamapperx.ui_qt.dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog
-from datamapperx.ui_qt.duplicate_dialog import DuplicateDialog
-from datamapperx.ui_qt.update_dialog import UpdateDialog
+from datamapperx.ui import main_window as mw
+from datamapperx.ui.access_dialog import AccessDialog
+from datamapperx.ui.dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog
+from datamapperx.ui.duplicate_dialog import DuplicateDialog
+from datamapperx.ui.update_dialog import UpdateDialog
 
 from ..conftest import ict_block, write_ict_log
 from .support import make_logs, pump, ready_to_review, scan
@@ -294,7 +294,7 @@ def test_the_review_step_is_locked_until_there_is_something_to_review(app, windo
 
 def test_the_step_bar_shows_states_and_ignores_locked_steps(app):
     from datamapperx.palette import LIGHT
-    from datamapperx.ui_qt.widgets import StepBar
+    from datamapperx.ui.widgets import StepBar
 
     clicked = []
     bar = StepBar(("Select", "Review & Export"), LIGHT)
@@ -323,7 +323,7 @@ def test_the_step_bar_shows_states_and_ignores_locked_steps(app):
 def test_check_chips_wrap_when_narrow_and_only_rebuild_on_change(app):
     from PySide6.QtWidgets import QLabel
 
-    from datamapperx.ui_qt.widgets import ChipRow
+    from datamapperx.ui.widgets import ChipRow
 
     row = ChipRow()
     chips = [("ok", "✓  10 of 10 samples"), ("ok", "✓  3 files per sample"), ("warn", "!  20 empty cells in 2 columns"),
@@ -495,7 +495,7 @@ def test_the_review_compares_the_clicked_row_with_the_limits(app, window, tmp_pa
 
 
 def test_the_tables_tint_rows_with_missing_values_and_wrong_file_counts(app, window, tmp_path):
-    from datamapperx.ui_qt.models import TableModel
+    from datamapperx.ui.models import TableModel
 
     folder = tmp_path / "logs"
     folder.mkdir()
@@ -801,7 +801,7 @@ def test_a_data_change_reaches_the_validation_page_when_it_is_open(app, window, 
 
 # ----------------------------------------------------------------------------- dialogs
 def test_every_dialog_opens_and_closes(app, window, tmp_path):
-    from datamapperx.ui_qt.profile_dialog import ProfileManager
+    from datamapperx.ui.profile_dialog import ProfileManager
 
     folder = tmp_path / "logs"
     folder.mkdir()
@@ -833,7 +833,7 @@ def test_the_help_menu_dialogs(app, window):
 
 
 def test_release_notes_render_headings_and_bullets(app, window):
-    from datamapperx.ui_qt.widgets import ReadOnlyText
+    from datamapperx.ui.widgets import ReadOnlyText
 
     box = ReadOnlyText()
     box.set_markdown("### New\n- **Faster** scan of `OneDrive` folders\nplain line")
@@ -865,7 +865,7 @@ def test_no_update_is_silent_unless_asked(app, window):
 
 def test_a_mandatory_update_opens_a_blocking_dialog(app, window, monkeypatch):
     dialog = fake_dialog()
-    monkeypatch.setattr("datamapperx.ui_qt.update_dialog.UpdateDialog", dialog)
+    monkeypatch.setattr("datamapperx.ui.update_dialog.UpdateDialog", dialog)
     window._on_update_checked(newer_info(min_supported="99.0.0"), manual=False)
     assert [kwargs for _args, kwargs in dialog.made] == [{"mandatory": True}]
 
@@ -880,7 +880,7 @@ def test_turning_the_notice_off_hides_the_banner_but_not_a_required_update(app, 
     window._on_update_checked(newer_info(), manual=False)
     assert not window.banner.isVisibleTo(window)
     dialog = fake_dialog()
-    monkeypatch.setattr("datamapperx.ui_qt.update_dialog.UpdateDialog", dialog)
+    monkeypatch.setattr("datamapperx.ui.update_dialog.UpdateDialog", dialog)
     window._on_update_checked(newer_info(min_supported="99.0.0"), manual=False)
     assert len(dialog.made) == 1
     window.auto_update_action.setChecked(False)
@@ -1014,3 +1014,27 @@ def test_a_task_that_ends_after_the_window_closed_is_dropped(app, window):
     window.close()  # waits for the worker and drops its callbacks
     app.processEvents()
     assert seen == [] and not window.tasks.busy
+
+
+def test_a_large_selection_is_checked_in_the_background_and_the_window_stays_free(app, window, tmp_path, monkeypatch):
+    monkeypatch.setattr(mw, "BIG_REVIEW_CELLS", 5)  # a few components already count as large here
+    folder = tmp_path / "logs"
+    folder.mkdir()
+    grr_logs(folder)
+    scan(app, window, folder, repeats=3)
+    window.add_all_shown()
+    window._show_step("review")
+    assert window.check_chips.chips() == [("info", "Checking the data…")]  # said at once, nothing waited for
+    assert window.grr_grid.rows() == [] and window.is_busy is False
+    pump(app, lambda: bool(window.grr_grid.rows()) and window.check_chips.chips() != [("info", "Checking the data…")])
+    assert [row[0] for row in window.grr_grid.rows()] == ["X", "Y"] and window.grr_grid.rows()[0][-1] == "FAIL"
+    assert ("ok", "✓  No empty cells") in window.check_chips.chips()
+    # a selection that changed meanwhile: the answer for the old one is thrown away
+    window.clear_selected()
+    window._add(["X"])
+    window._show_step("review")
+    assert window.check_chips.chips() == [("info", "Checking the data…")]
+    window.clear_selected()
+    pump(app, lambda: not window.tasks.busy and not window._preview_timer.isActive())
+    assert window.grr_grid.rows() == [] and window.check_chips.chips() == []
+    assert window._summary_key[1] != ("X",) and window._grr_key[1] != ("X",)

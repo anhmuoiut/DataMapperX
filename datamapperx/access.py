@@ -5,7 +5,7 @@ The owner controls it from one file in the repository, ``status.json``::
     {"disabled": false, "message": ""}
 
 Set ``disabled`` to ``true`` (and write a ``message`` if you like) and every copy stops the next time it looks at
-the file, which is when it starts and then once an hour. Nothing here knows about tkinter or the network: the window
+the file, which is when it starts and then once an hour. Nothing here knows about the window toolkit or the network: the window
 hands in the answer it got (or the failure) and gets back what to show.
 
 Three rules keep this fair and hard to dodge:

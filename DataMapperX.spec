@@ -45,11 +45,18 @@ a = Analysis(
 _UNUSED = ('PySide6/translations/', 'PySide6/qml/', 'PySide6/plugins/styles/', 'PySide6/plugins/tls/',
            'PySide6/plugins/networkinformation/', 'PySide6/plugins/generic/', 'PySide6/plugins/iconengines/')
 _KEEP_IMAGE_PLUGINS = ('qico',)  # a window icon is an .ico
+# Qt's software OpenGL (20 MB: a Widgets application paints with the raster engine), the Direct2D platform plugin (qwindows is
+# used), and the Network and Svg libraries that nothing here loads. The self-test fails if one of them was needed after all.
+_DROP_FILES = ('opengl32sw.dll', 'qdirect2d.dll', 'qminimal.dll', 'qoffscreen.dll', 'qt6network.dll', 'qt6svg.dll')
+# reportlab requires Pillow, but only for pictures inside PDFs (the reports draw their charts as vectors); the AVIF and WebP codecs
+# of Pillow are 8 MB that no report uses.
+_DROP_PREFIXES = ('_avif.', '_webp.')
 
 
 def _used(item) -> bool:
     name = item[0].replace('\\', '/')
-    if name.startswith(_UNUSED):
+    base = os.path.basename(name).lower()
+    if name.startswith(_UNUSED) or base in _DROP_FILES or (name.startswith('PIL/') and base.startswith(_DROP_PREFIXES)):
         return False
     if name.startswith('PySide6/plugins/imageformats/'):
         return os.path.basename(name).split('.')[0] in _KEEP_IMAGE_PLUGINS

@@ -1,9 +1,12 @@
-"""A formula drawn on a canvas: fractions, subscripts, roots and Greek letters, from ``mathtext`` source."""
+"""A formula painted on a widget: fractions, subscripts, roots and Greek letters, from ``mathtext`` source."""
+
 from __future__ import annotations
 
 import math
-import tkinter as tk
-from tkinter import font as tkfont
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..mathtext import layout, parse
 from ..palette import Palette
@@ -11,33 +14,48 @@ from ..palette import Palette
 MATH_SIZE = 15  # pixels
 
 
-class MathView(tk.Canvas):
-    def __init__(self, parent: tk.Misc, source: str, palette: Palette, *, size: float = MATH_SIZE, background: str | None = None):
-        self._font_master, self._fonts = parent, {}  # not _root: tkinter's widgets have a method of that name
-        self._family = tkfont.nametofont("TkDefaultFont", root=parent).actual("family")
-        box = layout(parse(source), size, self._measure)
+class MathView(QWidget):
+    def __init__(self, source: str, palette: Palette, *, size: float = MATH_SIZE, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source, self._ink = source, QColor(palette.fg)
+        self._fonts: dict[tuple[int, bool], QFont] = {}
+        self._box = layout(parse(source), size, self._measure)
         pad = 2
-        super().__init__(parent, width=math.ceil(box.w) + 2 * pad + 1, height=math.ceil(box.asc + box.desc) + 2 * pad + 1,
-                         bg=background or palette.surface, highlightthickness=0, borderwidth=0)
-        self.source = source
-        left, base = pad, pad + box.asc
-        for op in box.ops:
-            if op[0] == "t":
-                _, x, y, text, text_size, italic = op
-                self.create_text(left + x, base + y + self._font(text_size, italic).metrics("descent"), text=text, anchor="sw",
-                                 font=self._font(text_size, italic), fill=palette.fg)
-            else:
-                _, points, width, smooth = op
-                self.create_line(*(c for x, y in points for c in (left + x, base + y)), width=width, fill=palette.fg,
-                                 smooth=smooth, capstyle="round")
+        self._pad = pad
+        self.setFixedSize(math.ceil(self._box.w) + 2 * pad + 1, math.ceil(self._box.asc + self._box.desc) + 2 * pad + 1)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-    def _font(self, size: float, italic: bool) -> tkfont.Font:
+    def _font(self, size: float, italic: bool) -> QFont:
         key = (round(size), italic)
         if key not in self._fonts:
-            self._fonts[key] = tkfont.Font(self._font_master, family=self._family, size=-key[0], slant="italic" if italic else "roman")
+            font = QFont(self.font())
+            font.setPixelSize(max(1, key[0]))
+            font.setItalic(italic)
+            self._fonts[key] = font
         return self._fonts[key]
 
     def _measure(self, text: str, size: float, italic: bool) -> tuple[float, float, float]:
-        font = self._font(size, italic)
-        metrics = font.metrics()
-        return font.measure(text), metrics["ascent"], metrics["descent"]
+        metrics = QFontMetricsF(self._font(size, italic))
+        return metrics.horizontalAdvance(text), metrics.ascent(), metrics.descent()
+
+    def set_palette(self, palette: Palette) -> None:
+        self._ink = QColor(palette.fg)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        left, base = self._pad, self._pad + self._box.asc
+        for op in self._box.ops:
+            if op[0] == "t":
+                _, x, y, text, text_size, italic = op
+                painter.setFont(self._font(text_size, italic))
+                painter.setPen(self._ink)
+                painter.drawText(QPointF(left + x, base + y), text)
+            else:
+                _, points, width, _smooth = op
+                pen = QPen(self._ink, width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawPolyline([QPointF(left + x, base + y) for x, y in points])
+        painter.end()

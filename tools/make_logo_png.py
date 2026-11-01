@@ -1,6 +1,6 @@
 """Render assets/Jabil-Logo.svg into the PNG files the application shows.
 
-Tk 8.6 cannot draw SVG, so the logo is rendered once here and the PNGs are committed. Only development needs
+The window shows PNGs, so the logo is rendered once here and the PNGs are committed. Only development needs
 Pillow; the application itself does not. Run from the project folder after changing the SVG:
 
     python tools/make_logo_png.py

@@ -92,7 +92,7 @@ python -m venv .venv            # keep the venv outside OneDrive if the repo liv
 pip install -r requirements-dev.txt
 
 python main.py                  # run from source
-python -m pytest                # tests (the UI tests open real windows briefly)
+python -m pytest                # tests (the window tests run headless on Qt's offscreen platform)
 python -m ruff check .          # lint
 powershell -File tools\build.ps1   # build dist\DataMapperX.exe and run its self-test
 ```
@@ -111,9 +111,13 @@ datamapperx/
   statistics/           Dataset, Study, statistics, evaluation (criteria) and importers; no GUI
   stat_reports.py       PDF / Excel reports from finished results (stat_charts.py draws the charts)
   updater.py            check / download / verify / install updates
-  ui/                   tkinter windows, built on the sv-ttk (Windows 11) theme
-    controls.py         the component lists, the step bar and the check chips
-    validation_workspace.py  Validation & Reports: Data, Analysis Setup, Results, Report
+  workflow.py           what the Data Mapping screens show, decided without any widget
+  workspace_data.py     the data side of Validation & Reports, without any widget
+  ui/                   the window, on PySide6 (Qt Widgets, Fusion style, the shared colour palette)
+    main_window.py      Data Mapping (Select, Review & Export), the Help menu, updates and the off switch
+    validation_workspace.py  Validation & Reports: Data, Analysis, Results, Report
+    widgets.py          step bar, chips, tables, charts; models.py is the one table model
+    tasks.py            background work (QThreadPool) and its safety rules
 tests/                  pytest suite
 tools/                  build + release helpers
 .github/workflows/      CI and release automation

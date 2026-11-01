@@ -30,7 +30,7 @@ def run(mode: str) -> None:
     from PySide6.QtWidgets import QApplication
 
     from datamapperx.palette import LIGHT
-    from datamapperx.ui_qt.widgets import ActionTable
+    from datamapperx.ui.widgets import ActionTable
 
     app = QApplication.instance() or QApplication([])
     for _ in range(ROUNDS):

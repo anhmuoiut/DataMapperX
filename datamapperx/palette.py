@@ -1,6 +1,6 @@
 """The colours of the light and dark themes, without any toolkit.
 
-Both the tkinter window and the Qt prototype take their colours from here, so they cannot drift apart.
+The window, its stylesheet and the charts take their colours from here, so they cannot drift apart.
 """
 
 from __future__ import annotations

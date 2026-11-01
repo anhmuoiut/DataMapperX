@@ -11,7 +11,6 @@ Command line (all optional; with none, the window opens):
 from __future__ import annotations
 
 import argparse
-import ctypes
 import logging
 import sys
 
@@ -25,19 +24,6 @@ logger = logging.getLogger(__name__)
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_CANNOT_SELF_UPDATE = 2
-
-
-def _enable_dpi_awareness() -> None:
-    """Render crisply on scaled displays instead of letting Windows blur the window."""
-    if sys.platform != "win32":
-        return
-    try:
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        logger.debug("Could not set DPI awareness", exc_info=True)
 
 
 def headless_update(restart: bool) -> int:
@@ -76,14 +62,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.update:
         return headless_update(args.restart)
 
-    _enable_dpi_awareness()
     if args.smoke_test:
         from . import selftest
 
         return selftest.run()
 
-    from .ui.main_window import MainWindow
+    from .ui.main_window import run
 
-    app = MainWindow()
-    app.mainloop()
-    return EXIT_OK
+    return run(sys.argv[:1])  # Qt takes the screen's scaling into account by itself

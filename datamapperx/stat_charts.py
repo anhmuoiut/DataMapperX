@@ -632,36 +632,6 @@ def chart_primitives(spec: ChartSpec, width: float = 650, height: float = 280, x
     return output
 
 
-def _draw_primitives(canvas, primitives, dx: float = 0.0, dy: float = 0.0) -> None:
-    for kind, coords, style in primitives:
-        coords = tuple(value + (dx if i % 2 == 0 else dy) for i, value in enumerate(coords))
-        color = style.get("color", "#263746")
-        if kind == "text":
-            canvas.create_text(*coords, text=style["text"], fill=color, anchor=style.get("anchor", "w"),
-                               angle=style.get("angle", 0),
-                               font=("Segoe UI", max(1, round(style.get("size", 9))), "bold" if style.get("bold") else "normal"))
-        elif kind == "line":
-            canvas.create_line(*coords, fill=color, width=style.get("width", 1), dash=(5, 3) if style.get("dash") else ())
-        elif kind == "rect":
-            canvas.create_rectangle(*coords, fill=color, outline="")
-        elif kind == "circle":
-            canvas.create_oval(*coords, fill=color, outline="")
-
-
-def draw_tk_chart(canvas, spec: ChartSpec, width: int | None = None, height: int | None = None) -> None:
-    width, height = width or max(360, canvas.winfo_width()), height or max(240, canvas.winfo_height())
-    canvas.delete("all")
-    _draw_primitives(canvas, chart_primitives(spec, width, height))
-
-
-def _pixels_per_point(canvas) -> float:
-    """How many pixels one point of type takes on this screen (1.0 on a Mac, 1.33 on Windows at 96 dpi, more when scaled)."""
-    try:
-        return min(3.0, max(0.75, float(canvas.winfo_fpixels("1p"))))
-    except (AttributeError, TypeError, ValueError, RuntimeError):
-        return 1.0
-
-
 def agreement_extra_height(spec: ChartSpec, width: float, height: float, scale: float = 1.0) -> float:
     """How much taller than ``height`` an agreement panel must be on screen for its plot to keep ``AGREEMENT_PLOT_MIN`` pixels. Many
     appraisers, or long names, take most of a small panel for their rotated labels; the panel then grows (the canvas scrolls)
@@ -670,30 +640,6 @@ def agreement_extra_height(spec: ChartSpec, width: float, height: float, scale: 
         return 0.0
     _, top, _, bottom = next(coords for kind, coords, _ in chart_primitives(spec, width, height, None, True, scale) if kind == "line")
     return max(0.0, AGREEMENT_PLOT_MIN - (bottom - top))  # the plot is the axis: its height does not depend on the panel's other parts
-
-
-def draw_tk_charts(canvas, specs: Sequence[ChartSpec], columns: int = 2, min_height: int = 190,
-                   x_scale: str | None = None, compact: bool = False) -> None:
-    """Every chart of an item in a grid, as Minitab's report shows them; the canvas scrolls when they do not fit.
-    ``compact`` adapts them to the screen: the charts go side by side only when each gets room (``MIN_CELL_WIDTH``), their
-    spacing follows the size of the text, and long sample identities are shortened."""
-    width, height = max(360, canvas.winfo_width()), max(240, canvas.winfo_height())
-    canvas.delete("all")
-    if not specs:
-        canvas.configure(scrollregion=(0, 0, width, height))
-        return
-    scale = _pixels_per_point(canvas) if compact else 1.0
-    if compact:
-        columns, min_height = min(columns, int(width // MIN_CELL_WIDTH)), max(min_height, 210)
-    columns = max(1, min(columns, len(specs)))
-    rows = math.ceil(len(specs) / columns)
-    cell_w, cell_h = width / columns, max(min_height, height / rows)
-    if compact:
-        cell_h += max((agreement_extra_height(spec, cell_w - 8, cell_h - 6, scale) for spec in specs), default=0.0)
-    for index, spec in enumerate(specs):
-        primitives = chart_primitives(spec, cell_w - 8, cell_h - 6, x_scale, compact, scale)
-        _draw_primitives(canvas, primitives, (index % columns) * cell_w + 4, (index // columns) * cell_h)
-    canvas.configure(scrollregion=(0, 0, width, rows * cell_h))
 
 
 def reportlab_chart(spec: ChartSpec, width: float = 650, height: float = 280,
