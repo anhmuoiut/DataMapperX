@@ -2335,12 +2335,12 @@ def test_grr_has_no_pass_or_fail_until_criteria_are_chosen(app, tmp_path):
     run_validation(app, ws)
     assert [ws.table.heading(c)["text"] for c in ws.table["columns"]] == ["Test Item", "%SV/Tol", "%Study Var", "NDC"]
     assert all(r.status == "N/A" and "ndc" in r.metrics for r in ws.results) and "statistics only" in ws.summary_var.get()
-    assert "No acceptance criteria" in ws.plan_var.get()
+    assert ws.plan_title_var.get() == "Variable Gage R&R" and ws.plan_var.get() == "3 Test Items · 3 Samples" and not ws._judge_for("grr")
     ws.profile_var.set("SolarEdge")  # criteria are a layer on top: the figures stay and PASS / FAIL appear
     app.update()
     assert not ws.stale and [ws.table.heading(c)["text"] for c in ws.table["columns"]][-2:] == ["Acceptance Result", "Review"]
     assert {ws.table.item(i, "values")[-2] for i in ws.table.get_children()} <= {"PASS", "CONDITIONAL PASS", "FAIL", "N/A"}
-    assert "Customer criteria: SolarEdge" in ws.plan_var.get() and showing(app, ws.filter_combo)
+    assert ws.study.evaluation.profile == "SolarEdge" and ws._judge_for("grr") and showing(app, ws.filter_combo)
 
 
 def test_within_sigma_is_chosen_from_the_subgroup_size_unless_the_user_says_otherwise(app, tmp_path):
@@ -2350,13 +2350,13 @@ def test_within_sigma_is_chosen_from_the_subgroup_size_unless_the_user_says_othe
     ws = open_validation(app)
     ws.method_var.set("capability")
     app.update()
-    assert ws.study.options.within_method == "individuals" and "chosen from the subgroup size" in ws.plan_var.get()
+    assert ws.study.options.within_method == "individuals" and ws.within_hint_var.get() == "In use: average moving range"
     ws.subgroup_var.set(True)  # the two files of a serial number form a subgroup
     app.update()
-    assert ws.study.options.within_method == "pooled" and "pooled standard deviation" in ws.plan_var.get()
+    assert ws.study.options.within_method == "pooled" and ws.within_hint_var.get() == "In use: pooled standard deviation"
     ws.within_var.set("Average moving range, length 2 (subgroup size 1)")
     app.update()
-    assert ws.study.options.within_method == "individuals" and "chosen from the subgroup size" not in ws.plan_var.get()
+    assert ws.study.options.within_method == "individuals" and ws.within_hint_var.get() == "In use: average moving range"
 
 
 def test_the_details_tab_shows_the_tables_of_the_selected_item(app, tmp_path):
@@ -2801,7 +2801,7 @@ def test_a_single_tester_study_needs_no_operators_and_the_worksheet_says_how_it_
     assert all(part in ws.dataset_var.get() for part in ("Test Items 1", "Samples 10", "Total Readings 30", "Trials per Sample 3"))
     assert ws.hint_var.get() == "" and showing(app, ws.hint_label, False)  # balanced and complete: nothing to warn about
     run_validation(app, ws)
-    assert ws.results[0].valid and not ws.results[0].details.get("crossed") and "Single-tester" in ws.plan_var.get()
+    assert ws.results[0].valid and not ws.results[0].details.get("crossed") and ws.plan_title_var.get() == "Variable Gage R&R"
     assert not any(c.code == "one_appraiser" for c in ws.evaluated.record.validation.conditions)
     assert "Operators:" not in ws.checks_view.text.get("1.0", "end")
 
@@ -2824,7 +2824,7 @@ def test_the_study_variation_factor_scales_study_var_and_tolerance_only(app, tmp
     assert four["study_var"] == pytest.approx(six["study_var"] * 4 / 6) and four["percent_tolerance"] == pytest.approx(six["percent_tolerance"] * 4 / 6)
     for unchanged in ("percent_study_var", "ndc", "sigma_grr", "sigma_part", "variance_grr", "variance_part"):
         assert four[unchanged] == six[unchanged], unchanged
-    assert "4 × SD" in session_text(ws.results[0]) and "Study variation: 4 × SD." in ws.plan_var.get()
+    assert "4 × SD" in session_text(ws.results[0]) and ws.study.options.study_factor == 4.0
     note = guide_text(method_guide(ws._config()))
     assert "uses k = 4" in note and "±3σ" in note and "Gage R&R is the repeatability" in note
     ws.study_factor_var.set("7")
@@ -3045,3 +3045,41 @@ def test_results_put_the_table_beside_the_charts_in_a_wide_window_and_above_them
     for widget in (ws.table, ws.chart_canvas, ws.about_button):
         assert inside(app, widget), widget
     app.geometry("1360x880+0+0")
+
+
+def choices(widget, kind):
+    """The texts of the check buttons or radio buttons below a widget, in order."""
+    found = [widget.cget("text")] if widget.winfo_class() == kind else []
+    for child in widget.winfo_children():
+        found += choices(child, kind)
+    return found
+
+
+def test_the_capability_setup_is_two_checkboxes_the_criteria_on_demand_and_advanced_settings(app, tmp_path):
+    folder = tmp_path / "cap_setup"
+    folder.mkdir()
+    ready_to_review(app, folder)
+    ws = open_validation(app)
+    ws.method_var.set("capability")
+    ws.tabs.select(ws.setup_tab)
+    app.update()
+    assert ws.plan_title_var.get() == "Process Capability" and ws.plan_var.get() == "3 Test Items · 3 Samples"  # the whole plan
+    assert choices(ws.setup_tab, "TRadiobutton")[:2] == ["MSA – Variable Gage R&R", "Process Capability – Cp/Cpk, Pp/Ppk"]
+    assert choices(ws.cap_setup, "TCheckbutton") == ["Group readings by Sample ID", "Enable acceptance criteria"]
+    assert showing(app, ws.criteria_row, False) and showing(app, ws.advanced, False) and ws.threshold_var.get() == "1.33"
+    ws.judge_var.set(True)
+    app.update()
+    assert showing(app, ws.criteria_row) and choices(ws.criteria_row, "TRadiobutton") == ["Cpk (Within)", "Ppk (Overall)"]
+    ws.index_var.set("ppk")
+    ws.threshold_var.set("1.67")
+    assert ws.study.evaluation.decision_metric == "ppk" and ws.study.evaluation.cpk_threshold == 1.67  # the comparison is the same
+    ws.judge_var.set(False)
+    app.update()
+    assert showing(app, ws.criteria_row, False) and not ws._judge_for("capability")
+    ws.index_var.set("cpk")
+    ws.threshold_var.set("1.33")
+    ws.advanced_button.invoke()
+    assert showing(app, ws.advanced) and "Advanced Settings" in ws.advanced_button.cget("text")
+    ws.advanced_button.invoke()
+    ws.method_var.set("grr")
+    assert ws.plan_title_var.get() == "Variable Gage R&R"

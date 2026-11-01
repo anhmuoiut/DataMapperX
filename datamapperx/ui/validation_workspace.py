@@ -43,7 +43,6 @@ from ..statistics import (
     apply_design,
     auto_within_method,
     customers_to_json,
-    describe_design,
     import_rawdata_xlsx,
     merge_customers,
 )
@@ -71,6 +70,7 @@ WITHIN_CHOICES = {"auto": "Automatic (from the subgroup size)",
                   "individuals": "Average moving range, length 2 (subgroup size 1)",
                   "pooled": "Pooled standard deviation (subgroups of 2 or more)"}
 METHOD_NAMES = {"grr": "Variable Gage R&R", "capability": "Process Capability (Cp/Cpk)"}
+PLAN_TITLES = {"grr": "Variable Gage R&R", "capability": "Process Capability"}
 ORDERS = {"worksheet": "Worksheet order", "filename": "File name order",
           "filetime": "File time order (when each log file was saved)", "timestamp": "Timestamp order (File assignments)",
           "confirmed": "Rows are in measurement order (I confirm)"}
@@ -166,6 +166,8 @@ class ValidationWorkspace(ttk.Frame):
         self.file_var = tk.StringVar(value="No file chosen.")
         self.preview_note_var = tk.StringVar()
         self.plan_var = tk.StringVar()
+        self.plan_title_var = tk.StringVar()
+        self.within_hint_var = tk.StringVar()
         self.stale_var = tk.StringVar()
         self.summary_var = tk.StringVar()
         self.notes_var = tk.StringVar()
@@ -284,19 +286,20 @@ class ValidationWorkspace(ttk.Frame):
     def _build_setup(self) -> None:
         tab = self.setup_tab
         ttk.Label(tab, text="Plan", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.plan_label = ttk.Label(tab, textvariable=self.plan_var, style="Surface.TLabel", wraplength=800, justify="left")
-        self.plan_label.grid(row=1, column=0, sticky="w", pady=(0, 10))
-        tab.bind("<Configure>", lambda e: self.plan_label.configure(wraplength=max(200, e.width - 40)))
-        ttk.Label(tab, text="Study purpose", style="Section.TLabel").grid(row=2, column=0, sticky="w")
-        ttk.Radiobutton(tab, text="MSA: Variable Gage R&R. Is the measurement system good enough?", variable=self.method_var,
-                        value="grr", style="Surface.TRadiobutton").grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Radiobutton(tab, text="Process Capability: Cp/Cpk, Pp/Ppk. Does the process meet the specification?",
-                        variable=self.method_var, value="capability", style="Surface.TRadiobutton").grid(row=4, column=0, sticky="w")
+        ttk.Label(tab, textvariable=self.plan_title_var, style="Surface.TLabel", font=("Segoe UI Semibold", 11)).grid(
+            row=1, column=0, sticky="w", pady=(2, 0))
+        self.plan_label = ttk.Label(tab, textvariable=self.plan_var, style="SurfaceHint.TLabel")  # e.g. 8 Test Items · 10 Samples
+        self.plan_label.grid(row=2, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(tab, text="Study purpose", style="Section.TLabel").grid(row=3, column=0, sticky="w")
+        ttk.Radiobutton(tab, text="MSA – Variable Gage R&R", variable=self.method_var,
+                        value="grr", style="Surface.TRadiobutton").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(tab, text="Process Capability – Cp/Cpk, Pp/Ppk",
+                        variable=self.method_var, value="capability", style="Surface.TRadiobutton").grid(row=5, column=0, sticky="w")
 
         self.grr_setup = ttk.Frame(tab, style="Surface.TFrame")
         self.cap_setup = ttk.Frame(tab, style="Surface.TFrame")
         for frame in (self.grr_setup, self.cap_setup):
-            frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+            frame.grid(row=6, column=0, sticky="ew", pady=(10, 0))
             frame.columnconfigure(1, weight=1)
 
         def hint(parent, text, row, column=1, **grid):
@@ -331,28 +334,26 @@ class ValidationWorkspace(ttk.Frame):
         ttk.Label(customer, text="optional: adds PASS / FAIL, never changes a figure", style="SurfaceHint.TLabel").pack(side="left")
 
         cap = self.cap_setup
-        ttk.Checkbutton(cap, text="Use the Sample ID as the subgroup", variable=self.subgroup_var,
-                        style="Surface.TCheckbutton").grid(row=0, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        hint(cap, "Only if the readings of one sample really are a rational subgroup of the process.", 1)
-        ttk.Checkbutton(cap, text="Judge against a limit (optional)", variable=self.judge_var, style="Surface.TCheckbutton").grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        index = ttk.Frame(cap, style="Surface.TFrame")
-        index.grid(row=4, column=1, sticky="w", pady=(2, 3))
-        self.index_widgets = [
-            ttk.Radiobutton(index, text="Cpk (within)", variable=self.index_var, value="cpk", style="Surface.TRadiobutton"),
-            ttk.Radiobutton(index, text="Ppk (overall)", variable=self.index_var, value="ppk", style="Surface.TRadiobutton"),
-            ttk.Entry(index, textvariable=self.threshold_var, width=7)]
-        self.index_widgets[0].pack(side="left")
-        self.index_widgets[1].pack(side="left", padx=10)
-        ttk.Label(index, text="must exceed", style="SurfaceHint.TLabel").pack(side="left", padx=(8, 4))
-        self.index_widgets[2].pack(side="left")
-        self.advanced_button = ttk.Button(cap, text="Advanced options ▸", command=self._toggle_advanced)
-        self.advanced_button.grid(row=5, column=0, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(cap, text="Group readings by Sample ID", variable=self.subgroup_var,
+                        style="Surface.TCheckbutton").grid(row=0, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(cap, text="Enable acceptance criteria", variable=self.judge_var,
+                        style="Surface.TCheckbutton").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.criteria_row = ttk.Frame(cap, style="Surface.TFrame")  # only while the criteria are enabled
+        self.criteria_row.grid(row=2, column=0, sticky="w", padx=(24, 0), pady=(2, 3))
+        ttk.Radiobutton(self.criteria_row, text="Cpk (Within)", variable=self.index_var, value="cpk",
+                        style="Surface.TRadiobutton").pack(side="left")
+        ttk.Radiobutton(self.criteria_row, text="Ppk (Overall)", variable=self.index_var, value="ppk",
+                        style="Surface.TRadiobutton").pack(side="left", padx=10)
+        ttk.Label(self.criteria_row, text="must exceed", style="SurfaceHint.TLabel").pack(side="left", padx=(8, 4))
+        ttk.Entry(self.criteria_row, textvariable=self.threshold_var, width=7).pack(side="left")
+        self.advanced_button = ttk.Button(cap, text="Advanced Settings ▸", command=self._toggle_advanced)
+        self.advanced_button.grid(row=3, column=0, sticky="w", pady=(12, 0))
         self.advanced = ttk.Frame(cap, style="Surface.TFrame")
-        self.advanced.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.advanced.grid(row=4, column=0, sticky="w", pady=(4, 0))
         ttk.Label(self.advanced, text="Within sigma", style="Surface.TLabel").pack(side="left", padx=(0, 12))
         ttk.Combobox(self.advanced, textvariable=self.within_var, values=list(WITHIN_CHOICES.values()), state="readonly",
                      width=48).pack(side="left")
+        ttk.Label(self.advanced, textvariable=self.within_hint_var, style="SurfaceHint.TLabel").pack(side="left", padx=10)
         self.advanced.grid_remove()
 
     def _build_results(self) -> None:
@@ -610,14 +611,13 @@ class ValidationWorkspace(ttk.Frame):
     def _toggle_advanced(self) -> None:
         if self.advanced.winfo_manager():
             self.advanced.grid_remove()
-            self.advanced_button.configure(text="Advanced options ▸")
+            self.advanced_button.configure(text="Advanced Settings ▸")
         else:
             self.advanced.grid()
-            self.advanced_button.configure(text="Advanced options ▾")
+            self.advanced_button.configure(text="Advanced Settings ▾")
 
     def _apply_judge_layout(self) -> None:
-        for widget in self.index_widgets:
-            widget.configure(state="normal" if self.judge_var.get() else "disabled")
+        (self.criteria_row.grid if self.judge_var.get() else self.criteria_row.grid_remove)()
 
     def _apply_source_layout(self) -> None:
         """What belongs to the chosen source: File assignments only for Data Mapping results that exist; the choice file for an import."""
@@ -951,26 +951,18 @@ class ValidationWorkspace(ttk.Frame):
                                         self.comments_var.get().strip())
 
     def _plan_text(self) -> str:
-        study = self.study
-        if study is None or self.dataset is None:
+        """The data of the study in one line: 8 Test Items · 10 Samples."""
+        if self.study is None or self.dataset is None:
             return ""
-        samples = len({o.sample_id for o in self.dataset.observations})
-        design = " ".join(describe_design(study.design, study.options.method))
-        settings, capability = study.evaluation, study.options.method == "capability"
-        if capability:
-            within = ("average moving range (length 2)" if study.options.within_method == "individuals" else "pooled standard deviation of subgroups")
-            if self._within_key() == "auto":
-                within += " (chosen from the subgroup size)"
-            design += f" Within sigma: {within}."
-        else:
-            design += f" Study variation: {study.options.study_factor:g} × SD."
-        if not self._judge_for(study.options.method):
-            judged = "No acceptance criteria: statistics only."
-        elif capability:
-            judged = f"{settings.decision_metric.capitalize()} must exceed {settings.cpk_threshold:g}."
-        else:
-            judged = f"Customer criteria: {settings.profile}."
-        return f"{METHOD_NAMES[study.options.method]}: {len(self.dataset.items)} test items, {samples} samples. {design} {judged}"
+        items, samples = len(self.dataset.items), len({o.sample_id for o in self.dataset.observations})
+        return f"{items} Test Item{'s' if items != 1 else ''} · {samples} Sample{'s' if samples != 1 else ''}"
+
+    def _within_text(self) -> str:
+        """Which within sigma is in use (it may be chosen from the subgroup size), shown with the advanced settings."""
+        if self.study is None or self.study.options.method != "capability":
+            return ""
+        used = "average moving range" if self.study.options.within_method == "individuals" else "pooled standard deviation"
+        return f"In use: {used}"
 
     # ------------------------------------------------------------------ running
     def run_analysis(self) -> None:
@@ -1069,6 +1061,8 @@ class ValidationWorkspace(ttk.Frame):
         if self.setup_error:
             self.message_var.set(self.setup_error)
         self.plan_var.set(self._plan_text())
+        self.plan_title_var.set(PLAN_TITLES[self.method_var.get()] if self.dataset is not None else "")
+        self.within_hint_var.set(self._within_text())
         if stale and not self.running:
             self.stale_var.set("The data or the study settings changed since these results were computed. They are shown for reference "
                                "only and cannot be reported. Update the results to continue.")
