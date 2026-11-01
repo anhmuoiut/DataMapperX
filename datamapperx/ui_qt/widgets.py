@@ -56,9 +56,9 @@ class Card(QFrame):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 14)
         outer.setSpacing(8)
-        self.title = QLabel(title)
+        self.title = QLabel(title, self)  # parented before it is shown: a parentless label shown here would open as a window
         self.title.setObjectName("cardTitle")
-        self.title.setVisible(bool(title))
+        self.title.setHidden(not title)
         outer.addWidget(self.title)
         self.body = QVBoxLayout()
         self.body.setSpacing(8)

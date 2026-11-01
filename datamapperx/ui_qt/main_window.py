@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 
 from .._version import __version__
 from ..config import APP_CREDIT, APP_TITLE, DEFAULT_OUTPUT_FILE
-from ..exporter import generate_excel, summarize_limits
+from ..exporter import summarize_limits
 from ..models import ScanResult
 from ..paths import resource_path
 from ..profiles import load_profiles
@@ -54,8 +54,6 @@ from ..workflow import (
     preview_table,
     selected_info,
 )
-from ..workspace_data import MappingSource
-from .analysis_page import AnalysisPage
 from .tasks import TaskRunner
 from .theme import apply_theme, resolve_mode
 from .widgets import ActionTable, Card, ChipRow, DataTable, StepBar, make_button, repolish
@@ -110,11 +108,9 @@ class MainWindow(QMainWindow):
         self.steps.clicked.connect(self._on_step_clicked)
         root.addWidget(self.steps)
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_select())
-        self.pages.addWidget(self._build_review())
-        self.analysis = AnalysisPage(self.palette_tokens, self.tasks)
-        self.analysis.message.connect(self.set_status)
-        self.pages.addWidget(self.analysis)
+        self.preview = self.limits_table = self.chips = self.export_button = self.analysis = None  # built with their pages
+        self._page_builders = (self._build_select, self._build_review, self._build_analysis)
+        self._ensure_page(SELECT)  # the other pages are built when first shown, or a moment after the window opens (warm_up)
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
         self._build_status_bar()
@@ -124,6 +120,23 @@ class MainWindow(QMainWindow):
         self._show_step(SELECT)
 
     # ================================================================== layout
+    def _ensure_page(self, step: int) -> None:
+        """Build the pages up to ``step`` that do not exist yet: the first paint pays only for the page it shows."""
+        while self.pages.count() <= step:
+            self.pages.addWidget(self._page_builders[self.pages.count()]())
+
+    def warm_up(self) -> None:
+        """Build the other pages while the user reads the first one, so that going there later is instant."""
+        QTimer.singleShot(0, lambda: self._ensure_page(REVIEW))
+        QTimer.singleShot(120, lambda: self._ensure_page(ANALYSIS))
+
+    def _build_analysis(self) -> QWidget:
+        from .analysis_page import AnalysisPage  # pulls in the statistics and the report modules
+
+        self.analysis = AnalysisPage(self.palette_tokens, self.tasks)
+        self.analysis.message.connect(self.set_status)
+        return self.analysis
+
     def _build_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
         titles = QVBoxLayout()
@@ -316,6 +329,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._cancel.set()
         self._remember_inputs()
+        self.tasks.close()  # no worker may deliver into a window that is going away
         super().closeEvent(event)
 
     def set_status(self, text: str) -> None:
@@ -339,7 +353,8 @@ class MainWindow(QMainWindow):
         self._busy = busy
         self.scan_button.setEnabled(not busy)
         self.cancel_button.setVisible(busy and cancellable)
-        self.export_button.setEnabled(not busy)
+        if self.export_button is not None:
+            self.export_button.setEnabled(not busy)
         self.review_button.setEnabled(not busy)
         self.progress.setVisible(busy)
         if busy:
@@ -353,8 +368,10 @@ class MainWindow(QMainWindow):
         self.settings.theme = "light" if self.palette_tokens.mode == "dark" else "dark"
         self.palette_tokens = apply_theme(self.app, resolve_mode(self.settings.theme))
         for table in (self.available, self.selected_table, self.preview, self.limits_table):
-            table.set_palette(self.palette_tokens)
-        self.analysis.set_palette(self.palette_tokens)
+            if table is not None:
+                table.set_palette(self.palette_tokens)
+        if self.analysis is not None:
+            self.analysis.set_palette(self.palette_tokens)
         self._update_theme_button()
         save_settings(self.settings)
 
@@ -369,6 +386,7 @@ class MainWindow(QMainWindow):
     def _show_step(self, step: int) -> None:
         if step != SELECT and not self._review_ready():
             step = SELECT
+        self._ensure_page(step)
         self.pages.setCurrentIndex(step)
         if step == REVIEW:
             self._refresh_review()
@@ -382,7 +400,9 @@ class MainWindow(QMainWindow):
         else:
             self._show_step(REVIEW)
 
-    def _mapping_source(self) -> MappingSource | None:
+    def _mapping_source(self):
+        from ..workspace_data import MappingSource
+
         result = self.scan_result
         if result is None or not result.grouped or not self.selected:
             return None
@@ -618,6 +638,8 @@ class MainWindow(QMainWindow):
         path, grouped, components = Path(output), dict(result.grouped), list(self.selected)
         self._set_busy(True)
         self.set_status("Creating the Excel file…")
+        from ..exporter import generate_excel
+
         self.tasks.run(
             lambda _report: generate_excel(grouped, components, path, repeats),
             on_success=lambda _result: self._on_export_done(path),
@@ -640,4 +662,5 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName(APP_TITLE)
     window = MainWindow(app)
     window.show()
+    window.warm_up()
     return app.exec()

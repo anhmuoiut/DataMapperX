@@ -2771,7 +2771,7 @@ def test_every_new_study_starts_as_statistics_only_even_if_an_older_version_save
     pump(app, lambda: ws.dataset is not None and not ws.busy)
     assert ws.profile_var.get() == NO_CRITERIA and not ws.judge_var.get()  # the next study starts again without criteria
     run_validation(app, ws)
-    assert all(r.status == "N/A" for r in ws.results) and "Not evaluated" in ws.summary_var.get()
+    assert all(r.status == "N/A" for r in ws.results) and "Acceptance off" in ws.summary_var.get()
 
 
 def test_the_within_sigma_method_is_an_advanced_option(app, tmp_path):
@@ -2829,7 +2829,7 @@ def test_a_single_tester_study_needs_no_operators_and_the_worksheet_says_how_it_
     run_validation(app, ws)
     assert ws.results[0].valid and not ws.results[0].details.get("crossed") and ws.plan_title_var.get() == "Variable Gage R&R"
     assert not any(c.code == "one_appraiser" for c in ws.evaluated.record.validation.conditions)
-    assert "Operators:" not in ws.checks_view.text.get("1.0", "end")
+    assert not any(check.startswith("Operators") for _section, check, *_rest in check_rows(ws))
 
 
 def test_the_study_variation_factor_scales_study_var_and_tolerance_only(app, tmp_path):
@@ -2895,7 +2895,7 @@ def test_file_time_order_sorts_by_when_each_log_was_saved_and_is_taken_as_the_or
     ws.order_var.set(ORDERS["filetime"])
     pump(app, lambda: ws.dataset is not None and not ws.busy and ws.dataset.order_basis == "acquisition")
     assert "the time each log file was saved" in ws.dataset.description
-    first_files = [ws.preview.item(item, "values")[-1] for item in ws.preview.get_children()][:2]
+    first_files = [ws.preview.set(item, "source") for item in ws.preview.get_children()][:2]
     assert first_files[0].endswith("P10_Ann_9.log") and first_files[1].endswith("P10_Ann_8.log")  # the last name was saved first
     run_validation(app, ws)
     shown = " ".join(" ".join(row) for row in check_rows(ws))
@@ -2966,7 +2966,7 @@ def test_the_data_tab_has_a_compact_summary_seven_columns_a_test_item_filter_and
     assert shown == ("test_item", "sample", "trial", "value", "lsl", "usl", "unit")
     assert [ws.preview.heading(c)["text"] for c in shown] == ["Test Item", "Sample ID", "Trial", "Value", "LSL", "USL", "Unit"]
     first = ws.preview.get_children()[0]
-    assert ws.preview.item(first, "values")[-1] and "ingerprint" not in ws.dataset_var.get() + ws.hint_var.get() + ws.preview_note_var.get()
+    assert ws.preview.set(first, "source") and "ingerprint" not in ws.dataset_var.get() + ws.hint_var.get() + ws.preview_note_var.get()
     assert ws.hint_var.get() == "" and showing(app, ws.hint_label, False)  # nothing to fix, nothing said
     assert "inferred" in ws.preview.item(first, "tags") and "not the order of measurement" in ws.preview_note_var.get()
     ws.assign_var.set(False)  # without the labelling the readings have no Trial at all: that is a problem to fix
