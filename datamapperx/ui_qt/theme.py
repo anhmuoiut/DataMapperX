@@ -12,6 +12,10 @@ from PySide6.QtWidgets import QApplication
 
 from ..palette import DARK, LIGHT, Palette
 
+# A glyph that the interface font lacks (a check mark, a warning sign, a sun) sends Windows looking through every font for it, once,
+# and that search takes about half a second. Widgets that show such glyphs name the font that has them, and the search never happens.
+SYMBOL_FONT = "Segoe UI Symbol"
+
 
 def resolve_mode(setting: str) -> str:
     """``"light"`` or ``"dark"``; ``"system"`` follows the operating system (Qt 6.5+ reports it on Windows and macOS)."""
@@ -45,8 +49,17 @@ QLabel {{ background: transparent; }}
 QLabel#appTitle {{ font-size: 18pt; font-weight: 600; }}
 QLabel#cardTitle {{ font-size: 11pt; font-weight: 600; }}
 QLabel[role="muted"] {{ color: {p.muted}; }}
+QLabel[role="title"] {{ font-size: 14pt; font-weight: 600; }}
+QLabel[role="heading"] {{ font-size: 11pt; font-weight: 600; }}
+QLabel[role="ok"] {{ color: {p.ok}; }}
+QLabel[role="warn"] {{ color: {p.warn}; }}
+QLabel[role="bad"] {{ color: {p.danger}; }}
+QLabel[role="pick"] {{ background: {p.pick}; border-radius: 6px; padding: 6px 10px; }}
+QFrame#banner {{ background: {p.banner_bg}; border: 1px solid {p.line}; border-radius: 8px; }}
+QFrame#banner QLabel {{ color: {p.banner_fg}; }}
 QLabel[role="metric"] {{ font-size: 16pt; font-weight: 600; }}
-QLabel[chip] {{ border: 1px solid transparent; border-radius: 10px; padding: 2px 10px; }}
+QLabel[chip] {{ border: 1px solid transparent; border-radius: 10px; padding: 2px 10px; font-family: "{SYMBOL_FONT}"; }}
+QPushButton[glyphs="true"] {{ font-family: "{SYMBOL_FONT}"; }}
 QLabel[chip="ok"] {{ background: {p.ok_bg}; border-color: {p.ok_line}; color: {p.ok}; }}
 QLabel[chip="warn"] {{ background: {p.warn_bg}; border-color: {p.warn_line}; color: {p.warn}; }}
 QLabel[chip="bad"] {{ background: {p.bad_bg}; border-color: {p.bad_line}; color: {p.danger}; }}

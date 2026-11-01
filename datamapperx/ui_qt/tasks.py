@@ -35,6 +35,33 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 logger = logging.getLogger(__name__)
 
 FAST_SWITCH = 0.0005  # seconds; the default is 0.005
+PAUSE_GC = True  # the second layer of defence (see above); tools/qt_gc_stress.py switches it off to test the first alone
+
+
+class _Busy:
+    """What is changed while any task of any runner runs, counted across runners so that two of them cannot undo each other."""
+
+    users = 0
+    interval = 0.005
+    gc_was_enabled = False
+
+    @classmethod
+    def enter(cls, pause_gc: bool) -> None:
+        if cls.users == 0:
+            cls.interval = sys.getswitchinterval()
+            sys.setswitchinterval(FAST_SWITCH)
+            cls.gc_was_enabled = gc.isenabled()
+        cls.users += 1
+        if pause_gc:
+            gc.disable()
+
+    @classmethod
+    def leave(cls) -> None:
+        cls.users = max(0, cls.users - 1)
+        if cls.users == 0:
+            sys.setswitchinterval(cls.interval)
+            if cls.gc_was_enabled:
+                gc.enable()
 
 
 class _Signals(QObject):
@@ -64,7 +91,7 @@ class _Job(QRunnable):
 
 
 class TaskRunner(QObject):
-    def __init__(self, parent: QObject | None = None, *, pause_gc: bool = True) -> None:
+    def __init__(self, parent: QObject | None = None, *, pause_gc: bool | None = None) -> None:
         super().__init__(parent)
         self._signals = _Signals(self)  # lives on the UI thread, so the connected slots below run there
         self._signals.progress.connect(self._deliver_progress)
@@ -73,8 +100,7 @@ class TaskRunner(QObject):
         self._ids = itertools.count(1)
         self._callbacks: dict[int, tuple[Callable, Callable, Callable | None]] = {}
         self._pool = QThreadPool(self)
-        self._saved_interval: float | None = None
-        self._pause_gc, self._gc_was_enabled = pause_gc, False
+        self._pause_gc = pause_gc
         self._closed = False
 
     def run(self, work: Callable[[Callable[..., None]], Any], *, on_success: Callable[[Any], None],
@@ -82,12 +108,7 @@ class TaskRunner(QObject):
         if self._closed:
             return
         job_id = next(self._ids)
-        if not self._callbacks:
-            self._saved_interval = sys.getswitchinterval()
-            sys.setswitchinterval(FAST_SWITCH)
-            if self._pause_gc:
-                self._gc_was_enabled = gc.isenabled()
-                gc.disable()
+        _Busy.enter(PAUSE_GC if self._pause_gc is None else self._pause_gc)
         self._callbacks[job_id] = (on_success, on_error, on_progress)
         self._pool.start(_Job(job_id, work, self._signals))
 
@@ -98,11 +119,11 @@ class TaskRunner(QObject):
     def close(self, timeout_ms: int = 5000) -> bool:
         """Stop delivering, forget the tasks still running and wait for the pool. True when every worker has finished."""
         self._closed = True
+        for _ in range(len(self._callbacks)):
+            _Busy.leave()
         self._callbacks.clear()
         self._pool.clear()  # queued jobs that have not started
-        finished = self._pool.waitForDone(timeout_ms)
-        self._settle()
-        return finished
+        return self._pool.waitForDone(timeout_ms)
 
     def _deliver_progress(self, job_id: int, args: tuple) -> None:
         callbacks = self._callbacks.get(job_id)
@@ -115,7 +136,8 @@ class TaskRunner(QObject):
             if callbacks:
                 callbacks[0](result)
         finally:
-            self._settle()
+            if callbacks:
+                _Busy.leave()
 
     def _deliver_failed(self, job_id: int, exc: BaseException) -> None:
         callbacks = self._callbacks.pop(job_id, None)
@@ -124,15 +146,5 @@ class TaskRunner(QObject):
                 logger.error("Background task failed: %s", exc, exc_info=exc)
                 callbacks[1](exc)
         finally:
-            self._settle()
-
-    def _settle(self) -> None:
-        """When the last task is over, give back the GIL interval and the collector."""
-        if self._callbacks:
-            return
-        if self._saved_interval is not None:
-            sys.setswitchinterval(self._saved_interval)
-            self._saved_interval = None
-        if self._pause_gc and self._gc_was_enabled:
-            gc.enable()
-            self._gc_was_enabled = False
+            if callbacks:
+                _Busy.leave()

@@ -3,27 +3,42 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPointF, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QKeyEvent, QPainter, QPen
+from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetricsF,
+    QKeyEvent,
+    QPainter,
+    QPen,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QPushButton,
+    QSizePolicy,
     QStyle,
     QStyledItemDelegate,
     QTableView,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from ..palette import Palette
-from ..stat_charts import ChartSpec, chart_primitives
+from ..stat_charts import MIN_CELL_WIDTH, ChartSpec, agreement_extra_height, chart_primitives
 from .models import TableModel
+from .theme import SYMBOL_FONT
 
 ROW_HEIGHT = 28
 CHART_SCALE = 1.33  # the chart layout is in "report points", as in the PDF; this makes them legible on screen
@@ -66,52 +81,256 @@ class Card(QFrame):
 
 
 class StepBar(QWidget):
-    """The steps along the top. A finished step can be clicked to go back; a step that is not ready is greyed out."""
+    """Numbered steps side by side, painted in one go. A step is ``current`` (filled), ``complete`` (green), ``ready``
+    (outlined), ``warn`` (outlined in amber) or ``locked`` (grey; a click on it does nothing)."""
 
     clicked = Signal(int)
 
-    def __init__(self, titles: Sequence[str], parent: QWidget | None = None) -> None:
+    def __init__(self, titles: Sequence[str], palette: Palette, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self._buttons: list[QPushButton] = []
-        for index, title in enumerate(titles):
-            button = QPushButton(f"{index + 1}  {title}".replace("&", "&&"))
-            button.setProperty("step", "todo")
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setFlat(True)
-            button.clicked.connect(lambda _checked=False, i=index: self.clicked.emit(i))
-            layout.addWidget(button)
-            self._buttons.append(button)
-        layout.addStretch(1)
+        self._titles = [str(t) for t in titles]
+        self._state = ["ready"] * len(self._titles)
+        self._caption = [""] * len(self._titles)
+        self._palette = palette
+        self._focus = 0
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(54)
 
-    def set_state(self, current: int, ready: Sequence[bool]) -> None:
-        for index, button in enumerate(self._buttons):
-            button.setEnabled(index <= current or bool(ready[index]))
-            button.setProperty("step", "current" if index == current else "done" if index < current else "todo")
-            repolish(button)
+    def set_step(self, index: int, state: str, caption: str) -> None:
+        if (state, caption) != (self._state[index], self._caption[index]):
+            self._state[index], self._caption[index] = state, caption
+            self.update()
+
+    def state(self, index: int) -> str:
+        return self._state[index]
+
+    def caption(self, index: int) -> str:
+        return self._caption[index]
+
+    def set_palette(self, palette: Palette) -> None:
+        self._palette = palette
+        self.update()
+
+    def click(self, index: int) -> None:
+        if self._state[index] != "locked":
+            self.clicked.emit(index)
+
+    def _cells(self) -> list[QRectF]:
+        gap, count = 26.0, len(self._titles)
+        width = (self.width() - 2 - gap * (count - 1)) / max(count, 1)
+        return [QRectF(1 + i * (width + gap), 1, width, self.height() - 2) for i in range(count)]
+
+    def _colors(self, state: str) -> dict[str, str]:
+        p = self._palette
+        return {
+            "current": {"bg": p.accent, "line": p.accent, "ink": p.on_accent, "badge": p.on_accent, "badge_text": p.accent},
+            "complete": {"bg": p.ok_bg, "line": p.ok_line, "ink": p.ok, "badge": p.ok, "badge_text": p.surface},
+            "ready": {"bg": p.surface, "line": p.accent, "ink": p.accent, "badge": p.surface, "badge_text": p.accent},
+            "warn": {"bg": p.surface, "line": p.warn_line, "ink": p.warn, "badge": p.surface, "badge_text": p.warn},
+            "locked": {"bg": p.soft, "line": p.line, "ink": p.muted, "badge": p.soft, "badge_text": p.muted},
+        }[state]
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        title_font, caption_font = QFont(self.font()), QFont(self.font())
+        symbol_font = QFont(title_font)
+        symbol_font.setFamily(SYMBOL_FONT)  # the check mark is not in the interface font: name the font that has it
+        title_font.setBold(True)
+        title_font.setPointSizeF(self.font().pointSizeF() + 1)
+        caption_font.setPointSizeF(max(7.0, self.font().pointSizeF() - 0.5))
+        for index, cell in enumerate(self._cells()):
+            c = self._colors(self._state[index])
+            painter.setBrush(QColor(c["bg"]))
+            focused = self.hasFocus() and index == self._focus
+            painter.setPen(QPen(QColor(self._palette.fg if focused else c["line"]), 1.4))
+            painter.drawRoundedRect(cell.adjusted(0.5, 0.5, -0.5, -0.5), 7, 7)
+            size = 28.0
+            badge = QRectF(cell.left() + 12, cell.center().y() - size / 2, size, size)
+            painter.setBrush(QColor(c["badge"]))
+            painter.setPen(QPen(QColor(c["badge_text"] if self._state[index] == "current" else c["ink"]), 2))
+            painter.drawEllipse(badge.adjusted(1, 1, -1, -1))
+            painter.setPen(QColor(c["badge_text"]))
+            painter.setFont(symbol_font if self._state[index] == "complete" else title_font)
+            painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), "✓" if self._state[index] == "complete" else str(index + 1))
+            left, room = badge.right() + 10, cell.right() - badge.right() - 20
+            painter.setPen(QColor(c["ink"]))
+            painter.setFont(title_font)
+            painter.drawText(QRectF(left, cell.top() + 7, room, 20), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             painter.fontMetrics().elidedText(self._titles[index], Qt.TextElideMode.ElideRight, int(room)))
+            painter.setFont(caption_font)
+            painter.drawText(QRectF(left, cell.top() + 27, room, 18), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             painter.fontMetrics().elidedText(self._caption[index], Qt.TextElideMode.ElideRight, int(room)))
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        for index, cell in enumerate(self._cells()):
+            if cell.contains(event.position()):
+                self._focus = index
+                self.click(index)
+                return
+
+    def mouseMoveEvent(self, event) -> None:
+        hot = any(cell.contains(event.position()) and self._state[i] != "locked" for i, cell in enumerate(self._cells()))
+        self.setCursor(Qt.CursorShape.PointingHandCursor if hot else Qt.CursorShape.ArrowCursor)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = event.key()
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            self._focus = max(0, min(len(self._titles) - 1, self._focus + (1 if key == Qt.Key.Key_Right else -1)))
+            self.update()
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.click(self._focus)
+        else:
+            super().keyPressEvent(event)
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self.update()
+
+
+class FlowLayout(QLayout):
+    """Items left to right, wrapping to the next line when the width is used up (so chips never run off the window)."""
+
+    def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._space = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def _arrange(self, rect: QRect, *, apply: bool) -> int:
+        x, y, line = rect.x(), rect.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > rect.right() + 1 and line > 0:
+                x, y, line = rect.x(), y + line + self._space, 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._space
+            line = max(line, hint.height())
+        return y + line - rect.y()
 
 
 class ChipRow(QWidget):
-    """A row of small coloured notes: (kind, text) with kind ``ok``, ``warn``, ``bad`` or ``info``."""
+    """A row of small coloured notes: (kind, text) with kind ``ok``, ``warn``, ``bad`` or ``info``. It wraps when narrow and is
+    only rebuilt when the chips change."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(6)
-        self._layout.addStretch(1)
+        self._flow = FlowLayout(self)
+        self._chips: list[tuple[str, str]] = []
+        sizing = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        sizing.setHeightForWidth(True)
+        self.setSizePolicy(sizing)
+
+    def chips(self) -> list[tuple[str, str]]:
+        return list(self._chips)
 
     def set_chips(self, chips: Sequence[tuple[str, str]]) -> None:
-        while self._layout.count() > 1:
-            item = self._layout.takeAt(0)
+        chips = [(kind, text) for kind, text in chips]
+        if chips == self._chips:
+            return
+        self._chips = chips
+        while self._flow.count():
+            item = self._flow.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for position, (kind, text) in enumerate(chips):
-            label = QLabel(text)
+        for kind, text in chips:
+            label = QLabel(text, self)
             label.setProperty("chip", kind)
-            self._layout.insertWidget(position, label)
+            self._flow.addWidget(label)
+        self.updateGeometry()
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._flow.heightForWidth(width)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 26)
+
+
+class ReadOnlyText(QTextBrowser):
+    """Selectable, scrollable, read-only text for reports and release notes (plain, or the small Markdown of release notes)."""
+
+    def __init__(self, parent: QWidget | None = None, *, monospace: bool = False) -> None:
+        super().__init__(parent)
+        self.setOpenExternalLinks(False)
+        if monospace:
+            font = QFont("Consolas")
+            font.setStyleHint(QFont.StyleHint.Monospace)
+            font.setPointSizeF(self.font().pointSizeF())
+            self.setFont(font)
+            self.setLineWrapMode(QTextBrowser.LineWrapMode.NoWrap)
+
+    def set_text(self, content: str) -> None:
+        self.setPlainText(content)
+
+    def set_markdown(self, content: str) -> None:
+        """The small Markdown subset of release notes: headings, bullets, and plain lines (bold and code are shown plain)."""
+        self.clear()
+        cursor = self.textCursor()
+        for number, line in enumerate(content.splitlines()):
+            stripped = line.strip()
+            plain = re.sub(r"`([^`]*)`", r"\1", re.sub(r"\*\*(.+?)\*\*", r"\1", stripped))
+            block, char = QTextBlockFormat(), QTextCharFormat()
+            if number:
+                cursor.insertBlock()
+            if stripped.startswith("#"):
+                char.setFontWeight(QFont.Weight.DemiBold)
+                char.setFontPointSize(self.font().pointSizeF() + 1)
+                block.setTopMargin(8)
+                block.setBottomMargin(2)
+                text = plain.lstrip("#").strip()
+            elif stripped.startswith(("- ", "* ")):
+                block.setLeftMargin(28)
+                block.setTextIndent(-16)
+                text = "•  " + plain[2:]
+            else:
+                text = plain
+            cursor.setBlockFormat(block)
+            cursor.setCharFormat(char)
+            cursor.insertText(text)
+        self.moveCursor(QTextCursor.MoveOperation.Start)
 
 
 # ----------------------------------------------------------------------------- tables
@@ -145,6 +364,9 @@ class DataTable(QTableView):
     """A read-only table of text that stays fast however many rows it has: only the visible rows are asked for."""
 
     rowSelected = Signal(int)
+    activated = Signal(int)  # double-click or Enter on a row
+    cellPressed = Signal(int, int, int)  # row, column and the x of the pointer inside the cell, for text with a part to click
+    cellHover = Signal(int, int, int)
 
     def __init__(self, palette: Palette, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -159,6 +381,49 @@ class DataTable(QTableView):
         self._natural: list[int] = []
         self._stretch: int | None = None
         self.selectionModel().currentRowChanged.connect(lambda current, _previous: self.rowSelected.emit(current.row()))
+        self.doubleClicked.connect(lambda index: self.activated.emit(index.row()))
+        self.setMouseTracking(True)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.currentIndex().isValid():
+            self.activated.emit(self.currentIndex().row())
+        else:
+            super().keyPressEvent(event)
+
+    def _cell_at(self, event) -> tuple[int, int, int]:
+        index = self.indexAt(event.position().toPoint())
+        if not index.isValid():
+            return -1, -1, 0
+        return index.row(), index.column(), event.position().toPoint().x() - self.visualRect(index).left()
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        self.cellPressed.emit(*self._cell_at(event))
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        self.cellHover.emit(*self._cell_at(event))
+
+    def reset_view(self) -> None:
+        self.scrollToTop()
+        self.horizontalScrollBar().setValue(0)
+
+    # what is on show, for the window's own checks and for tests
+    def rows(self) -> list[tuple[str, ...]]:
+        return list(self.table_model.rows)
+
+    def headings(self) -> list[str]:
+        return self.table_model.headings
+
+    def tags(self) -> list[str]:
+        return self.table_model.tags
+
+    def cell_tags(self) -> dict[tuple[int, int], str]:
+        return self.table_model.cell_tags
+
+    def selected_index(self) -> int | None:
+        rows = self.selectionModel().selectedRows()
+        return rows[0].row() if rows else None
 
     def set_table(self, headings: Sequence[str], rows: Sequence[Sequence[object]], tags: Sequence[str] | None = None,
                   aligns: Sequence[str] | None = None, empty_text: str = "", stretch: int | None = None,
@@ -318,6 +583,13 @@ class ActionTable(QTableView):
         name = 1 if self._numbered else 0
         return [row[name] for row in self.table_model.rows]
 
+    def selected_items(self) -> list[str]:
+        items = self.items()
+        return [items[row] for row in self.selected_rows() if row < len(items)]
+
+    def reset_view(self) -> None:
+        self.scrollToTop()
+
     def selected_rows(self) -> list[int]:
         return sorted(index.row() for index in self.selectionModel().selectedRows())
 
@@ -360,43 +632,90 @@ class ActionTable(QTableView):
 class ChartPanel(QWidget):
     """Every chart of an item in a grid, painted from the same primitives the PDF and Excel reports use.
 
-    The primitives are laid out for a drawing measured in report points (the layout reserves room for text of those
-    sizes), so they are drawn at that scale and the painter enlarges the result. Fonts of any width then fit.
+    The charts are laid out in "report points" (their text is sized in points), so they are drawn at that scale and the painter
+    enlarges the result. The grid follows the width: charts side by side only while each gets ``MIN_CELL_WIDTH``, and an
+    agreement panel with many appraisers grows taller instead of squeezing its plot away. ``x_scale`` is the horizontal scale of
+    a capability histogram (``"auto"`` or ``"full"``). When an analysed item has no panel, ``note`` says which one it would need.
     """
 
     CELL_HEIGHT = 300
+    MIN_HEIGHT = 210
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._specs: list[ChartSpec] = []
-        self._cache: dict[tuple[int, int, int], list] = {}
+        self._cache: dict[tuple, list] = {}
+        self._x_scale: str | None = None
+        self._note = ""
+        self._muted = "#526174"
+        self._row_heights: list[float] = []
+        self._columns_used = 1
 
-    def set_specs(self, specs: Sequence[ChartSpec]) -> None:
-        self._specs = list(specs)
+    def set_specs(self, specs: Sequence[ChartSpec], x_scale: str | None = None, note: str = "", muted: str | None = None) -> None:
+        self._specs, self._x_scale, self._note = list(specs), x_scale, note
+        if muted:
+            self._muted = muted
         self._cache.clear()
-        rows = math.ceil(len(self._specs) / self._columns()) if self._specs else 1
-        self.setMinimumHeight(rows * self.CELL_HEIGHT)
+        self._relayout()
         self.update()
 
-    def _columns(self) -> int:
-        return 1 if len(self._specs) <= 1 else 2
+    def specs(self) -> list[ChartSpec]:
+        return list(self._specs)
 
-    def _primitives(self, index: int, width: int, height: int):
-        key = (index, width, height)
+    def _columns(self) -> int:
+        wanted = 1 if len(self._specs) <= 1 else 2
+        return max(1, min(wanted, int(self.width() // MIN_CELL_WIDTH) or 1, len(self._specs) or 1))
+
+    def _layout(self) -> tuple[int, float, list[float]]:
+        """(columns, width of a cell, height of each row of cells), in report points."""
+        columns = self._columns()
+        cell_w = max(240.0, self.width() / CHART_SCALE / columns)
+        rows = math.ceil(len(self._specs) / columns) if self._specs else 0
+        base = max(self.MIN_HEIGHT / CHART_SCALE, self.CELL_HEIGHT / CHART_SCALE)
+        heights = []
+        for row in range(rows):
+            extra = max((agreement_extra_height(spec, cell_w - 8, base - 6) for spec in self._specs[row * columns:(row + 1) * columns]),
+                        default=0.0)
+            heights.append(base + extra)
+        return columns, cell_w, heights
+
+    def _relayout(self) -> None:
+        columns, _cell_w, heights = self._layout()
+        self._columns_used, self._row_heights = columns, heights
+        needed = int(sum(heights) * CHART_SCALE) if heights else (90 if self._note else 0)
+        self.setMinimumHeight(needed)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        previous = (self._columns_used, tuple(self._row_heights))
+        self._relayout()
+        if (self._columns_used, tuple(self._row_heights)) != previous:
+            self._cache.clear()
+
+    def _primitives(self, index: int, width: float, height: float):
+        key = (index, round(width), round(height), self._x_scale)
         if key not in self._cache:
-            self._cache[key] = chart_primitives(self._specs[index], width, height)
+            self._cache[key] = chart_primitives(self._specs[index], width, height, self._x_scale, True, 1.0)
         return self._cache[key]
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("white"))  # charts are drawn for print, so they stay on white in dark mode
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._note and not self._specs:
+            painter.setPen(QColor(self._muted))
+            painter.drawText(self.rect().adjusted(16, 16, -16, -16), int(Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap), self._note)
+            painter.end()
+            return
         painter.scale(CHART_SCALE, CHART_SCALE)
-        columns = self._columns()
-        cell_w, cell_h = max(240, int(self.width() / CHART_SCALE / columns)), int(self.CELL_HEIGHT / CHART_SCALE)
-        for index in range(len(self._specs)):
-            x, y = (index % columns) * cell_w + 3, (index // columns) * cell_h
-            paint_primitives(painter, self._primitives(index, cell_w - 6, cell_h - 4), x, y, self.font())
+        columns, cell_w, heights = self._layout()
+        top = 0.0
+        for row, height in enumerate(heights):
+            for column in range(columns):
+                index = row * columns + column
+                if index < len(self._specs):
+                    paint_primitives(painter, self._primitives(index, cell_w - 8, height - 6), column * cell_w + 4, top, self.font())
+            top += height
         painter.end()
 
 
@@ -440,4 +759,5 @@ def _paint_text(painter: QPainter, x: float, y: float, style: dict, colour: QCol
     painter.restore()
 
 
-__all__ = ["ActionTable", "Card", "ChartPanel", "ChipRow", "DataTable", "StepBar", "make_button", "paint_primitives", "repolish"]
+__all__ = ["ActionTable", "Card", "ChartPanel", "ChipRow", "DataTable", "FlowLayout", "ReadOnlyText", "StepBar", "make_button",
+           "paint_primitives", "repolish"]

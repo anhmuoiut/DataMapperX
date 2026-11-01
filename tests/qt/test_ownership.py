@@ -11,26 +11,17 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-pytest.importorskip("PySide6")
-
-from PySide6.QtWidgets import QApplication
-
 from datamapperx.settings import Settings
-from datamapperx.ui_qt.main_window import ANALYSIS, REVIEW, MainWindow
+from datamapperx.ui_qt.main_window import MainWindow
 
-from .conftest import ict_block, write_ict_log
+from ..conftest import ict_block, write_ict_log
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
-@pytest.fixture(scope="module")
-def app():
-    return QApplication.instance() or QApplication([])
+ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 @pytest.fixture
@@ -47,19 +38,21 @@ def logs(tmp_path):
 
 def test_every_widget_the_window_creates_has_a_parent(app, logs):
     before = set(app.allWidgets())
-    window = MainWindow(app, settings=Settings(theme="light", last_folder=str(logs), expected_samples="4", repeats="3"))
+    window = MainWindow(app, settings=Settings(theme="light", last_folder=str(logs), expected_samples="4", repeats="3"),
+                        background_checks=False)
     window.profile_box.setCurrentText("ICT_I3070 Test Log")
     window.show()
     window.scan_logs()
-    import time
-
     end = time.time() + 15
-    while (window._busy or window.scan_result is None) and time.time() < end:
+    while (window.is_busy or window.scan_result is None) and time.time() < end:
         app.processEvents()
         time.sleep(0.002)
     window._add(["Alpha", "Beta"])
-    for step in (REVIEW, ANALYSIS):
-        window._show_step(step)
+    window._show_step("review")
+    window._show_workspace("validation")
+    window.manage_profiles()
+    window._show_about()
+    window._show_shortcuts()
     app.processEvents()
     orphans = [w for w in set(app.allWidgets()) - before if w.parent() is None and w is not window]
     assert not orphans, f"widgets without a parent: {orphans}"

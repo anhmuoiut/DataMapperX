@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 
 from ..palette import Palette
 
@@ -22,14 +22,25 @@ ALIGN = {"w": int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
 
 
 def tints(p: Palette) -> dict[str, QColor]:
-    bad, warn, ok = QColor(p.bad_bg), QColor(p.warn_bg), QColor(p.ok_bg)
-    return {"invalid": bad, "out": bad, "fail": bad, "missing": warn, "gap": warn, "caution": warn, "pass": ok}
+    bad, warn, ok, soft = QColor(p.bad_bg), QColor(p.warn_bg), QColor(p.ok_bg), QColor(p.soft)
+    return {"invalid": bad, "out": bad, "fail": bad, "missing": warn, "gap": warn, "caution": warn, "pass": ok,
+            "section": soft, "head": soft}
+
+
+def inks(p: Palette) -> dict[str, QColor]:
+    """The text colour of a row by its tag: a result is written in the colour of its verdict, a trial that was counted for the
+    person, and a column heading inside a table, quietly."""
+    return {"PASS": QColor(p.ok), "CONDITIONAL PASS": QColor(p.warn), "FAIL": QColor(p.danger), "N/A": QColor(p.muted),
+            "inferred": QColor(p.muted), "head": QColor(p.muted)}
 
 
 class TableModel(QAbstractTableModel):
     def __init__(self, palette: Palette, parent=None) -> None:
         super().__init__(parent)
         self._tints = tints(palette)
+        self._inks = inks(palette)
+        self._bold = QFont()
+        self._bold.setBold(True)
         self._headings: tuple[str, ...] = ()
         self._rows: list[tuple[str, ...]] = []
         self._tags: Sequence[str] = ()
@@ -53,6 +64,10 @@ class TableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole:
             tag = self._cell_tags.get((index.row(), index.column())) or (self._tags[index.row()] if self._tags else "")
             return self._tints.get(tag)
+        if role == Qt.ItemDataRole.ForegroundRole and self._tags:
+            return self._inks.get(self._tags[index.row()])
+        if role == Qt.ItemDataRole.FontRole and self._tags and self._tags[index.row()] in ("section", "head"):
+            return self._bold
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
@@ -74,10 +89,10 @@ class TableModel(QAbstractTableModel):
         self.endResetModel()
 
     def set_palette(self, palette: Palette) -> None:
-        self._tints = tints(palette)
+        self._tints, self._inks = tints(palette), inks(palette)
         if self._rows:
             self.dataChanged.emit(self.index(0, 0), self.index(len(self._rows) - 1, len(self._headings) - 1),
-                                  [Qt.ItemDataRole.BackgroundRole])
+                                  [Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole])
 
     def row_text(self, row: int) -> tuple[str, ...]:
         return self._rows[row]
@@ -89,3 +104,11 @@ class TableModel(QAbstractTableModel):
     @property
     def tags(self) -> list[str]:
         return list(self._tags)
+
+    @property
+    def cell_tags(self) -> dict[tuple[int, int], str]:
+        return dict(self._cell_tags)
+
+    @property
+    def headings(self) -> list[str]:
+        return list(self._headings)
