@@ -27,4 +27,11 @@ jobs:
         run: python -m ruff check .
 
       - name: Tests
-        run: python -m pytest
+        run: |
+          python -m pytest --tb=short -rfE 2>&1 | Tee-Object -FilePath pytest-output.txt
+          exit $LASTEXITCODE
+
+      # GitHub shows a job's log only to people who are signed in; an annotation is on the commit's checks page for everyone.
+      - name: Say which tests failed
+        if: failure()
+        run: python tools/ci_annotate.py pytest-output.txt
