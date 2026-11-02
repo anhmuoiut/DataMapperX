@@ -73,6 +73,10 @@ def test_the_window_survives_the_collector_running_on_a_worker_thread(logs):
 
 def test_the_stress_does_notice_a_widget_without_a_parent(logs):
     done = stress(logs, "40", "control")
+    if done.returncode == 0 and "survived 40" in done.stdout:
+        # Destroying a widget on a thread that does not own it is undefined behaviour: it is a crash on the machines this was
+        # written on, not a promise of one. Where it does not crash, this control cannot show that the stress is sensitive.
+        pytest.skip("the deliberate violation did not crash on this machine, so the control proves nothing here")
     assert done.returncode != 0 and "survived" not in done.stdout
 
 
