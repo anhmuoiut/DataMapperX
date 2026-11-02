@@ -69,7 +69,7 @@ from .dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDia
 from .duplicate_dialog import DuplicateDialog
 from .tasks import TaskRunner
 from .theme import apply_theme, resolve_mode
-from .widgets import ActionTable, Card, ChipRow, DataTable, StepBar, make_button, repolish
+from .widgets import ActionTable, Card, ChipRow, DataTable, ElidedLabel, StepBar, make_button, repolish
 
 if TYPE_CHECKING:
     from .. import updater
@@ -178,7 +178,7 @@ class MainWindow(QMainWindow):
             access.begin(self.settings, now)
             block = access.current_block(self.settings, now)
             if block:  # a copy that was told to stop stays stopped, even before the network answers
-                QTimer.singleShot(150, lambda: self._apply_access(block))
+                QTimer.singleShot(150, self, lambda: self._apply_access(block))  # with the window as context: gone with it
         if background_checks:
             QTimer.singleShot(1500, self._start_checks)
         QTimer.singleShot(5000, self._cleanup_update_leftovers)
@@ -374,9 +374,8 @@ class MainWindow(QMainWindow):
         bar = QStatusBar()
         bar.setSizeGripEnabled(False)
         self.setStatusBar(bar)
-        self.status_label = QLabel("Ready. Choose a profile and a folder, then scan.")
+        self.status_label = ElidedLabel("Ready. Choose a profile and a folder, then scan.", "muted")
         self.status_label.setContentsMargins(10, 0, 0, 0)
-        self.status_label.setProperty("role", "muted")
         bar.addWidget(self.status_label, 1)
         self.progress = QProgressBar()
         self.progress.setFixedWidth(160)
@@ -395,8 +394,8 @@ class MainWindow(QMainWindow):
 
     def warm_up(self) -> None:
         """Build the other pages while the user reads the first one, so that going there later is instant."""
-        QTimer.singleShot(0, lambda: self._ensure_page("review"))
-        QTimer.singleShot(120, lambda: self._ensure_page("validation"))
+        QTimer.singleShot(0, self, lambda: self._ensure_page("review"))  # the window is the timers' context: if it is closed and
+        QTimer.singleShot(120, self, lambda: self._ensure_page("validation"))  # deleted first, they never run on what is left
 
     def _build_select(self) -> QWidget:
         page = QWidget()

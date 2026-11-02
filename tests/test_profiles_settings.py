@@ -217,3 +217,18 @@ def test_no_old_profiles_file_means_nothing_is_imported_or_marked(tmp_path, monk
     monkeypatch.setattr("datamapperx.profiles.app_dir", lambda: empty)
     load_profiles(tmp_path / "profiles.json")
     assert not (tmp_path / "legacy_profiles_imported").exists()
+
+
+def test_settings_and_profiles_saved_with_a_byte_order_mark_are_read_not_discarded(tmp_path):
+    """Notepad can save a file with a UTF-8 byte-order mark; that must not make the file count as damaged."""
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_bytes(b"\xef\xbb\xbf" + json.dumps({"theme": "dark", "last_folder": "D:/Logs", "repeats": "5"}).encode("utf-8"))
+    loaded = load_settings(settings_file)
+    assert (loaded.theme, loaded.last_folder, loaded.repeats) == ("dark", "D:/Logs", "5")
+
+    profiles_file = tmp_path / "profiles.json"
+    mine = {"type": "excel", "component_col": "A", "measure_col": "B"}
+    profiles_file.write_bytes(b"\xef\xbb\xbf" + json.dumps({"My Profile": mine}).encode("utf-8"))
+    profiles = load_profiles(profiles_file)
+    assert profiles["My Profile"] == mine
+    assert not list(tmp_path.glob("profiles*corrupt*")) and not list(tmp_path.glob("*.bad*"))  # nothing was set aside as damaged

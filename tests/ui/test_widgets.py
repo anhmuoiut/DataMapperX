@@ -6,7 +6,7 @@ import threading
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QStyleFactory
+from PySide6.QtWidgets import QLabel, QStyleFactory
 
 from datamapperx.palette import DARK, LIGHT
 from datamapperx.stat_charts import chart_primitives, charts_for_result
@@ -14,7 +14,7 @@ from datamapperx.statistics import AnalysisConfig, analyze, normalize_records
 from datamapperx.ui.models import TableModel
 from datamapperx.ui.tasks import TaskRunner
 from datamapperx.ui.theme import apply_theme, make_palette, resolve_mode
-from datamapperx.ui.widgets import CHART_SCALE, ActionTable, ChartPanel
+from datamapperx.ui.widgets import CHART_SCALE, ActionTable, ChartPanel, ElidedLabel
 
 from ..conftest import ict_block, write_ict_log
 from .support import pump
@@ -182,3 +182,29 @@ def test_the_chart_panel_says_why_there_is_none():
     image = panel.grab().toImage()
     ink = sum(1 for x in range(0, image.width(), 2) for y in range(0, 60, 2) if image.pixelColor(QPoint(x, y)).lightness() < 200)
     assert ink > 20 and panel.specs() == []
+
+
+# ----------------------------------------------------------------------------- text longer than its room
+LONG_PATH = "C:\\Users\\someone\\OneDrive - Jabil\\03. Private Folder\\DEVELOP\\3. Progressing\\DataMapperX\\Programs\\Line 7\\RawData_v3.xlsx"
+
+
+def drawn(label) -> str:
+    """What the label shows, as against the whole text it was given."""
+    return QLabel.text(label)
+
+
+def test_a_long_path_is_shortened_to_its_room_keeps_its_ends_and_never_widens_the_window(app):
+    label = ElidedLabel(LONG_PATH, "muted", mode=Qt.TextElideMode.ElideMiddle)
+    label.resize(300, 24)
+    label.show()
+    app.processEvents()
+    whole = label.fontMetrics().horizontalAdvance(LONG_PATH)
+    assert whole > 300 and label.text() == LONG_PATH  # the caller always gets the whole text back
+    assert drawn(label).startswith("C:\\Users") and drawn(label).endswith("v3.xlsx") and "…" in drawn(label)  # both ends stay
+    assert label.fontMetrics().horizontalAdvance(drawn(label)) <= 300 and label.toolTip() == LONG_PATH
+    assert label.minimumSizeHint().width() == 0 and label.sizeHint().width() >= whole  # it asks for all it needs and gives way
+    label.resize(whole + 40, 24)  # more room: the whole path again, and no tooltip to repeat it
+    app.processEvents()
+    assert drawn(label) == LONG_PATH and label.toolTip() == ""
+    label.close()
+    label.deleteLater()

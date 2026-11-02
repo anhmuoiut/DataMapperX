@@ -43,7 +43,7 @@ class Settings:
 def load_settings(path: Path | None = None) -> Settings:
     path = path or settings_path()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))  # a file saved by Notepad may start with a byte-order mark
     except FileNotFoundError:
         return Settings()
     except (OSError, ValueError):

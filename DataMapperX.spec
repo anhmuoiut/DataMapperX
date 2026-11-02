@@ -49,8 +49,8 @@ _KEEP_IMAGE_PLUGINS = ('qico',)  # a window icon is an .ico
 # used), and the Network and Svg libraries that nothing here loads. The self-test fails if one of them was needed after all.
 _DROP_FILES = ('opengl32sw.dll', 'qdirect2d.dll', 'qminimal.dll', 'qoffscreen.dll', 'qt6network.dll', 'qt6svg.dll')
 # reportlab requires Pillow, but only for pictures inside PDFs (the reports draw their charts as vectors); the AVIF and WebP codecs
-# of Pillow are 8 MB that no report uses.
-_DROP_PREFIXES = ('_avif.', '_webp.')
+# of Pillow are 8 MB that no report uses, and its Tk binding (_imagingtk) has no Tk to bind to.
+_DROP_PREFIXES = ('_avif.', '_webp.', '_imagingtk.')
 
 
 def _used(item) -> bool:

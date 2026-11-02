@@ -177,7 +177,7 @@ class SampleWizard(Dialog):
         self.sn_example_excel.textEdited.connect(self.sn_example.setText)
 
         if sample is not None:
-            QTimer.singleShot(0, lambda: self.load_sample(sample))
+            QTimer.singleShot(0, self, lambda: self.load_sample(sample))
         else:
             QTimer.singleShot(120, self.choose_sample)
 

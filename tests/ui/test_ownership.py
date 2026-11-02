@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QCoreApplication, QEvent
 
 from datamapperx.settings import Settings
 from datamapperx.ui.main_window import MainWindow
@@ -73,3 +74,22 @@ def test_the_window_survives_the_collector_running_on_a_worker_thread(logs):
 def test_the_stress_does_notice_a_widget_without_a_parent(logs):
     done = stress(logs, "40", "control")
     assert done.returncode != 0 and "survived" not in done.stdout
+
+
+def test_a_window_closed_right_after_it_opened_never_runs_its_delayed_work_on_what_is_left(app, tmp_path, monkeypatch):
+    """warm_up() builds the other pages 0 and 120 ms later. A timer given a bare lambda would still fire after the window was
+    deleted and raise 'Internal C++ object already deleted'; one given the window as its context is cancelled with it."""
+    monkeypatch.setenv("DATAMAPPERX_HOME", str(tmp_path / "home"))
+    raised: list[BaseException] = []
+    monkeypatch.setattr(sys, "excepthook", lambda _kind, exc, _tb: raised.append(exc))
+    win = MainWindow(app, settings=Settings(theme="light"), background_checks=False)
+    win.show()
+    win.warm_up()
+    win.close()
+    win.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    end = time.time() + 0.4  # longer than the longest delay in warm_up
+    while time.time() < end:
+        app.processEvents()
+        time.sleep(0.005)
+    assert raised == []

@@ -1,4 +1,4 @@
-"""The reusable widgets: Card, StepBar, ChipRow, DataTable, ActionTable and ChartPanel."""
+"""The reusable widgets: ElidedLabel, Card, StepBar, ChipRow, DataTable, ActionTable and ChartPanel."""
 
 from __future__ import annotations
 
@@ -59,6 +59,44 @@ def make_button(text: str, slot=None, *, primary: bool = False) -> QPushButton:
     if slot is not None:
         button.clicked.connect(lambda _checked=False: slot())
     return button
+
+
+class ElidedLabel(QLabel):
+    """A one-line label that shortens text that does not fit ("C:\\Users\\…\\RawData.xlsx") instead of being cut off at the edge,
+    and that never makes its window's minimum width as wide as the text. ``text()`` is the whole text, which is also the tooltip."""
+
+    def __init__(self, text: str = "", role: str = "", parent: QWidget | None = None,
+                 mode: Qt.TextElideMode = Qt.TextElideMode.ElideRight) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self._mode = mode
+        if role:
+            self.setProperty("role", role)
+        self.setText(text)
+
+    def text(self) -> str:
+        return self._full
+
+    def setText(self, text: str) -> None:
+        self._full = text
+        self._fit()
+
+    def sizeHint(self) -> QSize:  # as wide as the whole text, so the label shows it all whenever there is room
+        margins = self.contentsMargins()
+        return QSize(self.fontMetrics().horizontalAdvance(self._full) + margins.left() + margins.right(), super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full, self._mode, max(0, self.contentsRect().width()))
+        if shown != QLabel.text(self):
+            QLabel.setText(self, shown)
+        self.setToolTip(self._full if shown != self._full else "")
 
 
 # ----------------------------------------------------------------------------- containers

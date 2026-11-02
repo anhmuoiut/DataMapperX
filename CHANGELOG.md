@@ -10,6 +10,10 @@ A release cannot be published unless its version has a section here.
 - The program no longer carries Tcl/Tk or the `sv-ttk` theme.
 - A large selection no longer freezes the Review: with about 1,200 components over 120 files the GRR pre-check and the data checks are worked out in the background (the window opens at once and fills in a moment later) instead of blocking it for about a second.
 
+### Fixed
+- A long file path, such as a RawData.xlsx deep in a OneDrive folder, is now shortened in the middle with … instead of being cut off at the edge of the window; point at it to read the whole path. The status line does the same with long messages.
+- A `settings.json` or `profiles.json` that you edited and saved in Notepad (which can add a hidden marker at the start of the file) is now read as it is. Before, it was taken for a damaged file: the settings were reset and the profiles were set aside.
+
 ## [1.2.0] - 2026-10-28
 
 ### New

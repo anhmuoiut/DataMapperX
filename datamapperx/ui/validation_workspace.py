@@ -107,7 +107,7 @@ from ..workspace_data import MappingSource, build_mapping_dataset, int_field, re
 from .dialogs import ReportDialog, label, open_path
 from .tasks import TaskRunner
 from .variables import Var, bind_check, bind_combo, bind_edit, bind_label, bind_radios, bind_spin
-from .widgets import ChartPanel, DataTable, make_button, repolish
+from .widgets import ChartPanel, DataTable, ElidedLabel, make_button, repolish
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +351,7 @@ class ValidationWorkspace(QWidget):
         file_row = QHBoxLayout(self.file_controls)
         file_row.setContentsMargins(0, 0, 0, 0)
         self.file_button = make_button("Choose file…", self.choose_file)
-        self.file_label = label("", "muted")
+        self.file_label = ElidedLabel("", "muted", mode=Qt.TextElideMode.ElideMiddle)  # a path can be longer than the window
         bind_label(self.file_label, self.file_var)
         file_row.addWidget(self.file_button)
         file_row.addWidget(self.file_label)
@@ -367,7 +367,7 @@ class ValidationWorkspace(QWidget):
         top.addWidget(self.settings_button)
         layout.addLayout(top)
 
-        self.dataset_label = label("", "heading")
+        self.dataset_label = ElidedLabel("", "heading")
         bind_label(self.dataset_label, self.dataset_var)
         layout.addWidget(self.dataset_label)
         self.hint_label = label("", "warn", wrap=True)

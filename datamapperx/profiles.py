@@ -213,7 +213,7 @@ def import_profiles_from(source: Path, data: dict[str, Any]) -> list[str]:
     Version 1.1.0 kept profiles next to the program. Built-in profiles are ignored (they are always restored)
     and a profile that already exists is never overwritten. Raises ``OSError`` / ``ValueError`` if unreadable.
     """
-    loaded = json.loads(source.read_text(encoding="utf-8"))
+    loaded = json.loads(source.read_text(encoding="utf-8-sig"))  # a byte-order mark, as Notepad writes one, is not part of the JSON
     if not isinstance(loaded, dict):
         raise ValueError("profiles.json must contain a JSON object")
     skip = set(BUILT_IN_PROFILE_NAMES) | {old for old, _new in _LEGACY_NAMES}
@@ -266,7 +266,7 @@ def load_profiles(path: Path | None = None) -> dict[str, dict[str, Any]]:
 
     data: dict[str, Any] = {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(loaded, dict):
             raise ValueError("profiles.json must contain a JSON object")
         data = loaded

@@ -12,12 +12,14 @@ compare numbers taken in the same session. The scripts are throw-away and are no
 |---|---:|---:|
 | From source, first paint (same session, alternating) | **1.14 s**, 48 MB | **0.71 s**, 77 MB |
 | From source, memory with every page built | 49 MB (Tk builds pages lazily) | 90 MB |
-| Packaged one-file exe, window on screen | 3.3 s, 64 MB | **3.0 s**, 105 MB |
+| Packaged one-file exe, window on screen | 3.3 s, 64 MB | **2.3 to 3.0 s**, 105 MB (2.1 to 3.2 s between sessions; see below) |
 | Size of the exe | 20.9 MB | 29.5 MB |
 | Packaged one-folder build (measured once, not shipped) | n/a | **1.0 s**, 51 MB, 66 MB in 115 files |
 
 The packaged start is dominated by the one-file exe unpacking itself into a temporary folder on every launch (about 2.3 s of the
-3.0 s, with the antivirus scanning each file), not by Qt. A one-folder distribution starts in about a second, but the
+3.0 s, with the antivirus scanning each file), not by Qt. It varies more between sessions than the from-source start: the same
+script gave a median of 3.0 s during the migration and 2.3 s (runs from 2.1 to 3.1 s) in the final review, so compare only
+numbers taken in one session. A one-folder distribution starts in about a second, but the
 self-updater (`datamapperx/updater.py`) replaces a single exe, so changing the form of distribution is a decision for the
 owner and not part of this migration.
 

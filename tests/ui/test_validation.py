@@ -10,7 +10,8 @@ from datetime import date
 
 import pytest
 from openpyxl import load_workbook
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QFileDialog, QLabel
 
 from datamapperx.ui import validation_workspace as vp
 from datamapperx.ui.dialogs import ReportDialog
@@ -825,3 +826,18 @@ def test_the_validation_workspace_follows_the_theme_and_shows_a_wide_report_tab(
     assert ws.palette_tokens is window.palette_tokens and ws.table.palette_tokens is window.palette_tokens
     ws.tabs.setCurrentWidget(ws.report_tab)
     assert ws.item_list.count() == 3 and ws.coverage_var.get() == "Included 3 of 3 items"
+
+
+def test_a_long_file_path_is_shortened_and_does_not_widen_the_workspace(app, window, tmp_path):
+    ws = ready(app, window, tmp_path, "long_path_logs")
+    ws.source_var.set("file")
+    window.resize(1500, 800)
+    ws.file_var.set("C:\\RawData.xlsx")
+    QTest.qWait(200)  # the layout gives the label its room a moment after the text changes
+    short = ws.minimumSizeHint().width()
+    long_path = "C:\\" + "\\".join(["a long folder name"] * 12) + "\\RawData.xlsx"
+    ws.file_var.set(long_path)
+    QTest.qWait(200)
+    assert ws.file_label.text() == long_path and ws.file_label.toolTip() == long_path  # shortened on screen, whole on hover
+    assert len(QLabel.text(ws.file_label)) < len(long_path) and "…" in QLabel.text(ws.file_label)
+    assert ws.minimumSizeHint().width() == short  # a long path no longer decides how narrow the window may be
