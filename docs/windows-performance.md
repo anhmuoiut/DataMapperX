@@ -10,10 +10,10 @@ compare numbers taken in the same session. The scripts are throw-away and are no
 
 | | Tk (last commit with it, `9bf4758`) | Qt, finished |
 |---|---:|---:|
-| From source, first paint (same session, alternating) | **1.14 s**, 48 MB | **0.71 s**, 77 MB |
+| From source, first paint (Tk and the first Qt figure: the migration session, alternating) | **1.14 s**, 48 MB | **0.71 s**, 77 MB (final build, release session: **0.72 s**, 81 MB) |
 | From source, memory with every page built | 49 MB (Tk builds pages lazily) | 90 MB |
-| Packaged one-file exe, window on screen | 3.3 s, 64 MB | **2.3 to 3.0 s**, 105 MB (2.1 to 3.2 s between sessions; see below) |
-| Size of the exe | 20.9 MB | 29.5 MB |
+| Packaged one-file exe, window on screen | 3.3 s, 64 MB | **2.1 s** median of 10 in the release session (1.99 to 2.27 s; 2.3 to 3.0 s in earlier sessions), 107 MB working set, 54 MB private |
+| Size of the exe | 20.9 MB | 29.5 MB (30,885,187 bytes) |
 | Packaged one-folder build (measured once, not shipped) | n/a | **1.0 s**, 51 MB, 66 MB in 115 files |
 
 The packaged start is dominated by the one-file exe unpacking itself into a temporary folder on every launch (about 2.3 s of the
