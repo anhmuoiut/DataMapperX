@@ -765,6 +765,7 @@ def _excel_chart(ws, data_ws, spec: ChartSpec, start_col: int, anchor: str, size
                     item.marker.symbol, item.marker.size = "circle", 4
                     item.marker.graphicalProperties.solidFill = series.color.lstrip("#")
                     item.graphicalProperties.line.noFill = True
+                    item.graphicalProperties.line.solidFill = None  # one fill only: Excel rejects a line that is both "no fill" and filled
         chart.set_categories(Reference(data_ws, min_col=category_column, min_row=2, max_row=count + 1))
         # Excel otherwise chooses its own label interval and may hide most serial numbers.
         chart.x_axis.tickLblSkip = 1
@@ -811,6 +812,7 @@ def _excel_chart(ws, data_ws, spec: ChartSpec, start_col: int, anchor: str, size
             item.marker.symbol, item.marker.size = "circle", 4
             item.marker.graphicalProperties.solidFill = series.color.lstrip("#")
             item.graphicalProperties.line.noFill = True
+            item.graphicalProperties.line.solidFill = None  # one fill only, as above
         chart.series.append(item)
         col += 2
     ys = [y for series in spec.series for _, y in series.points]
