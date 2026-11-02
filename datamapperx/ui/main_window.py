@@ -23,7 +23,6 @@ from PySide6.QtCore import QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -69,7 +68,17 @@ from .dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDia
 from .duplicate_dialog import DuplicateDialog
 from .tasks import TaskRunner
 from .theme import apply_theme, resolve_mode
-from .widgets import ActionTable, Card, ChipRow, DataTable, ElidedLabel, StepBar, make_button, repolish
+from .widgets import (
+    ActionTable,
+    Card,
+    ChipRow,
+    DataTable,
+    ElidedLabel,
+    StepBar,
+    WheelGuardedComboBox,
+    make_button,
+    repolish,
+)
 
 if TYPE_CHECKING:
     from .. import updater
@@ -410,13 +419,13 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_source(self) -> Card:
-        card = Card("01  Source")
+        card = Card("01  Source", scrolls=True)  # with large text on a small screen it scrolls instead of overlapping
         head = QHBoxLayout()
         head.addWidget(label("Log profile"), 1)
         self.manage_button = make_button("Manage…", self.manage_profiles)
         head.addWidget(self.manage_button)
         card.body.addLayout(head)
-        self.profile_box = QComboBox()
+        self.profile_box = WheelGuardedComboBox()
         self.profile_box.addItems(list(self.profiles))
         self.profile_box.activated.connect(lambda _index: self._on_profile_changed())
         card.body.addWidget(self.profile_box)

@@ -3,18 +3,42 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import contextmanager
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QFont, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QLabel, QStyleFactory
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QRadioButton,
+    QStyle,
+    QStyleFactory,
+    QVBoxLayout,
+    QWidget,
+)
 
+from datamapperx.config import DATA_DIR_ENV
 from datamapperx.palette import DARK, LIGHT
+from datamapperx.settings import Settings
 from datamapperx.stat_charts import chart_primitives, charts_for_result
 from datamapperx.statistics import AnalysisConfig, analyze, normalize_records
+from datamapperx.ui.main_window import MainWindow
 from datamapperx.ui.models import TableModel
 from datamapperx.ui.tasks import TaskRunner
 from datamapperx.ui.theme import apply_theme, make_palette, resolve_mode
-from datamapperx.ui.widgets import CHART_SCALE, ActionTable, ChartPanel, ElidedLabel
+from datamapperx.ui.widgets import (
+    CHART_SCALE,
+    ActionTable,
+    Card,
+    ChartPanel,
+    ElidedLabel,
+    ScrollTab,
+    WheelGuardedComboBox,
+)
 
 from ..conftest import ict_block, write_ict_log
 from .support import pump
@@ -208,3 +232,134 @@ def test_a_long_path_is_shortened_to_its_room_keeps_its_ends_and_never_widens_th
     assert drawn(label) == LONG_PATH and label.toolTip() == ""
     label.close()
     label.deleteLater()
+
+
+# ----------------------------------------------------------------------------- a page taller than its window (large text, small screen)
+def overlapping(root: QWidget) -> list[str]:
+    """Visible widgets that share a parent and overlap: what a layout squeezed below its minimum looks like."""
+    found = []
+    for parent in [root, *root.findChildren(QWidget)]:
+        kids = [c for c in parent.children() if isinstance(c, QWidget) and not c.isWindow() and c.isVisible()]
+        for i, a in enumerate(kids):
+            for b in kids[i + 1:]:
+                if a.geometry().intersects(b.geometry()):
+                    found.append(f"{type(a).__name__} {a.geometry().getRect()} over {type(b).__name__} {b.geometry().getRect()}")
+    return found
+
+
+def squeezed(root: QWidget) -> list[str]:
+    """Visible controls given less height than their own text needs: what a layout squeezed below its minimum does to them
+    (the text of a button or an input is then cut off)."""
+    kinds = (QPushButton, QLineEdit, QLabel, QComboBox, QCheckBox, QRadioButton)
+    return [f"{type(w).__name__} is {w.height()} high, needs {w.minimumSizeHint().height()}"
+            for w in root.findChildren(QWidget) if isinstance(w, kinds) and w.isVisible() and w.height() + 1 < w.minimumSizeHint().height()]
+
+
+def card_of(widget: QWidget) -> Card:
+    while not isinstance(widget, Card):
+        widget = widget.parentWidget()
+    return widget
+
+
+@contextmanager
+def large_text_window(app, monkeypatch, tmp_path, factor: float = 1.5):
+    """A main window built with the interface text ``factor`` times as large (as Windows' text size can make it): the font has
+    to be set first, because the widgets of a window that exists keep the font the stylesheet gave them."""
+    monkeypatch.setenv(DATA_DIR_ENV, str(tmp_path / "userdata"))
+    saved = app.font()
+    font = QFont(saved)
+    font.setPointSizeF(saved.pointSizeF() * factor)
+    app.setFont(font)
+    win = MainWindow(app, settings=Settings(theme="light"), background_checks=False)
+    win.setMinimumSize(0, 0)  # the size the test asks for, whatever the screen of the machine it runs on
+    win.resize(1500, 430)  # wide enough for the columns, too short for the content
+    win.show()
+    QTest.qWait(250)
+    try:
+        yield win
+    finally:
+        win.close()
+        win.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.setFont(saved)
+        QTest.qWait(100)
+
+
+def test_the_source_card_and_the_analysis_tab_do_not_scroll_in_an_ordinary_window(app, window):
+    card = card_of(window.scan_button)
+    window.resize(1360, 880)
+    QTest.qWait(150)
+    assert card.scroll_area.verticalScrollBar().maximum() == 0 and not overlapping(card.scroll_area.widget()) and not squeezed(card)
+    # no width is held back for a scroll bar that is not there: the card asks for what its content needs
+    assert card.scroll_area.minimumSizeHint().width() == card.scroll_area.widget().minimumSizeHint().width()
+    window._show_workspace("validation")
+    ws = window.validation
+    ws.tabs.setCurrentWidget(ws.setup_tab)
+    ws.method_var.set("capability")
+    ws._toggle_advanced()  # the tallest the page gets
+    QTest.qWait(150)
+    assert ws.setup_tab.scroll_area.verticalScrollBar().maximum() == 0 and not overlapping(ws.setup_tab.content) and not squeezed(ws.setup_tab)
+
+
+def test_the_source_card_scrolls_instead_of_overlapping_when_the_text_is_large(app, monkeypatch, tmp_path):
+    with large_text_window(app, monkeypatch, tmp_path) as win:
+        card = card_of(win.scan_button)
+        area = card.scroll_area
+        bar = area.verticalScrollBar()
+        assert bar.maximum() > 0  # the card is too short for its content: it scrolls
+        assert not overlapping(area.widget()) and not squeezed(card)  # ...and every control keeps its own place and its own height
+        extent = area.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent, None, area)
+        assert area.minimumSizeHint().width() == area.widget().minimumSizeHint().width() + extent  # the bar's width is asked for too
+        assert area.viewport().width() >= area.widget().minimumSizeHint().width()  # so nothing is cut off at the right
+        bar.setValue(bar.maximum())
+        QTest.qWait(50)
+        end = win.version_label  # the last item of the card can be brought into view
+        assert end.mapTo(card.scroll_area.viewport(), QPoint(0, end.height() - 1)).y() < card.scroll_area.viewport().height()
+
+
+def test_a_scrolling_tab_scrolls_when_its_content_is_taller_than_the_page_and_otherwise_fills_it(app):
+    tab = ScrollTab()
+    column = QVBoxLayout(tab.content)
+    for number in range(30):
+        column.addWidget(QLabel(f"line {number}"))
+    tab.resize(400, 200)
+    tab.show()
+    QTest.qWait(150)
+    bar = tab.scroll_area.verticalScrollBar()
+    assert bar.maximum() > 0 and not overlapping(tab.content) and not squeezed(tab)  # too short: it scrolls and the lines keep their places
+    bar.setValue(bar.maximum())
+    QTest.qWait(50)
+    assert tab.content.childAt(20, tab.content.height() - 20).text() == "line 29"  # the end is reachable
+    tab.resize(400, 1500)
+    QTest.qWait(150)
+    assert bar.maximum() == 0 and tab.content.height() == tab.scroll_area.viewport().height()  # tall enough: no bar, the page is filled
+    tab.close()
+    tab.deleteLater()
+
+
+def test_the_analysis_form_lives_in_the_scrolling_content_of_its_tab(app, window):
+    window._show_workspace("validation")
+    ws = window.validation
+    assert isinstance(ws.setup_tab, ScrollTab)
+    for widget in (ws.method_radios["grr"], ws.advanced_button, ws.within_combo):
+        parent = widget
+        while parent is not None and parent is not ws.setup_tab.content:
+            parent = parent.parentWidget()
+        assert parent is ws.setup_tab.content
+
+
+def test_the_mouse_wheel_changes_the_log_profile_only_when_it_has_the_focus(app, window):
+    box = window.profile_box
+    assert isinstance(box, WheelGuardedComboBox) and box.count() > 1
+    box.setCurrentIndex(0)
+
+    def wheel() -> QWheelEvent:
+        return QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120), Qt.MouseButton.NoButton,
+                           Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False)
+
+    event = wheel()
+    box.wheelEvent(event)  # as the card that scrolls would be handed it: not taken by the combo box
+    assert box.currentIndex() == 0 and not event.isAccepted()
+    box.hasFocus = lambda: True  # type: ignore[method-assign]
+    box.wheelEvent(wheel())
+    assert box.currentIndex() == 1  # with the focus it still works as a combo box does

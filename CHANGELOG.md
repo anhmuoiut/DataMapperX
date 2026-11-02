@@ -13,6 +13,7 @@ A release cannot be published unless its version has a section here.
 ### Fixed
 - A long file path, such as a RawData.xlsx deep in a OneDrive folder, is now shortened in the middle with … instead of being cut off at the edge of the window; point at it to read the whole path. The status line does the same with long messages.
 - A `settings.json` or `profiles.json` that you edited and saved in Notepad (which can add a hidden marker at the start of the file) is now read as it is. Before, it was taken for a damaged file: the settings were reset and the profiles were set aside.
+- With large Windows text on a small screen (for example 150% scaling and bigger text on a 1280x720 display), the Source card of Data Mapping and the Analysis tab of Validation & Reports scroll instead of squeezing their controls over each other. At the usual sizes nothing looks different. The log profile box now changes with the mouse wheel only after you have clicked it, so scrolling the card cannot switch the profile by accident.
 
 ## [1.2.0] - 2026-10-28
 

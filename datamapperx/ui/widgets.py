@@ -1,4 +1,4 @@
-"""The reusable widgets: ElidedLabel, Card, StepBar, ChipRow, DataTable, ActionTable and ChartPanel."""
+"""The reusable widgets: ElidedLabel, Card, WheelGuardedComboBox, StepBar, ChipRow, DataTable, ActionTable and ChartPanel."""
 
 from __future__ import annotations
 
@@ -20,12 +20,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QFrame,
     QHeaderView,
     QLabel,
     QLayout,
     QLayoutItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
@@ -100,10 +102,37 @@ class ElidedLabel(QLabel):
 
 
 # ----------------------------------------------------------------------------- containers
-class Card(QFrame):
-    """A titled surface. Put the content in ``body``."""
+class _ScrollsUpAndDown(QScrollArea):
+    """A scroll area that asks for the width its content needs (and the scroll bar), as a plain layout would: a bare QScrollArea
+    asks for almost nothing, and the page would give it a share of the width that cuts the content off at the right."""
 
-    def __init__(self, title: str = "", parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.verticalScrollBar().rangeChanged.connect(lambda *_: self.updateGeometry())  # the bar came or went: the width asked for changes
+
+    def minimumSizeHint(self) -> QSize:
+        content = self.widget()
+        width = content.minimumSizeHint().width() if content is not None else 0
+        bar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent, None, self) if self.verticalScrollBar().maximum() > 0 else 0
+        return QSize(width + bar + 2 * self.frameWidth(), super().minimumSizeHint().height())
+
+
+def _scroll_around(parent: QWidget, content: QWidget) -> QScrollArea:
+    area = _ScrollsUpAndDown(parent)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(content)
+    content.setAutoFillBackground(False)  # setWidget() switches it on; what is behind (the card, the tab page) must show through
+    area.viewport().setAutoFillBackground(False)
+    return area
+
+
+class Card(QFrame):
+    """A titled surface. Put the content in ``body``. With ``scrolls`` the content scrolls up and down when the card is too short
+    for it (large text on a small screen) instead of being squeezed over itself; when it fits, it looks as it does without."""
+
+    def __init__(self, title: str = "", parent: QWidget | None = None, *, scrolls: bool = False) -> None:
         super().__init__(parent)
         self.setObjectName("card")
         outer = QVBoxLayout(self)
@@ -115,7 +144,42 @@ class Card(QFrame):
         outer.addWidget(self.title)
         self.body = QVBoxLayout()
         self.body.setSpacing(8)
-        outer.addLayout(self.body, 1)
+        if not scrolls:
+            outer.addLayout(self.body, 1)
+            return
+        inner = QWidget(self)
+        inner.setLayout(self.body)
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = _scroll_around(self, inner)
+        outer.addWidget(self.scroll_area, 1)
+
+
+class ScrollTab(QWidget):
+    """A page of a tab widget whose content (build its layout on ``content``) scrolls up and down when the page is too short for
+    it, and looks as a plain page does when it is not."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.content = QWidget(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = _scroll_around(self, self.content)
+        outer.addWidget(self.scroll_area)
+
+
+class WheelGuardedComboBox(QComboBox):
+    """A combo box that the mouse wheel changes only while it has the focus, so that wheeling over a scrolling card scrolls the
+    card, and a choice that matters (the log profile) is never changed by accident."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # tab or click, not the wheel
+
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()  # handed on to the card that scrolls
 
 
 class StepBar(QWidget):

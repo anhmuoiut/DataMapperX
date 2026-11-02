@@ -107,7 +107,7 @@ from ..workspace_data import MappingSource, build_mapping_dataset, int_field, re
 from .dialogs import ReportDialog, label, open_path
 from .tasks import TaskRunner
 from .variables import Var, bind_check, bind_combo, bind_edit, bind_label, bind_radios, bind_spin
-from .widgets import ChartPanel, DataTable, ElidedLabel, make_button, repolish
+from .widgets import ChartPanel, DataTable, ElidedLabel, ScrollTab, make_button, repolish
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +321,8 @@ class ValidationWorkspace(QWidget):
         outer.addWidget(self.stale_banner)
 
         self.tabs = QTabWidget()
-        self.data_tab, self.setup_tab, self.results_tab, self.report_tab = (QWidget() for _ in range(4))
+        self.data_tab, self.results_tab, self.report_tab = QWidget(), QWidget(), QWidget()
+        self.setup_tab = ScrollTab()  # a form: with large text it scrolls instead of being squeezed (the Report page fits by shrinking its list)
         for tab, title in ((self.data_tab, "Data"), (self.setup_tab, "Analysis"), (self.results_tab, "Results"), (self.report_tab, "Report")):
             self.tabs.addTab(tab, title)
         self._build_data()
@@ -396,7 +397,7 @@ class ValidationWorkspace(QWidget):
             self.preview.setColumnHidden(index, key not in shown)
 
     def _build_setup(self) -> None:
-        layout = QVBoxLayout(self.setup_tab)
+        layout = QVBoxLayout(self.setup_tab.content)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(4)
         layout.addWidget(label("Plan", "heading"))
