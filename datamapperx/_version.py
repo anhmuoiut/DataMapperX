@@ -3,4 +3,4 @@
 The release workflow refuses to publish unless the git tag equals ``v`` + this value.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
