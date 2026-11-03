@@ -239,7 +239,7 @@ def _check_steps(app, window, folder: Path) -> None:
         window._show_step("review")
         app.processEvents()
         _require(window.step == "review" and len(window.preview_grid.rows()) == 2, "the review did not show the data")
-        _require(len(window.limits_grid.rows()) == 1 and window.check_chips.chips(), "the review did not show the limits")
+        _require(len(window.limits_grid.rows()) == 1, "the review did not show the limits")
         window._show_workspace("validation")  # Validation & Reports analyses a copy of what was scanned
         workspace = window.validation
         _wait(app, lambda: workspace.dataset is not None and not workspace.busy, "the validation data")

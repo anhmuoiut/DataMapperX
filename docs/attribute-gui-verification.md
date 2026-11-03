@@ -1,27 +1,39 @@
-# Attribute Agreement: one-time check in the real window
+# Attribute Agreement: sample files and a manual walk-through
 
-Everything about Attribute Agreement that can be tested without a window has been (`tests/test_attribute*.py`, `tests/test_ratings.py`). The code of the workspace itself has also been run in the real Qt workspace on Qt's offscreen platform, so no window opens and no focus is taken (`tests/ui/test_validation_attribute.py`): import, mapping, Run, the Results table, Details, Checks, the charts, sorting, switching between methods and making the reports, so a missing name or a wrong call would already have been found. What is left is what only the window on a screen shows: how the import dialog, the tables, the colours and the charts look, and the PDF and Excel files opened in their own programs. This is the list to go through once. The readiness flags stay off until it has been done and approved.
+State on 2026-11-02. The owner has stated that Attribute Agreement is validated and works similarly to Minitab (see
+`docs/attribute-release-readiness.md`); the checklist below was **not** recorded as done, and this file no longer gates anything. It
+stays for two uses: the ten sample files with the figures they must give, and a list to walk through in the real window after a change to
+the Attribute screens.
+
+Everything about Attribute Agreement that can be tested without a window has been (`tests/test_attribute*.py`, `tests/test_ratings.py`). The
+code of the workspace itself is also run in the real Qt workspace on Qt's offscreen platform, so no window opens and no focus is taken
+(`tests/ui/test_validation_attribute.py`): import, mapping, Run, the Results table, Details, Checks, the charts, sorting, switching
+between methods and making the reports. What only a window on a screen shows is how the import dialog, the tables, the colours and the
+charts look, and the PDF and Excel files opened in their own programs; the list in section 3 is for that.
 
 Starting the application opens a window and takes the keyboard focus, so do this when that does not matter.
 
-## 1. Start with the checks switched on
+## 1. Starting the application
 
-The two flags `ATTRIBUTE_RESULTS_READY` and `ATTRIBUTE_REPORTS_READY` (`datamapperx/ui/validation_workspace.py`) are False. Two environment variables let the window run Attribute Agreement and make its report without changing them:
+The two flags `ATTRIBUTE_RESULTS_READY` and `ATTRIBUTE_REPORTS_READY` (`datamapperx/ui/validation_workspace.py`) are `True` in the working
+tree (a staged change of the owner) and `False` in the last commit, `aeee0fd`. With `True`, `python main.py` runs Attribute Agreement and
+makes its reports. With `False`, two environment variables do the same without changing the flags:
 
 ```
-DATAMAPPERX_ATTRIBUTE_RESULTS=1 DATAMAPPERX_ATTRIBUTE_REPORTS=1 .venv/bin/python main.py        # macOS
 set DATAMAPPERX_ATTRIBUTE_RESULTS=1 && set DATAMAPPERX_ATTRIBUTE_REPORTS=1 && python main.py      # Windows
+DATAMAPPERX_ATTRIBUTE_RESULTS=1 DATAMAPPERX_ATTRIBUTE_REPORTS=1 .venv/bin/python main.py        # macOS
 ```
 
-Without them, the Run button of Attribute Agreement is disabled and says that it cannot be run yet, and the PDF and Excel buttons say that its reports are not available yet. Check that first (without the variables), then restart with them.
+With the flags `False` and no variables, the Run button of Attribute Agreement is disabled and says that it cannot be run yet, and the
+PDF and Excel buttons say that its reports are not available yet.
 
 ## 2. Sample files
 
-Run this once in the project folder (it writes ten files to `samples/attribute_gui/`, which is not part of the repository):
+Run this in the project folder (it writes ten files to `samples/attribute_gui/`, which is not part of the repository):
 
 ```
-.venv/bin/python tools/make_attribute_samples.py          # macOS
 python tools\make_attribute_samples.py                  # Windows
+.venv/bin/python tools/make_attribute_samples.py          # macOS
 ```
 
 The first column of the table says what to expect. `tests/ui/test_attribute_samples.py` opens the same ten files the way the Import dialog does, runs them in the Qt workspace (headless) and asserts the figures, Checks and tables below, so what is left for the window is how they look and behave.
@@ -41,7 +53,7 @@ The first column of the table says what to expect. `tests/ui/test_attribute_samp
 
 ## 3. Checklist
 
-Tick each line; write down anything that differs from "expected".
+Go through each line and note anything that differs from "expected".
 
 **A. Import, mapping and preview** (Data tab, "Import ratings (CSV/XLSX)")
 - [ ] The button reads "Import ratings…"; choosing 1_reference opens the dialog with Sample ID = Samples, Rating = Measurements, Appraiser = Appraisers, Known Standard = Standard, Trial = (none), Test Item = (none).
@@ -80,7 +92,7 @@ Tick each line; write down anything that differs from "expected".
 - [ ] 10_twelve_long_names: in a small window each panel is taller than usual and the panel scrolls, so that the percent scale (ticks 60 to 100 or 90 to 100) stays readable; the rotated names may touch each other on a high-resolution screen in a very small window (a known limit: widen the window).
 - [ ] The charts stay on a white background in the dark theme, as the other charts do.
 
-**G. Reports** (Report tab; needs `DATAMAPPERX_ATTRIBUTE_REPORTS=1`)
+**G. Reports** (Report tab; with the flags `False` it needs `DATAMAPPERX_ATTRIBUTE_REPORTS=1`)
 - [ ] Generate PDF and Excel for 1_reference and 3_three_appraisers. PDF: tables in the order of section D on a portrait page, then "Assessment Agreement" with the two panels on a landscape page; no cover, no company name.
 - [ ] Excel: the same tables with the interval as two numeric cells; click a cell to see the full value (for example 96.6666666666667); two charts with circle and X markers and a line between the limits, opening without a repair message in Excel.
 - [ ] With acceptance on, an "Acceptance" table follows the statistics and says that it is a criterion of the user; with it off there is none.
@@ -99,30 +111,6 @@ Tick each line; write down anything that differs from "expected".
 
 * The ten sample files and the nine Pass/Fail studies were run through the Qt workspace (`tests/ui/test_attribute_samples.py`): the table, Details, Checks and summary of each are those of section 2. The Details, the PDF and the workbook hold the same figures (cell by cell for the workbook, row by row for the PDF).
 * The 38 PDF and Excel files of those 19 studies (re-run after the Assessment Disagreement table was changed to Minitab's) open under strict pypdf and Ghostscript with no warning (portrait pages of tables, one landscape page of charts), and the workbooks pass zip, XML, content-type, relationship and chart-element-order checks and reload in openpyxl. Pages of 1_reference, 3_three_appraisers, 5_unusable_standard, F_multiple_appraisers and H_one_reference_category_absent were looked at as images: no overlap or clipping.
-* Not done: opening the files in Excel and in a PDF viewer, and everything that is how the window looks (section 3).
-
-## 4. After the check
-
-Record the outcome in the matrix of `docs/attribute-release-readiness.md`. If everything above holds, and only then, set the two flags to True in `datamapperx/ui/validation_workspace.py`, and run the test suite once more (`tests/test_attribute_setup.py` and `tests/test_attribute_results.py` assert the released-off state and will need that change). If anything differs, note the file, the step and what the window did.
-
-## 5. Result log
-
-Date: ____  Windows / macOS: ____  Build: ____
-
-| Section | Done (yes / no) | Everything as expected? | Notes |
-|---|---|---|---|
-| A. Import, mapping, preview | | | |
-| B. Analysis configuration | | | |
-| C. Run and Results table | | | |
-| D. Details | | | |
-| E. Checks | | | |
-| F. Charts | | | |
-| G. Reports (and the files opened in Excel / a PDF viewer) | | | |
-| H. Switching between methods | | | |
-| I. Regression sanity | | | |
-
-Anything that differs from "expected" (one line each; a screenshot of the window itself helps):
-
-| # | Sample file | Step | Expected | What the window did | Light / dark |
-|---|---|---|---|---|---|
-| 1 | | | | | |
+* Not done on that day: opening the files in Excel and in a PDF viewer, and everything that is how the window looks (section 3). Since then
+  (2026-11-02, `docs/windows-acceptance.md`) the Attribute workbook has been opened in a real, hidden Excel 16 without repair. How the
+  window looks, and the Attribute PDF in a viewer, are covered only by the owner's own validation (statement, not recorded).

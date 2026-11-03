@@ -138,14 +138,18 @@ class GrrCriteriaDialog(Dialog):
     """The criteria of the GRR pre-check: for each metric whether it decides, and its limits. Nothing changes until Apply."""
 
     def __init__(self, parent: QWidget, criteria, on_apply) -> None:
-        super().__init__(parent, "Quick Check criteria", min_size=(430, 300))
+        super().__init__(parent, "Quick Check criteria", min_size=(540, 400))
         from ..grr import QUICK_LABELS
 
         self.on_apply = on_apply
         self.fields: dict[str, tuple[QCheckBox, QLineEdit, QLineEdit | None]] = {}
+        self.layout_root.addWidget(label("GR&R Pre-check · Quick Check criteria", "title"))
+        self.layout_root.addWidget(label("Used to colour the preliminary screening table. This does not change formal GR&R calculations.",
+                                         "muted", wrap=True))
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
+        grid.setColumnStretch(0, 1)
         for column, text in ((0, "Metric"), (1, "PASS up to"), (2, "FAIL above")):
             grid.addWidget(label(text, "muted"), 0, column)
         for row, criterion in enumerate(criteria, start=1):
@@ -172,8 +176,10 @@ class GrrCriteriaDialog(Dialog):
                     grid.addLayout(cell, row, column)
             self.fields[criterion.metric] = (enabled, low, high)
         self.layout_root.addLayout(grid)
-        self.layout_root.addWidget(label("A metric that is not used stays in the table, without colour, and does not decide the "
-                                         "Result. The Result is the worst of the metrics used.", "muted", wrap=True))
+        self.layout_root.addWidget(label("A value up to PASS is PASS; above PASS and up to FAIL is CONDITION; above FAIL is FAIL. An NDC "
+                                         "below the minimum is FAIL. A figure that cannot be judged is N/A and never counts as a PASS. "
+                                         "The Result is the worst of the metrics used. A metric that is not used stays in the table, "
+                                         "without colour, and does not decide the Result.", "note", wrap=True))
         self.error = label("", "bad", wrap=True)
         self.layout_root.addWidget(self.error)
         self.layout_root.addStretch(1)
@@ -181,7 +187,7 @@ class GrrCriteriaDialog(Dialog):
         row.addWidget(make_button("Reset to defaults", self.reset))
         row.addStretch(1)
         row.addWidget(make_button("Cancel", self.close))
-        row.addWidget(make_button("Apply", self.apply, primary=True))
+        row.addWidget(make_button("Apply criteria", self.apply, primary=True))
 
     def reset(self) -> None:
         from ..grr import DEFAULT_QUICK_CRITERIA

@@ -80,8 +80,8 @@ def test_the_plan_line_counts_appraisers_for_ratings_only():
     assert stub._plan_text() == ""
 
 
-def test_attribute_agreement_can_be_set_up_but_not_run_until_its_results_exist():
-    assert workspace.ATTRIBUTE_RESULTS_READY is False  # the next stage builds Results, Details and Checks, and turns this on
+def test_attribute_agreement_can_be_set_up_and_its_results_now_exist():
+    assert workspace.ATTRIBUTE_RESULTS_READY is True  # the stage that built Results, Details and Checks turned this on
     assert "cannot be run" in workspace.ATTRIBUTE_PENDING
     assert set(workspace.METHOD_NAMES) == set(workspace.PLAN_TITLES) == {"grr", "capability", "attribute"}
     assert workspace.CONFIDENCE_LEVELS == ("90%", "95%", "99%") and workspace.CONFIDENCE_LEVELS[1] == "95%"  # 95 % is the default

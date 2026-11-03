@@ -20,7 +20,7 @@ from PIL import Image, ImageChops, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 SVG = ROOT / "assets" / "Jabil-Logo.svg"
-HEIGHTS = (38, 76)
+HEIGHTS = (30, 66)
 SUPERSAMPLE = 4
 CURVE_STEPS = 24
 LETTERS_DARK_BACKGROUND = "#ffffff"

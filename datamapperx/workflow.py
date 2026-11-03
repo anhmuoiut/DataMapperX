@@ -15,11 +15,11 @@ from .config import MISSING_TEXT, PREVIEW_COLUMNS_PER_PAGE, PREVIEW_ROW_LIMIT
 from .exporter import ExportRow, iter_export_rows
 from .models import ScanResult
 from .review import HIGH, LOW, MISSING, ReviewSummary, limit_rows
+from .utils import to_number
 
 SELECTED_EMPTY_TEXT = "Press + on a component on the left,\nor double-click it."
 EMPTY_PREVIEW_TEXT = "Your data preview starts here.\nChoose a source folder, then scan its logs."
 IDLE_PREVIEW_NOTE = "The preview uses the same rows and column order as your Excel file."
-NO_ROW_CHOSEN_TEXT = "Click a row to compare its values with the limits."
 PREVIEW_FIXED_HEADINGS = ("No.", "Serial number", "File")  # the columns before the components
 
 
@@ -40,11 +40,22 @@ class AvailableView:
     filtering: bool
 
 
-def available_view(components: Sequence[str], selected: Sequence[str], keyword: str) -> AvailableView:
+def has_numeric_limits(limits: Mapping[str, Mapping[str, str]], component: str) -> bool:
+    """Whether a component lists a Min and a Max that are both numbers: the ones a value can be judged against."""
+    info = limits.get(component, {})
+    return to_number(info.get("min")) is not None and to_number(info.get("max")) is not None
+
+
+def available_view(components: Sequence[str], selected: Sequence[str], keyword: str, *, numeric_only: bool = False,
+                   limits: Mapping[str, Mapping[str, str]] | None = None) -> AvailableView:
+    """``numeric_only`` is the Value filter: only components with a numeric Min and Max (by the ``limits`` of the logs)."""
     chosen = set(selected)
     keyword = keyword.strip().lower()
     remaining = [c for c in components if c not in chosen]
     shown = [c for c in remaining if keyword in c.lower()] if keyword else remaining
+    if numeric_only:
+        shown = [c for c in shown if has_numeric_limits(limits or {}, c)]
+    filtering = bool(keyword) or numeric_only
     if not components:
         empty = "Scan a folder to list\nits components here."
     elif not remaining:
@@ -53,11 +64,11 @@ def available_view(components: Sequence[str], selected: Sequence[str], keyword: 
         empty = "No component matches the filter."
     if not components:
         info = ""
-    elif keyword:
+    elif filtering:
         info = f"{len(shown)} of {len(remaining)} shown"
     else:
         info = f"{len(remaining)} available"
-    return AvailableView(shown, empty, info, bool(keyword))
+    return AvailableView(shown, empty, info, filtering)
 
 
 def selected_info(count: int) -> str:

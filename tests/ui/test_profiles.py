@@ -90,7 +90,7 @@ def test_the_profile_list_in_the_window_follows_the_manager(app, window):
     assert "Another ICT" in [window.profile_box.itemText(i) for i in range(window.profile_box.count())]
     assert window.profile_box.currentText() == "Another ICT"  # a saved profile becomes the chosen one, as it always did
     window._on_profile_changed()
-    assert "Profile changed" in window.status_label.text() and window.hint_label.text().startswith("Text log")
+    assert "Profile changed" in window.status_label.text() and window.profile_box.toolTip().startswith("Text log")
     manager.listbox.setCurrentRow(list(window.profiles).index("Another ICT"))
     manager._delete()
     assert window.profile_box.currentText() != "Another ICT" and "deleted" in window.status_label.text()

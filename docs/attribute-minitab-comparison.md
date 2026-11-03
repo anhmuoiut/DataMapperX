@@ -1,6 +1,6 @@
 # Attribute Agreement: comparison with Minitab
 
-What has been compared with output Minitab itself printed, what has not, and the nine studies to run in Minitab to close the open part, the Assessment Disagreement table. Nothing in this file is a Minitab result unless it says so.
+State on 2026-11-02. What has been compared with output Minitab itself printed (the repository holds one example, Minitab's Textile print quality), what has not, and the nine studies that can be run in Minitab to put evidence for the Assessment Disagreement table into the repository. The owner stated on 2026-11-02 that Attribute Agreement is validated and works similarly to Minitab; that validation is not stored here, so this file describes the repository's evidence and not the owner's. Nothing in this file is a Minitab result unless it says so.
 
 ## 1. Compared and agreeing
 
@@ -44,7 +44,7 @@ Sources that could not be used: the book (O'Reilly refused the page, Google Book
 
 ## 4. The nine studies
 
-`python tools/attribute_disagreement_cases.py` writes nine CSV files to `samples/attribute_minitab/` and prints what DataMapperX shows for each. All have 24 samples (S01-S14 Standard Pass, S15-S24 Standard Fail, so that the three divisors 10, 14 and 24 differ) and 3 trials. What DataMapperX shows (counts, with the percent in brackets):
+`python tools/attribute_disagreement_cases.py` (from the project folder) writes nine CSV files to `samples/attribute_minitab/` and prints what DataMapperX shows for each. All have 24 samples (S01-S14 Standard Pass, S15-S24 Standard Fail, so that the three divisors 10, 14 and 24 differ) and 3 trials. What DataMapperX shows (counts, with the percent in brackets):
 
 | Study | Appraiser | #Pass/Fail | #Fail/Pass | #Mixed |
 |---|---|---|---|---|
@@ -62,9 +62,9 @@ Studies D, E and F separate the readings of the counts that are possible (a mixe
 
 To run one in Minitab: open the CSV, **Stat > Quality Tools > Attribute Agreement Analysis**; Data are arranged as **Attribute column**; Attribute column **Measurements**; Samples **Samples**; Appraisers **Appraisers**; Known standard/attribute **Standard** (leave it empty for G); "Categories of the attribute data are ordered" **unchecked**; confidence level 95 %. Copy the whole **Session window** of each study.
 
-## 5. When Minitab's output arrives
+## 5. If Minitab's output is added to the repository
 
 1. Set each study's Assessment Disagreement table beside the one above. If they agree for all nine, the rule and its divisors are confirmed, edge cases included.
 2. The Session outputs become `tests/reference/` files and tests in the manner of `tests/test_attribute_minitab.py`; they also compare the agreement, interval and kappa figures printed with them (kappa with two responses and imperfect agreement, the 0 % interval of study I).
 3. If something differs, only `_disagreement` and its tests change.
-4. Only then may `METHOD_VERIFICATION["attribute_agreement"]` (`statistics/study.py`) move from "Pending Minitab Verification", and the one sentence in About the method that says the table has not been compared with a full Minitab run goes.
+4. Only then may `METHOD_VERIFICATION["attribute_agreement"]` (`datamapperx/statistics/study.py`) move from "Pending Minitab Verification", and the one sentence in About the method (`datamapperx/statistics/formulas.py`) that says the table has not been compared with a full Minitab run go. Whether and when to move it is the owner's decision (`docs/statistical-validation.md`, "Method verification"); both still say "pending" in the code today.

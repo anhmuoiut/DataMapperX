@@ -86,7 +86,7 @@ PENDING_VERIFICATION = "Pending Minitab Verification"
 MINITAB_VERIFIED = "Minitab Verified"
 
 # Whether a calculation method has been compared with Minitab output. This describes the method, not any dataset.
-# A method moves to MINITAB_VERIFIED only after every Golden Test case for it passes (docs/validation-workspace-proposal.md).
+# A method moves to MINITAB_VERIFIED only after every Golden Test case for it passes (docs/statistical-validation.md, "Method verification").
 METHOD_VERIFICATION: dict[str, str] = {
     "grr_one_way": PENDING_VERIFICATION,
     "grr_crossed": PENDING_VERIFICATION,

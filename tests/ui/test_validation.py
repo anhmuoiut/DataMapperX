@@ -72,7 +72,7 @@ def test_validation_is_a_workspace_beside_data_mapping_and_leaves_the_raw_export
     assert window.validate_button.isEnabled() and window.export_button.isEnabled()
     window.validate_button.click()
     assert window.workspace == "validation" and window.content.currentWidget() is window.validation
-    assert not window.step_bar.isVisibleTo(window) and window.mapping_switch.isVisible()
+    assert window.step_bar.isVisibleTo(window) and window.home_button.isVisible()  # the step bar goes on to Analyze, Results and Report
     ws = open_validation(app, window)
     assert [ws.tabs.isTabEnabled(i) for i in range(4)] == [True, True, False, False]  # the tabs open up as the work progresses
     assert all(part in ws.dataset_var.get() for part in ("Test Items 3", "Samples 3", "Total Readings 18", "Trials per Sample 2"))
@@ -181,7 +181,7 @@ def test_the_within_sigma_method_is_an_advanced_option_and_the_capability_setup_
     ws.method_var.set("capability")
     assert ws.plan_title_var.get() == "Process Capability" and ws.plan_var.get() == "3 Test Items · 3 Samples"
     assert [b.text() for b in ws.method_radios.values()] == [
-        "MSA – Variable Gage R&R", "Process Capability – Cp/Cpk, Pp/Ppk", "Attribute Agreement – PASS/FAIL ratings"]
+        "Process Capability", "Variable Gage R&&R", "Attribute Agreement"]
     assert ws.subgroup_check.text() == "Group readings by Sample ID" and ws.judge_check.text() == "Enable acceptance criteria"
     assert ws.criteria_row.isHidden() and ws.advanced.isHidden() and ws.threshold_var.get() == "1.33"
     ws.judge_var.set(True)

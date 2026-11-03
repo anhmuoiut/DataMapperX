@@ -274,6 +274,7 @@ def large_text_window(app, monkeypatch, tmp_path, factor: float = 1.5):
     win.setMinimumSize(0, 0)  # the size the test asks for, whatever the screen of the machine it runs on
     win.resize(1500, 430)  # wide enough for the columns, too short for the content
     win.show()
+    win._show_workspace("mapping")  # the program opens on the Dashboard; these tests look at Data Mapping's Source card
     QTest.qWait(250)
     try:
         yield win
@@ -286,6 +287,7 @@ def large_text_window(app, monkeypatch, tmp_path, factor: float = 1.5):
 
 
 def test_the_source_card_and_the_analysis_tab_do_not_scroll_in_an_ordinary_window(app, window):
+    window._show_workspace("mapping")  # the program opens on the Dashboard
     card = card_of(window.scan_button)
     window.resize(1360, 880)
     QTest.qWait(150)

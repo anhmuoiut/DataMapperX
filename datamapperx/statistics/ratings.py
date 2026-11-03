@@ -154,8 +154,9 @@ def _read_csv(path: Path) -> RatingsTable:
     return _table(path, "", (), grid)
 
 
-def read_ratings_table(path: str | Path, sheet: str | None = None) -> RatingsTable:
-    """Read a CSV (comma, semicolon, tab or bar separated; UTF-8 or Windows-1252) or the sheet of an XLSX workbook."""
+def read_ratings_table(path: str | Path, sheet: str | None = None, fallbacks: Sequence[str] = ()) -> RatingsTable:
+    """Read a CSV (comma, semicolon, tab or bar separated; UTF-8 or Windows-1252) or the sheet of an XLSX workbook: ``sheet``, else the
+    first of the ``fallbacks`` the workbook has, else its first sheet."""
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix not in SUFFIXES:
@@ -167,7 +168,7 @@ def read_ratings_table(path: str | Path, sheet: str | None = None) -> RatingsTab
         names = tuple(reader.sheet_names)
         if not names:
             raise RatingsFormatError("The workbook has no worksheet.")
-        chosen = sheet if sheet in names else names[0]
+        chosen = next((name for name in (sheet, *fallbacks) if name in names), names[0])
         return chosen, names, [(number, values) for number, values in reader.iter_rows(chosen)]
 
     chosen, names, grid = read_workbook(path, work)

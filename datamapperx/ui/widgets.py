@@ -1,4 +1,5 @@
-"""The reusable widgets: ElidedLabel, Card, WheelGuardedComboBox, StepBar, ChipRow, DataTable, ActionTable and ChartPanel."""
+"""The reusable widgets: ElidedLabel, FittingLabel, Card (with its badge and header row), CountTile, ActionBox, CompactPage,
+WheelGuardedComboBox, StepBar, DataTable, ActionTable and ChartPanel."""
 
 from __future__ import annotations
 
@@ -6,7 +7,18 @@ import math
 import re
 from collections.abc import Sequence
 
-from PySide6.QtCore import QItemSelection, QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelection,
+    QItemSelectionModel,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -22,6 +34,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLayout,
@@ -33,6 +46,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QTableView,
     QTextBrowser,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -101,6 +115,32 @@ class ElidedLabel(QLabel):
         self.setToolTip(self._full if shown != self._full else "")
 
 
+class FittingLabel(QLabel):
+    """A one-line label with a second, shorter wording: it shows the whole text while that fits and the short one when it does not
+    (the whole is then its tooltip), and never asks for more width than the short one. ``text()`` is the whole text."""
+
+    def __init__(self, text: str, short: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full, self._short = text, short
+        QLabel.setText(self, text)
+
+    def text(self) -> str:
+        return self._full
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.fontMetrics().horizontalAdvance(self._full), super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.fontMetrics().horizontalAdvance(self._short), super().minimumSizeHint().height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        shown = self._full if self.fontMetrics().horizontalAdvance(self._full) <= self.contentsRect().width() else self._short
+        if shown != QLabel.text(self):
+            QLabel.setText(self, shown)
+        self.setToolTip(self._full if shown != self._full else "")
+
+
 # ----------------------------------------------------------------------------- containers
 class _ScrollsUpAndDown(QScrollArea):
     """A scroll area that asks for the width its content needs (and the scroll bar), as a plain layout would: a bare QScrollArea
@@ -128,22 +168,56 @@ def _scroll_around(parent: QWidget, content: QWidget) -> QScrollArea:
     return area
 
 
+def set_badge(badge: QLabel, text: str, kind: str = "neutral") -> None:
+    """Show ``text`` as a small pill in the colour of ``kind`` (``neutral``, ``ok``, ``warn`` or ``bad``); no text hides it."""
+    badge.setText(text)
+    badge.setProperty("badge", kind)
+    badge.setVisible(bool(text))
+    repolish(badge)
+
+
+def make_badge(parent: QWidget | None = None) -> QLabel:
+    badge = QLabel(parent)
+    badge.setProperty("badge", "neutral")
+    badge.hide()  # until it has something to say
+    return badge
+
+
 class Card(QFrame):
     """A titled surface. Put the content in ``body``. With ``scrolls`` the content scrolls up and down when the card is too short
-    for it (large text on a small screen) instead of being squeezed over itself; when it fits, it looks as it does without."""
+    for it (large text on a small screen) instead of being squeezed over itself; when it fits, it looks as it does without.
+    With ``badge`` the title line ends in a small pill (``set_badge``): a count or a state, as "11 available" or "Scan completed".
+    With ``head`` the title line is a row of its own (``head``, a QHBoxLayout) to put a filter, a count or an action at its right.
+    ``dense`` is the engineering layout: less margin and space around and between the parts, the table gets the room.
+    ``short_title`` is a shorter wording for a card too narrow for the title beside its badge: the title stays on one line."""
 
-    def __init__(self, title: str = "", parent: QWidget | None = None, *, scrolls: bool = False) -> None:
+    def __init__(self, title: str = "", parent: QWidget | None = None, *, scrolls: bool = False, badge: bool = False,
+                 head: bool = False, dense: bool = False, short_title: str = "") -> None:
         super().__init__(parent)
         self.setObjectName("card")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 12, 14, 14)
-        outer.setSpacing(8)
-        self.title = QLabel(title, self)  # parented before it is shown: a parentless label shown here would open as a window
+        outer.setContentsMargins(*((12, 9, 12, 10) if dense else (14, 12, 14, 14)))
+        outer.setSpacing(6 if dense else 8)
+        # parented before it is shown: a parentless label shown here would open as a window
+        self.title = FittingLabel(title, short_title, self) if short_title else QLabel(title, self)
         self.title.setObjectName("cardTitle")
         self.title.setHidden(not title)
-        outer.addWidget(self.title)
+        self.badge: QLabel | None = None
+        self.head: QHBoxLayout | None = None
+        if badge or head:
+            if not short_title:
+                self.title.setWordWrap(True)  # a long title gives way to what is beside it instead of fixing a minimum width for the card
+            self.head = QHBoxLayout()
+            self.head.setSpacing(8)
+            self.head.addWidget(self.title, 1)
+            if badge:
+                self.badge = make_badge(self)
+                self.head.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignVCenter)
+            outer.addLayout(self.head)
+        else:
+            outer.addWidget(self.title)
         self.body = QVBoxLayout()
-        self.body.setSpacing(8)
+        self.body.setSpacing(6 if dense else 8)
         if not scrolls:
             outer.addLayout(self.body, 1)
             return
@@ -152,6 +226,96 @@ class Card(QFrame):
         self.body.setContentsMargins(0, 0, 0, 0)
         self.scroll_area = _scroll_around(self, inner)
         outer.addWidget(self.scroll_area, 1)
+
+    def set_badge(self, text: str, kind: str = "neutral") -> None:
+        if self.badge is not None:
+            set_badge(self.badge, text, kind)
+
+
+class CountTile(QFrame):
+    """The name of a result and how many items have it, tinted as the result is (PASS 4): ``kind`` is ok, warn or bad."""
+
+    def __init__(self, name: str, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("countTile")
+        self.setProperty("kind", kind)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 3, 10, 3)
+        self.name = QLabel(name, self)
+        self.count = QLabel("–", self)
+        self.count.setProperty("role", "count")
+        row.addWidget(self.name)
+        row.addStretch(1)
+        row.addWidget(self.count)
+
+    def set_count(self, count: int | None) -> None:
+        self.count.setText("–" if count is None else str(count))
+
+
+class ActionBox(QFrame):
+    """One of the next actions of a screen: what it does in a line (shortened, with the whole in its tooltip, when the box is
+    narrow), and its button. ``primary`` marks the one to take when in doubt. A short page hides the line (``set_compact``) and
+    keeps the title and the button."""
+
+    def __init__(self, title: str, description: str, button: QPushButton, *, primary: bool = False, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("actionBox")
+        self.setProperty("primary", primary)
+        self._row = row = QHBoxLayout(self)
+        row.setContentsMargins(14, 7, 12, 7)
+        row.setSpacing(12)
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        self.title = QLabel(title, self)
+        self.title.setProperty("role", "actionTitle")
+        self.description = ElidedLabel(description, "muted", self)
+        text.addWidget(self.title)
+        text.addWidget(self.description)
+        self.button = button
+        row.addLayout(text, 1)
+        row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def set_compact(self, compact: bool) -> None:
+        self.description.setVisible(not compact)
+        self._row.setContentsMargins(*((14, 4, 12, 4) if compact else (14, 7, 12, 7)))
+
+
+class NarrowPage(QWidget):
+    """A page that says when it has become narrower than ``below`` pixels (``narrow_changed``), so that its panels can share the
+    width differently: roomy while it is at least that wide."""
+
+    narrow_changed = Signal(bool)
+
+    def __init__(self, below: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._below = below
+        self.narrow = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        narrow = self.width() < self._below
+        if narrow != self.narrow:
+            self.narrow = narrow
+            self.narrow_changed.emit(narrow)
+
+
+class CompactPage(QWidget):
+    """A page that says when it has become too short for its roomy layout (``compact_changed``), so that its content can give up
+    the lines that only explain. Roomy while the page is at least ``below`` pixels tall."""
+
+    compact_changed = Signal(bool)
+
+    def __init__(self, below: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._below = below
+        self.compact = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        compact = self.height() < self._below
+        if compact != self.compact:
+            self.compact = compact
+            self.compact_changed.emit(compact)
 
 
 class ScrollTab(QWidget):
@@ -184,25 +348,77 @@ class WheelGuardedComboBox(QComboBox):
 
 class StepBar(QWidget):
     """Numbered steps side by side, painted in one go. A step is ``current`` (filled), ``complete`` (green), ``ready``
-    (outlined), ``warn`` (outlined in amber) or ``locked`` (grey; a click on it does nothing)."""
+    (outlined), ``warn`` (outlined in amber) or ``locked`` (grey; a click on it does nothing).
+
+    ``compact`` is the form of the design's breadcrumb row: small pills of the width of their title, one line high, that sit where
+    the layout puts them; the caption of a step is then its tooltip instead of a second line."""
 
     clicked = Signal(int)
+    PILL_HEIGHT = 30
+    PILL_GAP = 6.0
 
-    def __init__(self, titles: Sequence[str], palette: Palette, parent: QWidget | None = None) -> None:
+    def __init__(self, titles: Sequence[str], palette: Palette, parent: QWidget | None = None, *, compact: bool = False) -> None:
         super().__init__(parent)
         self._titles = [str(t) for t in titles]
         self._state = ["ready"] * len(self._titles)
         self._caption = [""] * len(self._titles)
         self._palette = palette
+        self._compact = compact
         self._focus = 0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(54)
+        if compact:
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            self.setFixedHeight(self.PILL_HEIGHT)
+        else:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setFixedHeight(54)
+
+    def _pill_widths(self) -> list[float]:
+        font = QFont(self.font())
+        font.setBold(True)
+        metrics = QFontMetricsF(font)
+        return [22 + metrics.horizontalAdvance(f"{i + 1:02d} {title}") + (14 if self._state[i] == "complete" else 0)
+                for i, title in enumerate(self._titles)]
+
+    def sizeHint(self) -> QSize:
+        if not self._compact:
+            return super().sizeHint()
+        widths = self._pill_widths()
+        return QSize(int(sum(widths) + self.PILL_GAP * (len(widths) - 1)) + 2, self.PILL_HEIGHT)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(min(320, self.sizeHint().width()), self.PILL_HEIGHT) if self._compact else super().minimumSizeHint()
+
+    def set_titles(self, titles: Sequence[str]) -> None:
+        titles = [str(title) for title in titles]
+        if titles != self._titles:
+            self._titles = titles
+            self._state, self._caption = ["ready"] * len(titles), [""] * len(titles)
+            self._focus = min(self._focus, max(0, len(titles) - 1))
+            self.updateGeometry()
+            self.update()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if self._compact and event.type() == QEvent.Type.FontChange:
+            self.updateGeometry()  # larger text: wider pills
+
+    def event(self, event) -> bool:
+        if self._compact and event.type() == QEvent.Type.ToolTip:
+            for index, cell in enumerate(self._cells()):
+                if cell.contains(event.pos().toPointF()) and self._caption[index]:
+                    QToolTip.showText(event.globalPos(), f"{self._titles[index]}: {self._caption[index]}", self)
+                    return True
+            QToolTip.hideText()
+            return True
+        return super().event(event)
 
     def set_step(self, index: int, state: str, caption: str) -> None:
         if (state, caption) != (self._state[index], self._caption[index]):
             self._state[index], self._caption[index] = state, caption
+            if self._compact:
+                self.updateGeometry()
             self.update()
 
     def state(self, index: int) -> str:
@@ -220,12 +436,27 @@ class StepBar(QWidget):
             self.clicked.emit(index)
 
     def _cells(self) -> list[QRectF]:
+        if self._compact:
+            widths = self._pill_widths()
+            room = max(0, self.width() - 2 - self.PILL_GAP * (len(widths) - 1))
+            if sum(widths) > room:
+                widths = [width * room / sum(widths) for width in widths]
+            x = max(0.0, self.width() - sum(widths) - self.PILL_GAP * (len(widths) - 1) - 2) + 1  # a wider bar keeps them at its right
+            cells = []
+            for width in widths:
+                cells.append(QRectF(x, 1, width, self.height() - 2))
+                x += width + self.PILL_GAP
+            return cells
         gap, count = 26.0, len(self._titles)
         width = (self.width() - 2 - gap * (count - 1)) / max(count, 1)
         return [QRectF(1 + i * (width + gap), 1, width, self.height() - 2) for i in range(count)]
 
     def _colors(self, state: str) -> dict[str, str]:
         p = self._palette
+        if self._compact:
+            return {"bg": p.pick if state == "current" else p.surface,
+                    "line": p.accent if state == "current" else p.line,
+                    "ink": p.accent if state == "current" else p.ok if state == "complete" else p.warn if state == "warn" else p.muted}
         return {
             "current": {"bg": p.accent, "line": p.accent, "ink": p.on_accent, "badge": p.on_accent, "badge_text": p.accent},
             "complete": {"bg": p.ok_bg, "line": p.ok_line, "ink": p.ok, "badge": p.ok, "badge_text": p.surface},
@@ -241,7 +472,8 @@ class StepBar(QWidget):
         symbol_font = QFont(title_font)
         symbol_font.setFamily(SYMBOL_FONT)  # the check mark is not in the interface font: name the font that has it
         title_font.setBold(True)
-        title_font.setPointSizeF(self.font().pointSizeF() + 1)
+        if not self._compact:
+            title_font.setPointSizeF(self.font().pointSizeF() + 1)
         caption_font.setPointSizeF(max(7.0, self.font().pointSizeF() - 0.5))
         for index, cell in enumerate(self._cells()):
             c = self._colors(self._state[index])
@@ -249,6 +481,9 @@ class StepBar(QWidget):
             focused = self.hasFocus() and index == self._focus
             painter.setPen(QPen(QColor(self._palette.fg if focused else c["line"]), 1.4))
             painter.drawRoundedRect(cell.adjusted(0.5, 0.5, -0.5, -0.5), 7, 7)
+            if self._compact:
+                self._paint_pill(painter, index, cell, c, title_font, symbol_font)
+                continue
             size = 28.0
             badge = QRectF(cell.left() + 12, cell.center().y() - size / 2, size, size)
             painter.setBrush(QColor(c["badge"]))
@@ -266,6 +501,19 @@ class StepBar(QWidget):
             painter.drawText(QRectF(left, cell.top() + 27, room, 18), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                              painter.fontMetrics().elidedText(self._caption[index], Qt.TextElideMode.ElideRight, int(room)))
         painter.end()
+
+    def _paint_pill(self, painter: QPainter, index: int, cell: QRectF, c: dict[str, str], title_font: QFont, symbol_font: QFont) -> None:
+        """V6's compact numbered label; completed steps retain their number and add a check."""
+        painter.setPen(QColor(c["ink"]))
+        left = cell.left() + 10
+        if self._state[index] == "complete":
+            painter.setFont(symbol_font)
+            painter.drawText(QRectF(left, cell.top(), 14, cell.height()), int(Qt.AlignmentFlag.AlignVCenter), "✓")
+            left += 14
+        painter.setFont(title_font)
+        room = max(0, int(cell.right() - left - 10))
+        text = painter.fontMetrics().elidedText(f"{index + 1:02d} {self._titles[index]}", Qt.TextElideMode.ElideRight, room)
+        painter.drawText(QRectF(left, cell.top(), room, cell.height()), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
 
     def mousePressEvent(self, event) -> None:
         for index, cell in enumerate(self._cells()):
@@ -351,35 +599,19 @@ class FlowLayout(QLayout):
         return y + line - rect.y()
 
 
-class ChipRow(QWidget):
-    """A row of small coloured notes: (kind, text) with kind ``ok``, ``warn``, ``bad`` or ``info``. It wraps when narrow and is
-    only rebuilt when the chips change."""
+class FlowRow(QWidget):
+    """Widgets side by side on one line while they fit, and on as many lines as they need when they do not (a heading and the note
+    that goes with it): the height follows the width."""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, *widgets: QWidget, spacing: int = 8, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._flow = FlowLayout(self)
-        self._chips: list[tuple[str, str]] = []
+        self._flow = FlowLayout(self, spacing)
+        for widget in widgets:
+            widget.setParent(self)
+            self._flow.addWidget(widget)
         sizing = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         sizing.setHeightForWidth(True)
         self.setSizePolicy(sizing)
-
-    def chips(self) -> list[tuple[str, str]]:
-        return list(self._chips)
-
-    def set_chips(self, chips: Sequence[tuple[str, str]]) -> None:
-        chips = [(kind, text) for kind, text in chips]
-        if chips == self._chips:
-            return
-        self._chips = chips
-        while self._flow.count():
-            item = self._flow.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        for kind, text in chips:
-            label = QLabel(text, self)
-            label.setProperty("chip", kind)
-            self._flow.addWidget(label)
-        self.updateGeometry()
 
     def hasHeightForWidth(self) -> bool:
         return True
@@ -388,7 +620,7 @@ class ChipRow(QWidget):
         return self._flow.heightForWidth(width)
 
     def minimumSizeHint(self) -> QSize:
-        return QSize(0, 26)
+        return QSize(0, self._flow.minimumSize().height())
 
 
 class ReadOnlyText(QTextBrowser):
@@ -436,19 +668,63 @@ class ReadOnlyText(QTextBrowser):
 
 
 # ----------------------------------------------------------------------------- tables
-def _style_table(view: QTableView) -> None:
+def _style_table(view: QTableView, row_height: int = ROW_HEIGHT) -> None:
     view.setShowGrid(False)
     view.setAlternatingRowColors(False)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     view.verticalHeader().hide()
-    view.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
+    view.verticalHeader().setDefaultSectionSize(row_height)
     view.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
     view.horizontalHeader().setHighlightSections(False)
     view.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.setFrameShape(QFrame.Shape.NoFrame)
+
+
+def _draw_row_line(painter: QPainter, option, palette: Palette) -> None:
+    """A thin line under a row, so that a long row of figures is followed across the table by eye."""
+    painter.save()
+    painter.setPen(QColor(palette.line))
+    y = option.rect.bottom()
+    painter.drawLine(option.rect.left(), y, option.rect.right(), y)
+    painter.restore()
+
+
+def elide_middle(metrics, text: str, width: float, head_share: float = 0.35) -> str:
+    """``text`` shortened to ``width`` pixels by an ellipsis in the middle, keeping more of the end than of the start: the names of
+    components differ near their end more often than at their start ("Aux With Load [3v8], Vin (No Load)" and "... Iin (No Load)")."""
+    if metrics.horizontalAdvance(text) <= width:
+        return text
+    ellipsis = "…"
+    room = width - metrics.horizontalAdvance(ellipsis)
+    if room <= 0:
+        return ellipsis
+    head_room = room * head_share
+    head = next((text[:n] for n in range(len(text), 0, -1) if metrics.horizontalAdvance(text[:n]) <= head_room), "")
+    tail = next((text[-n:] for n in range(len(text), 0, -1) if metrics.horizontalAdvance(text[-n:]) <= room - head_room), "")
+    return head + ellipsis + tail
+
+
+class _RowLines(QStyledItemDelegate):
+    """The usual painting of a cell, and the line under its row."""
+
+    def __init__(self, view: QTableView) -> None:
+        super().__init__(view)
+        self._view = view
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        if self._view.textElideMode() == Qt.TextElideMode.ElideMiddle and option.text and option.rect.width() > 0:
+            # the item view's own painting cuts a long name short at its end whatever the mode (it lays the words out first), so the
+            # text is shortened here, keeping both ends of it
+            margin = self._view.style().pixelMetric(QStyle.PixelMetric.PM_FocusFrameHMargin, None, self._view) + 1
+            option.text = elide_middle(option.fontMetrics, option.text, option.rect.width() - 2 * margin)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        super().paint(painter, option, index)
+        _draw_row_line(painter, option, self._view.palette_tokens)
 
 
 class _EmptyText:
@@ -470,13 +746,19 @@ class DataTable(QTableView):
     cellPressed = Signal(int, int, int)  # row, column and the x of the pointer inside the cell, for text with a part to click
     cellHover = Signal(int, int, int)
 
-    def __init__(self, palette: Palette, parent: QWidget | None = None) -> None:
+    def __init__(self, palette: Palette, parent: QWidget | None = None, *, row_height: int = ROW_HEIGHT, row_lines: bool = False,
+                 elide_middle: bool = False) -> None:
         super().__init__(parent)
         self.palette_tokens = palette
         self.table_model = TableModel(palette, self)
         self.setModel(self.table_model)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        _style_table(self)
+        _style_table(self, row_height)
+        if elide_middle:  # for a table of names: the end of a long name is what tells two of them apart
+            self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+            self.horizontalHeader().setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        if row_lines:
+            self.setItemDelegate(_RowLines(self))
         self.horizontalHeader().setStretchLastSection(False)
         self._empty_text = ""
         self._hint = _EmptyText()
@@ -586,36 +868,41 @@ class DataTable(QTableView):
 
 
 class _ButtonDelegate(QStyledItemDelegate):
-    """Paints the + or × at the end of a row; it grows a filled background while the pointer is over it."""
+    """Paints the + or × of a row; it grows a filled background while the pointer is over it."""
 
     SIZE = 24
 
-    def __init__(self, view: ActionTable) -> None:
+    def __init__(self, view: ActionTable, glyph: str) -> None:
         super().__init__(view)
         self._view = view
+        self._glyph = glyph  # "add" or "remove"
+        self._size = max(18, min(self.SIZE, view.row_height - 7))  # a button never fills a short row to its edges
 
     def paint(self, painter: QPainter, option, index) -> None:
         super().paint(painter, option, index)  # the row background / selection
         p = self._view.palette_tokens
+        if self._view.row_lines:
+            _draw_row_line(painter, option, p)
+        kind = self._glyph
+        quiet = kind == "remove"  # grey until the pointer is over it; the + is in the accent colour
         hot = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        add = self._view.kind == "add"
-        box = QRect(0, 0, self.SIZE, self.SIZE)
+        box = QRect(0, 0, self._size, self._size)
         box.moveCenter(option.rect.center())
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if hot:
-            painter.setBrush(QColor(p.accent if add else p.danger))
+            painter.setBrush(QColor(p.danger if quiet else p.accent))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(QRectF(box), 6, 6)
-            glyph = QColor(p.on_accent if add else p.surface)
+            glyph = QColor(p.surface if quiet else p.on_accent)
         else:
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(p.accent if add else p.muted), 1))
+            painter.setPen(QPen(QColor(p.muted if quiet else p.accent), 1))
             painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
-            glyph = QColor(p.accent if add else p.muted)
+            glyph = QColor(p.muted if quiet else p.accent)
         painter.setPen(QPen(glyph, 1.6))
         c, r = QPointF(box.center()) + QPointF(0.5, 0.5), 5.0
-        if add:
+        if kind == "add":
             painter.drawLine(QPointF(c.x() - r, c.y()), QPointF(c.x() + r, c.y()))
             painter.drawLine(QPointF(c.x(), c.y() - r), QPointF(c.x(), c.y() + r))
         else:
@@ -624,37 +911,47 @@ class _ButtonDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index) -> QSize:
-        return QSize(44, ROW_HEIGHT)
+        return QSize(44, self._view.row_height)
 
 
 class ActionTable(QTableView):
     """A multi-select list of names with one button at the end of each row (``kind`` is ``"add"`` or ``"remove"``).
 
-    Optional columns: the row number and right-aligned values with headings (Min, Max). A click on a button emits
-    ``action(row)``; double-click or Enter emits ``activated_rows`` for the selected rows; Delete emits ``delete_pressed``.
-    Qt reports a double-click on a button as a single click, so it never acts on two rows, and two quick clicks on
-    different rows both count (a time-based guard would swallow the second).
+    Optional columns: the row number and right-aligned values with headings (Min, Max). With ``reorder``, Alt+↑ / Alt+↓ move the
+    highlighted rows (``move_keys(direction)``). A click on a button emits ``action(row)``; double-click or Enter emits
+    ``activated_rows`` for the selected rows; Delete emits ``delete_pressed``. Qt reports a double-click on a button as a single
+    click, so it never acts on two rows, and two quick clicks on different rows both count (a time-based guard would swallow the
+    second). ``show_header`` False leaves the heading strip out (a list of names needs none).
     """
 
     action = Signal(int)
+    move_keys = Signal(int)
     activated_rows = Signal(list)
     delete_pressed = Signal()
 
     def __init__(self, palette: Palette, *, kind: str, name_heading: str, numbered: bool = False,
-                 value_headings: Sequence[str] = (), parent: QWidget | None = None) -> None:
+                 value_headings: Sequence[str] = (), parent: QWidget | None = None, row_height: int = ROW_HEIGHT,
+                 row_lines: bool = False, reorder: bool = False, show_header: bool = True) -> None:
         super().__init__(parent)
         if kind not in ("add", "remove"):
             raise ValueError(f"unknown kind {kind!r}")
         self.kind, self.palette_tokens, self._numbered = kind, palette, numbered
+        self.row_height, self.row_lines = row_height, row_lines
+        self._reorder = reorder
         self._headings = ([" No."] if numbered else []) + [name_heading, *value_headings, ""]
         self._aligns = (["center"] if numbered else []) + ["w", *["e"] * len(value_headings), "center"]
         self.table_model = TableModel(palette, self)
         self.setModel(self.table_model)
         self.table_model.set_table(self._headings, [], aligns=self._aligns)
         self._button_column = len(self._headings) - 1
-        self.setItemDelegateForColumn(self._button_column, _ButtonDelegate(self))
+        self.setItemDelegateForColumn(self._button_column, _ButtonDelegate(self, kind))
+        if row_lines:
+            for column in range(self._button_column):
+                self.setItemDelegateForColumn(column, _RowLines(self))
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        _style_table(self)
+        _style_table(self, row_height)
+        self.horizontalHeader().setVisible(show_header)
+        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)  # names that differ at their end ("… Vin (No Load)", "… Iin (No Load)") stay apart
         self.setMouseTracking(True)
         self._empty_text, self._hint = "", _EmptyText()
         self.clicked.connect(self._clicked)
@@ -709,16 +1006,17 @@ class ActionTable(QTableView):
         self.viewport().update()
 
     def _clicked(self, index) -> None:
-        if index.column() != self._button_column:
-            return
-        self.action.emit(index.row())
+        if index.column() == self._button_column:
+            self.action.emit(index.row())
 
     def _double_clicked(self, index) -> None:
         if index.column() != self._button_column:
             self.activated_rows.emit(self.selected_rows())
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        if self._reorder and event.modifiers() & Qt.KeyboardModifier.AltModifier and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self.move_keys.emit(-1 if event.key() == Qt.Key.Key_Up else 1)
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.activated_rows.emit(self.selected_rows())
         elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_pressed.emit()
@@ -743,8 +1041,9 @@ class ChartPanel(QWidget):
     CELL_HEIGHT = 300
     MIN_HEIGHT = 210
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, cell_height: int = CELL_HEIGHT) -> None:
         super().__init__(parent)
+        self._cell_height = cell_height
         self._specs: list[ChartSpec] = []
         self._cache: dict[tuple, list] = {}
         self._x_scale: str | None = None
@@ -773,7 +1072,7 @@ class ChartPanel(QWidget):
         columns = self._columns()
         cell_w = max(240.0, self.width() / CHART_SCALE / columns)
         rows = math.ceil(len(self._specs) / columns) if self._specs else 0
-        base = max(self.MIN_HEIGHT / CHART_SCALE, self.CELL_HEIGHT / CHART_SCALE)
+        base = max(self.MIN_HEIGHT / CHART_SCALE, self._cell_height / CHART_SCALE)
         heights = []
         for row in range(rows):
             extra = max((agreement_extra_height(spec, cell_w - 8, base - 6) for spec in self._specs[row * columns:(row + 1) * columns]),
@@ -861,5 +1160,5 @@ def _paint_text(painter: QPainter, x: float, y: float, style: dict, colour: QCol
     painter.restore()
 
 
-__all__ = ["ActionTable", "Card", "ChartPanel", "ChipRow", "DataTable", "FlowLayout", "ReadOnlyText", "StepBar", "make_button",
+__all__ = ["ActionTable", "Card", "ChartPanel", "DataTable", "FlowLayout", "ReadOnlyText", "StepBar", "make_button",
            "paint_primitives", "repolish"]

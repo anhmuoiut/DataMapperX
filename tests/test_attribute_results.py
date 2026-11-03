@@ -241,10 +241,13 @@ def test_attribute_agreement_has_its_two_agreement_panels_and_nothing_of_another
 
 
 # ----------------------------------------------------------------------------- the release switches (what the window shows is tested in tests/ui)
-def test_attribute_agreement_stays_blocked_until_released_but_can_be_checked_on_purpose(monkeypatch):
+def test_attribute_agreement_is_released_and_the_flags_still_gate_it_when_they_are_off(monkeypatch):
     for name in (workspace.ATTRIBUTE_PREVIEW_ENV, workspace.ATTRIBUTE_REPORTS_ENV):
         monkeypatch.delenv(name, raising=False)
-    assert workspace.ATTRIBUTE_RESULTS_READY is False and workspace.ATTRIBUTE_REPORTS_READY is False  # the readiness flags stay off
+    assert workspace.ATTRIBUTE_RESULTS_READY is True and workspace.ATTRIBUTE_REPORTS_READY is True  # as the program is shipped
+    assert workspace.attribute_runnable() and workspace.attribute_reportable()
+    monkeypatch.setattr(workspace, "ATTRIBUTE_RESULTS_READY", False)  # withheld again: the gates still hold it back
+    monkeypatch.setattr(workspace, "ATTRIBUTE_REPORTS_READY", False)
     assert not workspace.attribute_runnable() and "cannot be run yet" in workspace.ATTRIBUTE_PENDING
     assert not workspace.attribute_reportable() and "not available yet" in workspace.ATTRIBUTE_REPORT_PENDING
     monkeypatch.setenv(workspace.ATTRIBUTE_PREVIEW_ENV, "1")

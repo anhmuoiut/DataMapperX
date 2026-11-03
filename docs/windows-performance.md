@@ -1,5 +1,7 @@
 # Windows performance of the Qt window
 
+**A snapshot at commit `aeee0fd`.** The V6 Dashboard and the Mapping and Review redesign that followed were not measured again.
+
 Measured on the development machine (Windows 11 Enterprise, Python 3.13, PySide6 6.12, project folder on OneDrive), never on a
 Mac. "From source" is `python main.py`; "packaged" is the exe `tools\build.ps1` builds. Times are to the first paint of the
 window (from source: after the imports, before the interpreter starts, about 30 ms; packaged: from launching the exe until a

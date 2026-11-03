@@ -13,7 +13,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from datamapperx.config import DATA_DIR_ENV
 from datamapperx.settings import Settings
@@ -57,3 +57,35 @@ def window(app, monkeypatch, tmp_path):
     win.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # processEvents() alone does not delete it: every
     app.processEvents()  # later theme change would re-style the windows of all earlier tests as well
+
+
+class Picks:
+    """What the person picks in the file dialogs of the operating system next ("" cancels)."""
+
+    def __init__(self) -> None:
+        self.open = self.save = ""
+
+
+@pytest.fixture
+def picks(monkeypatch):
+    chosen = Picks()
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (chosen.open, "")))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (chosen.save, "")))
+    return chosen
+
+
+@pytest.fixture
+def dialogs(monkeypatch):
+    """Every Analyze by Excel File dialog the Dashboard opens, in order (a closed one is deleted a moment later, so the last one made
+    is the one to use)."""
+    from datamapperx.ui.excel_analysis_dialog import ExcelAnalysisDialog
+
+    made = []
+    original = ExcelAnalysisDialog.present
+
+    def present(self) -> None:
+        made.append(self)
+        original(self)
+
+    monkeypatch.setattr(ExcelAnalysisDialog, "present", present)
+    return made

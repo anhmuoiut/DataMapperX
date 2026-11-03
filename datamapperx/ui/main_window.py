@@ -1,4 +1,5 @@
-"""The main DataMapperX window: Data Mapping (Select, then Review & Export) and, beside it, Validation & Reports.
+"""The main DataMapperX window. It opens on the Dashboard, whose two cards lead into Data Mapping (Select, then Review Data) and
+Validation & Reports (with a RawData.xlsx imported); a button in the navigation leads back, and nothing is cleared by moving between them.
 
 What each list, table, chip and note says is decided in ``datamapperx.workflow``; scanning, exporting, statistics and
 settings are the application's own modules. This file is layout, signals, the busy state, and the checks that run behind
@@ -20,12 +21,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,18 +46,16 @@ from .._version import __version__
 from ..config import APP_CREDIT, APP_TITLE, DEFAULT_OUTPUT_FILE
 from ..exporter import ExportRow, summarize_limits
 from ..models import ScanResult
+from ..palette import DARK
 from ..paths import is_frozen, log_path, resource_path, user_data_dir
 from ..profiles import get_profile_extensions, load_profiles
 from ..reporting import describe_empty_scan, full_report, summarize_scan
-from ..review import ReviewSummary, summarize_review
 from ..scanner import scan_folder
 from ..settings import Settings, load_settings, save_settings
 from ..utils import parse_positive_int
 from ..workflow import (
-    NO_ROW_CHOSEN_TEXT,
     SELECTED_EMPTY_TEXT,
     available_view,
-    check_chips,
     limit_overview,
     limit_panel,
     limit_texts,
@@ -64,20 +63,27 @@ from ..workflow import (
     preview_table,
     selected_info,
 )
+from .dashboard import DashboardPage
 from .dialogs import AboutDialog, ExportDoneDialog, GrrCriteriaDialog, ReportDialog, label, open_path
 from .duplicate_dialog import DuplicateDialog
+from .pcb_background import PcbBackground
 from .tasks import TaskRunner
-from .theme import apply_theme, resolve_mode
+from .theme import apply_theme, make_palette, resolve_mode, stylesheet
 from .widgets import (
     ActionTable,
     Card,
-    ChipRow,
+    CompactPage,
+    CountTile,
     DataTable,
     ElidedLabel,
+    FlowRow,
+    NarrowPage,
     StepBar,
     WheelGuardedComboBox,
+    make_badge,
     make_button,
     repolish,
+    set_badge,
 )
 
 if TYPE_CHECKING:
@@ -94,12 +100,25 @@ SHORTCUTS = (
     ("Ctrl+O", "Choose the source folder"),
     ("Ctrl+Enter  /  F5", "Scan logs"),
     ("Esc", "Cancel a running scan"),
-    ("Ctrl+E", "Go to Review & Export, then export to Excel"),
+    ("Ctrl+E", "Go to Review Data, then export RawData.xlsx"),
     ("Double-click / Enter", "Add or remove the highlighted component"),
     ("Ctrl+A", "Select every component in a list"),
     ("Delete", "Remove the highlighted selected components"),
+    ("Alt+Up  /  Alt+Down", "Move the highlighted selected components up or down"),
 )
 VERDICT_CHIPS = {"ok": "ok", "warn": "warn", "bad": "bad"}
+ACTION_ROW_HEIGHT = 30  # the rows of the Available and Selected lists: a little taller than a data table's (28), for the + and ×
+REVIEW_ROW_HEIGHT = 28  # and of the short tables beside the data of the Review: as a data table's
+QUALITY_MIN_WIDTH = 430  # the Pre-check card never gets narrower, so its table has no sideways scroll bar (the design: 410)
+GRR_NAME_WIDTH = 230  # the widest the Test column of the Pre-check gets: a longer name is cut short (its tooltip has it all)
+REVIEW_COMPACT_BELOW = 480  # page height, in pixels, under which the Review gives up the lines that only explain (the smallest
+#                             window, 680 tall, leaves it about 530: still roomy; only a screen smaller than that is not)
+VALUE_FILTER_TIP = "Show only components with numeric MIN and MAX limits."
+MAPPING_NARROW_BELOW = 1150  # page widths under which the lists get more of the width and Source keeps only what it needs
+MAPPING_STRETCH = (27, 68, 35)  # Source : Available : Selected, the design's 270 : 680 : 350
+MAPPING_STRETCH_NARROW = (24, 56, 40)  # the Selected list has its number, ↑ ↓ and × beside every name: it needs more of a narrow page
+DASHBOARD_STATUS = "Choose a starting point."
+PCB_ANIMATED = True  # the circuit board the Dashboard stands on: False leaves it still, drawn once, with nothing running
 
 
 def parse_geometry(text: str) -> tuple[int, int, int, int] | None:
@@ -124,8 +143,11 @@ class MainWindow(QMainWindow):
         self.reviewed_duplicates: set[str] = set()
         self.is_busy = False
         self.step = "select"  # "select" or "review"
-        self.workspace = "mapping"  # "mapping" (the two steps) or "validation"
+        self.workspace = "dashboard"  # where the program opens; "mapping" (the two steps) or "validation" once a workflow is chosen
+        self.workflow_route = "logs"
+        self._analysis_after_mapping = False
         self.validation = None  # built the first time it is opened
+        self._excel_state = None  # what the Analyze by Excel File dialog was left with (an ExcelState), once it has been opened
         self.access_dialog: AccessDialog | None = None
         self._cancel = threading.Event()
         self._data_serial = 0  # moves whenever the scanned data (or the choice among duplicates) changes
@@ -135,9 +157,8 @@ class MainWindow(QMainWindow):
         self._preview_page = 0
         self._preview_rows: list[ExportRow] = []
         self._preview_components: tuple[str, ...] = ()
-        self._summary: ReviewSummary | None = None
-        self._summary_key: tuple | None = None
         self._grr_results: list[GrrResult] = []
+        self._grr_note = False  # whether the Pre-check has a note on the test it shows
         self._grr_key: tuple | None = None
         self._pending: dict[str, tuple] = {}  # what the background is working out for the Review, and for which data
         self.grr_criteria = None  # read with the review page, which is the only place that uses it
@@ -158,11 +179,13 @@ class MainWindow(QMainWindow):
         root.setSpacing(6)
         root.addWidget(self._build_header())
         root.addWidget(self._build_banner())
-        root.addLayout(self._build_nav())
+        root.addWidget(self._build_nav())
         self.content = QStackedWidget()
         root.addWidget(self.content, 1)
         self.setCentralWidget(central)
         self._build_status_bar()
+        self._chrome_dark = False  # see _update_canvas
+        self.canvas = PcbBackground(self, bands=self._canvas_bands, animated=PCB_ANIMATED)
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_review)
@@ -170,6 +193,7 @@ class MainWindow(QMainWindow):
         self._recheck_timer.setSingleShot(True)
         self._recheck_timer.timeout.connect(self._recheck_access)
 
+        self._ensure_page("dashboard")  # first, so that it is the page on show; Data Mapping is built behind it, as it always was
         self._ensure_page("select")
         self._bind_shortcuts()
         self._restore_inputs()
@@ -177,6 +201,9 @@ class MainWindow(QMainWindow):
         self._update_profile_hint()
         self._refresh_lists()
         self._update_switch()
+        self.nav_bar.hide()  # the Dashboard has no navigation of its own: its two cards are the way in
+        self.set_status(DASHBOARD_STATUS)
+        self._update_canvas()
         self.search.textChanged.connect(lambda _text: self._refresh_available(reset_view=True))
         self.repeats_edit.textChanged.connect(lambda _text: (self._schedule_preview(), self._notify_validation()))
 
@@ -277,7 +304,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================== layout
     def _build_header(self) -> QWidget:
-        header = QWidget()
+        self.header = header = QWidget()
         row = QHBoxLayout(header)
         row.setContentsMargins(2, 4, 2, 0)
         left = QHBoxLayout()
@@ -347,7 +374,7 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
 
     def _update_brand_logo(self) -> None:
-        pixmap = self._brand.get(self.palette_tokens.mode)
+        pixmap = self._brand.get("dark" if self.workspace == "dashboard" else self.palette_tokens.mode)  # the Dashboard is dark
         self.brand_logo.setVisible(pixmap is not None)
         if pixmap is not None:
             self.brand_logo.setPixmap(pixmap)
@@ -367,17 +394,26 @@ class MainWindow(QMainWindow):
         self.banner.hide()
         return self.banner
 
-    def _build_nav(self) -> QHBoxLayout:
-        nav = QHBoxLayout()
-        nav.setSpacing(14)
+    def _build_nav(self) -> QWidget:
+        self.nav_bar = QWidget()
+        nav = QHBoxLayout(self.nav_bar)
+        nav.setContentsMargins(0, 0, 0, 0)
+        nav.setSpacing(8)
+        self.home_button = make_button("⌂  Dashboard", lambda: self._show_workspace("dashboard"))
+        self.home_button.setProperty("glyphs", True)  # the house is not in the interface font
+        self.home_button.setToolTip("Back to the Dashboard. Your scan, your data and your results stay as they are.")
         self.mapping_switch = make_button("Data Mapping", lambda: self._show_workspace("mapping"))
         self.validation_switch = make_button("Validation & Reports", lambda: self._show_workspace("validation"))
-        nav.addWidget(self.mapping_switch)
-        nav.addWidget(self.validation_switch)
-        self.step_bar = StepBar(("Select", "Review & Export"), self.palette_tokens)
+        nav.addWidget(self.home_button)
+        for button in (self.mapping_switch, self.validation_switch):
+            button.setParent(self.nav_bar)
+            button.hide()  # compatibility handles; the V6 workflow steps are the visible navigation
+        self.workflow_breadcrumb = ElidedLabel("Map test logs", "muted")
+        nav.addWidget(self.workflow_breadcrumb, 1)
+        self.step_bar = StepBar(("Mapping", "Review & Pre-check", "Analyze", "Results", "Report"), self.palette_tokens, compact=True)
         self.step_bar.clicked.connect(self._on_step_clicked)
-        nav.addWidget(self.step_bar, 1)
-        return nav
+        nav.addWidget(self.step_bar)
+        return self.nav_bar
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
@@ -396,7 +432,8 @@ class MainWindow(QMainWindow):
     def _ensure_page(self, name: str) -> QWidget:
         page = self._pages.get(name)
         if page is None:
-            page = {"select": self._build_select, "review": self._build_review, "validation": self._build_validation}[name]()
+            page = {"dashboard": self._build_dashboard, "select": self._build_select, "review": self._build_review,
+                    "validation": self._build_validation}[name]()
             self._pages[name] = page
             self.content.addWidget(page)
         return page
@@ -406,60 +443,122 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self, lambda: self._ensure_page("review"))  # the window is the timers' context: if it is closed and
         QTimer.singleShot(120, self, lambda: self._ensure_page("validation"))  # deleted first, they never run on what is left
 
+    def _build_dashboard(self) -> QWidget:
+        self.dashboard = DashboardPage(self.palette_tokens)
+        self.dashboard.map_requested.connect(self.start_mapping)
+        self.dashboard.rawdata_requested.connect(self.start_excel_analysis)
+        return self.dashboard
+
+    @staticmethod
+    def _page_header(title: str) -> tuple[QWidget, QHBoxLayout]:
+        """One line: the title of a screen, and at the right its state and its way back."""
+        header = QWidget()
+        row = QHBoxLayout(header)
+        row.setContentsMargins(2, 0, 2, 0)
+        row.setSpacing(12)
+        row.addWidget(label(title, "pageTitle"))
+        row.addStretch(1)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        row.addLayout(actions)
+        row.setAlignment(actions, Qt.AlignmentFlag.AlignVCenter)  # a badge is a pill, not as tall as the title beside it
+        return header, actions
+
     def _build_select(self) -> QWidget:
-        page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 6)
-        layout.setSpacing(12)
-        layout.addWidget(self._build_source(), 2)
-        layout.addWidget(self._build_available(), 4)
-        layout.addWidget(self._build_selected(), 3)
+        page = NarrowPage(MAPPING_NARROW_BELOW)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 4)
+        outer.setSpacing(6)
+        header, actions = self._page_header("Select measurements")
+        self.scan_badge = make_badge()
+        actions.addWidget(self.scan_badge)
+        outer.addWidget(header)
+        layout = QHBoxLayout()
+        layout.setSpacing(10)
+        layout.addWidget(self._build_source(), MAPPING_STRETCH[0])  # the proportions of the design, about 270 : 680 : 350 pixels at 1360
+        layout.addWidget(self._build_available(), MAPPING_STRETCH[1])
+        layout.addWidget(self._build_selected(), MAPPING_STRETCH[2])
+        outer.addLayout(layout, 1)
+
+        def share(narrow: bool) -> None:
+            for index, factor in enumerate(MAPPING_STRETCH_NARROW if narrow else MAPPING_STRETCH):
+                layout.setStretch(index, factor)
+
+        page.narrow_changed.connect(share)
         self._busy_widgets += [self.manage_button, self.browse_button, self.scan_button, self.reset_button, self.expected_edit,
-                               self.repeats_edit, self.folder_edit, self.search, self.profile_box]
+                               self.repeats_edit, self.folder_edit, self.search, self.value_filter, self.profile_box]
+        height = max(button.sizeHint().height() for button in (self.add_all_button, self.add_button, self.review_button))
+        for button in (self.add_all_button, self.add_button, self.review_button):
+            button.setMinimumHeight(height)  # the filled button is taller than the others: the two footers are one height, and level
+        self._update_scan_badge()
         return page
 
+    def _update_scan_badge(self) -> None:
+        """What the scan found, in a word, beside the title of the screen."""
+        result = self.scan_result
+        if result is None:
+            set_badge(self.scan_badge, "No scan yet")
+        elif not result.grouped:
+            set_badge(self.scan_badge, "No usable data", "bad")
+        elif result.cancelled:
+            set_badge(self.scan_badge, "Scan cancelled", "warn")
+        else:
+            set_badge(self.scan_badge, "Scan completed", "ok")
+
     def _build_source(self) -> Card:
-        card = Card("01  Source", scrolls=True)  # with large text on a small screen it scrolls instead of overlapping
+        card = Card("01 · Source", scrolls=True, dense=True)  # with large text on a small screen it scrolls instead of overlapping
+        profile = QVBoxLayout()  # a caption sits close above what it names: the pairs read as pairs, the card's gaps separate them
+        profile.setSpacing(3)
         head = QHBoxLayout()
         head.addWidget(label("Log profile"), 1)
         self.manage_button = make_button("Manage…", self.manage_profiles)
         head.addWidget(self.manage_button)
-        card.body.addLayout(head)
+        profile.addLayout(head)
         self.profile_box = WheelGuardedComboBox()
         self.profile_box.addItems(list(self.profiles))
         self.profile_box.activated.connect(lambda _index: self._on_profile_changed())
-        card.body.addWidget(self.profile_box)
-        self.hint_label = label("", "muted", wrap=True)
-        card.body.addWidget(self.hint_label)
-        card.body.addWidget(label("Source folder"))
-        folder = QHBoxLayout()
+        profile.addWidget(self.profile_box)
+        card.body.addLayout(profile)
+        folder = QVBoxLayout()
+        folder.setSpacing(3)
+        folder.addWidget(label("Source folder"))
+        row = QHBoxLayout()
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText("Folder that holds the logs")
         self.folder_edit.returnPressed.connect(self.scan_logs)
         self.browse_button = make_button("Browse…", self.pick_folder)
-        folder.addWidget(self.folder_edit, 1)
-        folder.addWidget(self.browse_button)
+        row.addWidget(self.folder_edit, 1)
+        row.addWidget(self.browse_button)
+        folder.addLayout(row)
         card.body.addLayout(folder)
-        counts = QGridLayout()
-        counts.setHorizontalSpacing(8)
+        counts = QHBoxLayout()  # Expected samples and Files per sample side by side
+        counts.setSpacing(8)
         self.expected_edit, self.repeats_edit = QLineEdit(), QLineEdit()
-        counts.addWidget(label("Expected samples", "muted"), 0, 0)
-        counts.addWidget(label("Files per sample", "muted"), 0, 1)
-        counts.addWidget(self.expected_edit, 1, 0)
-        counts.addWidget(self.repeats_edit, 1, 1)
+        for caption, edit in (("Expected samples", self.expected_edit), ("Files per sample", self.repeats_edit)):
+            pair = QVBoxLayout()
+            pair.setSpacing(3)
+            pair.addWidget(label(caption, "muted"))
+            pair.addWidget(edit)
+            counts.addLayout(pair, 1)
         card.body.addLayout(counts)
 
         self.scan_button = make_button("Scan logs", self.scan_logs, primary=True)
         self.cancel_button = make_button("Cancel", self._cancel_scan)
         self.cancel_button.setEnabled(False)
         self.reset_button = make_button("Reset", self.reset_workflow)
-        card.body.addWidget(self.scan_button)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.cancel_button, 1)
-        buttons.addWidget(self.reset_button, 1)
+        for button in (self.cancel_button, self.reset_button):
+            button.setMinimumWidth(58)  # a style's 80-pixel minimum would make the Source column wider than it needs to be
+        buttons = QHBoxLayout()  # the scan and what belongs to it on one row
+        buttons.setSpacing(6)
+        buttons.addWidget(self.scan_button, 3)
+        buttons.addWidget(self.cancel_button, 2)
+        buttons.addWidget(self.reset_button, 2)
         card.body.addLayout(buttons)
 
-        tiles = QHBoxLayout()
+        strip = QFrame()  # the three figures of the scan on one quiet strip
+        strip.setObjectName("metricStrip")
+        tiles = QHBoxLayout(strip)
+        tiles.setContentsMargins(10, 5, 10, 5)
         self.samples_value, self.files_value, self.components_value = (label("–", "metric") for _ in range(3))
         for value, caption in ((self.samples_value, "Samples"), (self.files_value, "Files"), (self.components_value, "Fields")):
             tile = QVBoxLayout()
@@ -467,169 +566,251 @@ class MainWindow(QMainWindow):
             tile.addWidget(value)
             tile.addWidget(label(caption, "muted"))
             tiles.addLayout(tile)
-        card.body.addLayout(tiles)
+        card.body.addWidget(strip)
         self.verdict = label("No scan yet.", "muted", wrap=True)
         card.body.addWidget(self.verdict)
         self.details_button = make_button("View scan details", self._show_scan_details)
         self.details_button.setEnabled(False)
         card.body.addWidget(self.details_button)
         card.body.addStretch(1)
-        self.version_label = label(f"Version {__version__}  ·  {APP_CREDIT}", "muted")
+        self.version_label = ElidedLabel(f"Version {__version__}  ·  {APP_CREDIT}", "muted")  # never what fixes the column's width
         card.body.addWidget(self.version_label)
         return card
 
     def _build_available(self) -> Card:
-        card = Card("02  Available components")
+        """The title and the Value filter on one line; the search; the table; and the count with the ways to add under it."""
+        card = Card("02 · Available Measurements", head=True, dense=True, short_title="02 · Available")
+        self.value_filter = QCheckBox("Value")  # a display filter only: it changes what is listed, never what is selected
+        self.value_filter.setToolTip(VALUE_FILTER_TIP)
+        self._style_value_filter()
+        self.value_filter.toggled.connect(lambda _on: self._refresh_available(reset_view=True))
+        self.available_info = label("", "muted")  # "39 available", or "3 of 39 shown" while filtering
+        card.head.addWidget(self.value_filter, 0, Qt.AlignmentFlag.AlignVCenter)
+        card.head.setSpacing(6)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search components…")
+        self.search.setPlaceholderText("Search measurements…")
         self.search.setClearButtonEnabled(True)
-        self.available_list = ActionTable(self.palette_tokens, kind="add", name_heading="Component", value_headings=("Min", "Max"))
+        self.available_list = ActionTable(self.palette_tokens, kind="add", name_heading="Component", value_headings=("Min", "Max"),
+                                          row_height=ACTION_ROW_HEIGHT, row_lines=True)
         self.available_list.action.connect(self._add_at)
         self.available_list.activated_rows.connect(lambda _rows: self.add_components())
         self.available_list.selectionModel().selectionChanged.connect(lambda *_: self._update_actions())
-        self.available_info = label("", "muted")
         self.add_all_button = make_button("Add all shown", self.add_all_shown)
         self.add_button = make_button("Add →", self.add_components)
         card.body.addWidget(self.search)
         card.body.addWidget(self.available_list, 1)
-        card.body.addWidget(self.available_info)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.add_all_button, 1)
-        buttons.addWidget(self.add_button, 1)
-        card.body.addLayout(buttons)
+        footer = QHBoxLayout()  # level with the Selected panel's: its count, ↑ ↓ and the way on
+        footer.setSpacing(6)
+        footer.addWidget(self.available_info)
+        footer.addStretch(1)
+        footer.addWidget(self.add_all_button)
+        footer.addWidget(self.add_button)
+        card.body.addLayout(footer)
         return card
 
     def _build_selected(self) -> Card:
-        card = Card("Selected for export")
-        card.body.addWidget(label("Top to bottom = Excel column order", "muted"))
-        self.selected_list = ActionTable(self.palette_tokens, kind="remove", name_heading="Component", numbered=True)
+        """The title; Clear selection, level with the search of the list beside it; the names, each with its number and ×; and under
+        them the count, one ↑ ↓ pair for the highlighted row, and the way on."""
+        card = Card("03 · Selected Measurements", dense=True, short_title="03 · Selected")
+        card.title.setMinimumHeight(self.value_filter.sizeHint().height())  # as tall as the Available title line: the two titles are level
+        self.selected_list = ActionTable(self.palette_tokens, kind="remove", name_heading="Component", numbered=True,
+                                         row_height=ACTION_ROW_HEIGHT, row_lines=True, reorder=True, show_header=False)
         self.selected_list.action.connect(self._remove_at)
+        self.selected_list.move_keys.connect(self.move_selected)  # Alt+Up / Alt+Down: the same as ↑ ↓ below the list
         self.selected_list.activated_rows.connect(lambda _rows: self.remove_components())
         self.selected_list.delete_pressed.connect(self.remove_components)
         self.selected_list.selectionModel().selectionChanged.connect(lambda *_: self._update_actions())
-        self.selected_info = label("", "muted")
+        self.selected_info = ElidedLabel("", "muted")  # "6 selected"; it gives way to the buttons beside it in a narrow window
         self.move_up_button = make_button("↑", lambda: self.move_selected(-1))
         self.move_down_button = make_button("↓", lambda: self.move_selected(1))
-        for button in (self.move_up_button, self.move_down_button):
-            button.setFixedWidth(40)
-        self.clear_button = make_button("Clear", self.clear_selected)
-        self.review_button = make_button("Review & Export  →", lambda: self._show_step("review"), primary=True)
+        for button, name in ((self.move_up_button, "up"), (self.move_down_button, "down")):
+            button.setFixedWidth(32)
+            button.setToolTip(f"Move the highlighted measurement {name}")
+            button.setAccessibleName(f"Move {name}")
+        self.clear_button = make_button("Clear selection", self.clear_selected)
+        self.review_button = make_button("Review Data  →", lambda: self._show_step("review"), primary=True)
+        self.selected_list.viewport().setToolTip("Order here is the column order of RawData.xlsx.")
+        slot = QWidget()  # as tall as the search above the list beside it, so that the two lists start level
+        slot_row = QHBoxLayout(slot)
+        slot_row.setContentsMargins(0, 0, 0, 0)
+        slot_row.addStretch(1)
+        slot_row.addWidget(self.clear_button)
+        slot.setMinimumHeight(self.search.sizeHint().height())
+        card.body.addWidget(slot)
         card.body.addWidget(self.selected_list, 1)
-        card.body.addWidget(self.selected_info)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.move_up_button)
-        buttons.addWidget(self.move_down_button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.clear_button)
-        card.body.addLayout(buttons)
-        card.body.addWidget(self.review_button)
+        footer = QHBoxLayout()  # level with the footer of the Available list
+        footer.setSpacing(6)
+        footer.addWidget(self.selected_info)
+        footer.addWidget(self.move_up_button)
+        footer.addWidget(self.move_down_button)
+        footer.addStretch(1)
+        footer.addWidget(self.review_button)
+        card.body.addLayout(footer)
         return card
 
     def _build_review(self) -> QWidget:
-        """Step 2: the data as it will be exported, the limits beside it, and the checks with the Export button."""
-        page = QWidget()
+        """Step 2, Review Data: the data as they will be exported beside the checks of them, and the two ways on: Export RawData.xlsx
+        and Continue to Analysis. Neither needs the other."""
+        page = CompactPage(REVIEW_COMPACT_BELOW)
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 6)
-        outer.setSpacing(8)
+        outer.setContentsMargins(0, 0, 0, 4)
+        outer.setSpacing(6)
+        header, actions = self._page_header("Review Data")
+        self.back_button = make_button("←  Edit selection", lambda: self._show_step("select"))
+        self.review_badge = make_badge()
+        actions.addWidget(self.back_button)
+        actions.addWidget(self.review_badge)
+        outer.addWidget(header)
+
         columns = QHBoxLayout()
-        columns.setSpacing(12)
-
-        card = Card()
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(label("Review your data", "heading"))
-        self.review_count = label("", "muted")
-        toolbar.addWidget(self.review_count, 1)
-        self.pager_prev = make_button("‹", lambda: self._page_preview(-1))
-        self.pager_next = make_button("›", lambda: self._page_preview(1))
-        for button in (self.pager_prev, self.pager_next):
-            button.setFixedWidth(36)
-        self.pager_label = label("", "muted")
-        self.pager = [self.pager_prev, self.pager_label, self.pager_next]
-        for widget in self.pager:
-            toolbar.addWidget(widget)
-            widget.setVisible(False)
-        card.body.addLayout(toolbar)
-        card.body.addWidget(label("Same rows and column order as your Excel file. Click a row to compare its values with the limits.",
-                                  "muted", wrap=True))
-        legend = QHBoxLayout()
-        for kind, text in (("warn", "A value is missing"), ("bad", "Sample has the wrong number of files")):
-            chip = QLabel(text)
-            chip.setProperty("chip", kind)
-            legend.addWidget(chip)
-        legend.addStretch(1)
-        card.body.addLayout(legend)
-        self.preview_grid = DataTable(self.palette_tokens)
-        self.preview_grid.rowSelected.connect(self._on_preview_select)
-        self.preview_grid.activated.connect(lambda _row: self.side_tabs.setCurrentWidget(self.limits_page))
-        card.body.addWidget(self.preview_grid, 1)
-        self.preview_info = label("", "muted", wrap=True)
-        card.body.addWidget(self.preview_info)
-        columns.addWidget(card, 3)
-
-        self.side_tabs = QTabWidget()
-        self.side_tabs.setDocumentMode(True)
-        self.grr_page = self._build_grr_review()
-        self.side_tabs.addTab(self.grr_page, "GRR pre-check")
-        self.limits_page = Card()
-        self.limits_title = label("Limits", "heading")
-        self.limits_page.body.addWidget(self.limits_title)
-        self.review_row_label = label(NO_ROW_CHOSEN_TEXT, "pick", wrap=True)
-        self.limits_page.body.addWidget(self.review_row_label)
-        self.limits_grid = DataTable(self.palette_tokens)
-        self.limits_page.body.addWidget(self.limits_grid, 1)
-        self.limits_page.body.addWidget(label("▲ above max   ▼ below min   – nothing there. Min, max and unit are the limits the "
-                                              "Excel file lists beside the data.", "muted", wrap=True))
-        self.side_tabs.addTab(self.limits_page, "Limits")
-        columns.addWidget(self.side_tabs, 2)
+        columns.setSpacing(10)
+        columns.addWidget(self._build_preview_card(), 8)  # the data first: 1.6 : 1 (the design: 1.55 : 1)
+        columns.addWidget(self._build_quality_card(), 5)
         outer.addLayout(columns, 1)
 
-        bar = Card()
-        row = QHBoxLayout()
-        self.check_chips = ChipRow()
-        row.addWidget(self.check_chips, 1)
-        self.back_button = make_button("←  Back", lambda: self._show_step("select"))
-        self.validate_button = make_button("Validation & Reports  →", lambda: self._show_workspace("validation"))
-        self.export_button = make_button("Export Excel…", self.export_excel, primary=True)
-        for button in (self.back_button, self.validate_button, self.export_button):
-            row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
-        bar.body.addLayout(row)
-        outer.addWidget(bar)
+        self.validate_button = make_button("Continue to Analysis  →", lambda: self._show_workspace("validation"), primary=True)
+        self.export_button = make_button("Export RawData.xlsx…", self.export_excel)
+        self.export_button.setAccessibleName("Export RawData.xlsx")
+        self.validate_button.setAccessibleName("Continue to Analysis")
+        self.export_button.setToolTip("Save the selected measurements as RawData.xlsx. No analysis needed.")
+        self.validate_button.setToolTip("Analyze this dataset directly. No export needed.")
+        self.export_button.setMinimumHeight(self.validate_button.sizeHint().height())  # the filled button is the taller: one height
+        choices = QHBoxLayout()  # the bottom action row: both ways on, side by side
+        choices.setSpacing(10)
+        choices.addStretch(1)
+        choices.addWidget(self.export_button)
+        choices.addWidget(self.validate_button)
+        outer.addLayout(choices)
+        page.compact_changed.connect(self._review_compact)
         self._busy_widgets += [self.back_button, self.validate_button, self.export_button]
         self._pages["review"] = page  # the actions below look for it
         self._update_actions()
         return page
 
+    def _review_compact(self, compact: bool) -> None:
+        """A short window: the lines that only explain make room for the tables."""
+        self._sync_review_extras()
+
+    def _sync_review_extras(self) -> None:
+        """Which of the lines around the tables are shown. A line that carries something of its own is always shown (a preview cut
+        short, a note on how a test was judged); one that only explains gives its place to the tables when the window is short, and
+        one that only says what the badge beside the title already says is left out."""
+        if "review" not in self._pages:
+            return
+        compact = self._pages["review"].compact
+        self.preview_info.setVisible(self.preview_info.text().rstrip(".") != self.review_count.text())  # "30 rows." under "30 rows"
+        self.grr_detail.setVisible(not compact or self._grr_note)
+
+    def _build_preview_card(self) -> Card:
+        """The data as they will be exported, as large as the window allows: the title, the count and the columns' pager in one line,
+        then the table."""
+        card = Card("Data Preview", badge=True, dense=True)
+        card.title.setToolTip("Same rows and column order as your Excel file. Click a row to compare its values with the limits.")
+        self.review_count = card.badge  # "30 rows"
+        self.pager_prev = make_button("‹", lambda: self._page_preview(-1))
+        self.pager_next = make_button("›", lambda: self._page_preview(1))
+        for button in (self.pager_prev, self.pager_next):
+            button.setFixedWidth(32)
+        self.pager_label = label("", "muted")
+        self.pager = [self.pager_prev, self.pager_label, self.pager_next]
+        for widget in self.pager:
+            card.head.addWidget(widget, 0, Qt.AlignmentFlag.AlignVCenter)
+            widget.setVisible(False)
+        card.head.setSpacing(6)
+        self.legend_row = QWidget()  # what the tints of a row mean: there only while a row has one
+        legend = QHBoxLayout(self.legend_row)
+        legend.setContentsMargins(0, 0, 0, 0)
+        self.legend_chips = {}
+        for tag, kind, text in (("missing", "warn", "A value is missing"), ("invalid", "bad", "Sample has the wrong number of files")):
+            chip = QLabel(text)
+            chip.setProperty("chip", kind)
+            self.legend_chips[tag] = chip
+            legend.addWidget(chip)
+        legend.addStretch(1)
+        self.legend_row.hide()
+        card.body.addWidget(self.legend_row)
+        self.preview_grid = DataTable(self.palette_tokens, row_lines=True, elide_middle=True)
+        self.preview_grid.rowSelected.connect(self._on_preview_select)
+        self.preview_grid.activated.connect(lambda _row: self.side_tabs.setCurrentWidget(self.limits_page))
+        card.body.addWidget(self.preview_grid, 1)
+        self.preview_info = label("", "micro", wrap=True)
+        card.body.addWidget(self.preview_info)
+        return card
+
+    def _show_legend(self, tags: list[str]) -> None:
+        """A key to the tints only for the tints there are on the page."""
+        for tag, chip in self.legend_chips.items():
+            chip.setVisible(tag in tags)
+        self.legend_row.setVisible(any(tag in tags for tag in self.legend_chips))
+
+    def _build_quality_card(self) -> Card:
+        """The Pre-check and the Limits in the panel at the right: a titled card as in the design, with the Criteria button in the line
+        of the tabs (it is the Pre-check's, so it is there only on that tab)."""
+        card = Card("Data quality & settings", dense=True)
+        card.setMinimumWidth(QUALITY_MIN_WIDTH)
+        self.side_tabs = QTabWidget()
+        self.side_tabs.setObjectName("reviewTabs")
+        self.side_tabs.setDocumentMode(True)
+        self.side_tabs.tabBar().setDrawBase(False)  # the tabs are pills of their own: no line under them
+        self.grr_page = self._build_grr_review()
+        self.side_tabs.addTab(self.grr_page, "GR&&R pre-check")  # && is how a tab shows a single &
+        self.side_tabs.setTabToolTip(0, "Total Gage R&R · Screening: a quick check of the selected tests")
+        self.limits_page = QWidget()
+        limits = QVBoxLayout(self.limits_page)
+        limits.setContentsMargins(0, 6, 0, 0)
+        limits.setSpacing(5)
+        self.limits_title = label("Limits", "heading")
+        limits.addWidget(self.limits_title)
+        self.limits_grid = DataTable(self.palette_tokens, row_height=REVIEW_ROW_HEIGHT, row_lines=True, elide_middle=True)
+        limits.addWidget(self.limits_grid, 1)
+        limits.addWidget(label("▲ above max   ▼ below min", "micro"))
+        self.side_tabs.addTab(self.limits_page, "Limits (LSL / USL)")
+        self.side_tabs.setCornerWidget(self.grr_criteria_button, Qt.Corner.TopRightCorner)
+        self.side_tabs.currentChanged.connect(self._sync_criteria_button)
+        bar = self.side_tabs.tabBar()
+        bar.setUsesScrollButtons(False)  # the tabs and Criteria always fit: the card is never narrower than they are
+        bar.ensurePolished()
+        self.grr_criteria_button.ensurePolished()
+        card.setMinimumWidth(max(QUALITY_MIN_WIDTH, bar.sizeHint().width() + self.grr_criteria_button.sizeHint().width() + 8 + 26))
+        card.body.addWidget(self.side_tabs, 1)
+        return card
+
+    def _sync_criteria_button(self, _index: int = 0) -> None:
+        self.grr_criteria_button.setVisible(self.side_tabs.currentWidget() is self.grr_page)  # the criteria are the Pre-check's
+
     def _build_grr_review(self) -> QWidget:
         from ..grr import quick_criteria_from_json
 
         self.grr_criteria = quick_criteria_from_json(self.settings.quick_check_criteria)
-        card = Card()
-        head = QHBoxLayout()
-        head.addWidget(label("Total Gage R&R", "heading"), 1)
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(0, 6, 0, 0)
+        column.setSpacing(5)
         self.grr_criteria_button = make_button("Criteria…", self._edit_grr_criteria)
-        head.addWidget(self.grr_criteria_button)
-        card.body.addLayout(head)
-        legend = QHBoxLayout()
-        for kind, title in (("ok", "PASS"), ("warn", "CONDITION"), ("bad", "FAIL")):
-            tile = QLabel(title)
-            tile.setProperty("chip", kind)
-            tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            legend.addWidget(tile, 1)
-        card.body.addLayout(legend)
-        self.grr_grid = DataTable(self.palette_tokens)
+        column.addWidget(FlowRow(label("Total Gage R&R · Screening", "subhead")))
+        counts = QHBoxLayout()
+        counts.setSpacing(6)
+        self.grr_counts = {"PASS": CountTile("PASS", "ok"), "CONDITION": CountTile("CONDITION", "warn"), "FAIL": CountTile("FAIL", "bad")}
+        for tile in self.grr_counts.values():
+            counts.addWidget(tile, 1)
+        column.addLayout(counts)
+        self.grr_grid = DataTable(self.palette_tokens, row_height=REVIEW_ROW_HEIGHT, row_lines=True, elide_middle=True)
         self.grr_grid.rowSelected.connect(self._on_grr_select)
-        card.body.addWidget(self.grr_grid, 1)
-        self.grr_summary = label("", "muted", wrap=True)
-        self.grr_detail = label("Select a test to see its Study Var and calculation notes.", "muted", wrap=True)
-        card.body.addWidget(self.grr_summary)
-        card.body.addWidget(self.grr_detail)
-        return card
+        column.addWidget(self.grr_grid, 1)
+        self.grr_summary = label("", "micro", wrap=True)
+        self.grr_detail = label("Select a test to see its Study Var and calculation notes.", "micro", wrap=True)
+        column.addWidget(self.grr_summary)
+        column.addWidget(self.grr_detail)
+        return page
 
     def _build_validation(self) -> QWidget:
         from .validation_workspace import ValidationWorkspace  # pulls in the statistics and the report modules
 
         self.validation = ValidationWorkspace(self.palette_tokens, settings=self.settings, source=self._mapping_source,
                                               save_settings=lambda: save_settings(self.settings), parent=self.content)
+        self.validation.tabs.tabBar().hide()
+        self.validation.tabs.currentChanged.connect(self._update_steps)
+        self.validation.navigation_changed.connect(self._update_steps)
         return self.validation
 
     # ================================================================== steps and workspaces
@@ -644,8 +825,18 @@ class MainWindow(QMainWindow):
         return self.scan_result.sns_with_wrong_repeat_count(repeats)
 
     def _on_step_clicked(self, index: int) -> None:
-        if not self.is_busy:
+        if self.is_busy:
+            return
+        if self.workflow_route == "logs" and index < 2:
             self._show_step("select" if index == 0 else "review")
+            return
+        tab_index = index - 1 if self.workflow_route == "logs" else index + 1
+        page = self._ensure_page("validation")
+        if not page.tabs.isTabEnabled(tab_index):
+            return
+        self._show_workspace("validation")
+        page.tabs.setCurrentIndex(tab_index)
+        self._update_steps()
 
     def _show_step(self, step: str) -> None:
         if self.workspace != "mapping":
@@ -659,7 +850,7 @@ class MainWindow(QMainWindow):
             self._refresh_review()
             self.side_tabs.setCurrentWidget(self.grr_page)
             self.preview_grid.setFocus()
-            self.set_status("Preview your data, then export Excel. Validation & Reports is optional and works on a copy of the data.")
+            self.set_status("Check your data, then export or continue to analysis.")
         else:
             self.content.setCurrentWidget(self._pages["select"])
             self.step = "select"
@@ -685,45 +876,109 @@ class MainWindow(QMainWindow):
             self.validation.source_changed()
 
     def _show_workspace(self, name: str) -> None:
+        """Bring one of the three places to the front: "dashboard", "mapping" or "validation". Nothing is closed, cleared or reset
+        by moving between them: each keeps what it holds until its own Reset, a new scan or a new import replaces it."""
         if name == self.workspace:
             return
-        if name == "validation":
+        if name == "dashboard":
+            self.nav_bar.hide()
+            self.content.setCurrentWidget(self._pages["dashboard"])
+            self.workspace = "dashboard"
+            self.set_status(DASHBOARD_STATUS)
+        elif name == "validation":
             if self.is_busy:
                 return
             page = self._ensure_page("validation")
-            self.step_bar.hide()
+            self._analysis_after_mapping = self.workflow_route == "logs" and self.workspace == "mapping"
+            self.nav_bar.show()
+            self.step_bar.show()
             self.content.setCurrentWidget(page)
             self.workspace = "validation"
             self.validation.on_show()
-            self.set_status("Validation & Reports works on a copy of the data. Data Mapping and the Excel export are not affected.")
+            self.set_status("Analysis works on a copy of the data.")
         else:
+            self.workflow_route = "logs"
+            self.nav_bar.show()
             self.step_bar.show()
             self.content.setCurrentWidget(self._pages["review"] if self.step == "review" else self._pages["select"])
             self.workspace = "mapping"
             self._update_steps()
-            self.set_status("Ready." if self.step == "select" else "Preview your data, then export Excel.")
+            if self.step == "review":
+                self.set_status("Check your data, then export or continue to analysis.")
+            else:
+                self.set_status("Ready." if self.scan_result else "Ready. Choose a profile and a folder, then scan.")
+        self._update_canvas()
         self._update_switch()
+        self._update_steps()
+
+    # ------------------------------------------------------------------ the Dashboard's two starting points
+    def start_mapping(self) -> None:
+        """Map Test Logfiles: Data Mapping exactly as it is, with whatever the user already scanned and chose."""
+        self.workflow_route = "logs"
+        self._show_workspace("mapping")
+        self._update_steps()
+
+    def start_excel_analysis(self) -> None:
+        """Analyze by Excel File: the dialog in which the person chooses the type of analysis and a workbook, sees whether the file may
+        be analysed, and continues. What was chosen stays for the next time the card is used."""
+        from .excel_analysis_dialog import ExcelAnalysisDialog, ExcelState
+
+        if self.is_busy:
+            return
+        if self._excel_state is None:
+            self._excel_state = ExcelState()
+        ExcelAnalysisDialog(self, self._excel_state, self._continue_excel_analysis).present()
+
+    def _continue_excel_analysis(self, state) -> None:
+        """The file was checked and the person pressed Continue: its data are the study's, and the Analysis tab opens (nothing runs).
+        The data that are already open are not read again: that takes a new file, or Check again followed by Continue."""
+        validation = self._ensure_page("validation")
+        imported, attribute = state.report.imported, state.category == "attribute"
+        self.workflow_route = "raw"
+        self._show_workspace("validation")
+        if attribute and not (validation.source_var.get() == "ratings" and validation.ratings is imported):
+            validation.open_ratings(imported, then_setup=True)
+        elif not attribute and not (validation.source_var.get() == "file" and validation.imported is imported
+                                    and validation.method_var.get() == state.method):
+            validation.open_import(imported, state.path, method=state.method, then_setup=True)
+        self._update_steps()
 
     def _update_switch(self) -> None:
         for button, name in ((self.mapping_switch, "mapping"), (self.validation_switch, "validation")):
             button.setProperty("primary", self.workspace == name)
             repolish(button)
 
-    def _update_steps(self) -> None:
+    def _update_steps(self, *_args) -> None:
+        validation = self.validation
+        if self._analysis_after_mapping and validation is not None and not validation.preparing \
+                and validation.tabs.isTabEnabled(validation.tabs.indexOf(validation.setup_tab)):
+            self._analysis_after_mapping = False
+            validation.tabs.setCurrentWidget(validation.setup_tab)
+        logs = self.workflow_route == "logs"
+        titles = ("Mapping", "Review & Pre-check", "Analyze", "Results", "Report") if logs else ("Configure", "Results", "Report")
+        self.step_bar.set_titles(titles)
+        self.workflow_breadcrumb.setText("Map test logs" if logs else "Analyze by Excel File")
         count = len(self.selected_components)
         has_data = bool(self.scan_result and self.scan_result.grouped)
         ready = has_data and count > 0
         blocked = ready and bool(self._wrong_samples())
-        later = "Fix the file count first" if blocked else "Check the values, then save Excel"
-        if self.step == "review":
-            self.step_bar.set_step(0, "complete", f"{count} component{'s' if count != 1 else ''} selected")
-            self.step_bar.set_step(1, "current", later)
+        later = "Fix the file count first" if blocked else "Check the values, then export or analyze"
+        if self.workspace == "validation" and validation is not None:
+            current = max(1, validation.tabs.currentIndex()) + (1 if logs else -1)
         else:
-            self.step_bar.set_step(0, "current", "Folder, profile & components")
-            if not ready:
-                self.step_bar.set_step(1, "locked", "Scan, then select components")
+            current = 1 if self.step == "review" else 0
+        for index in range(len(titles)):
+            if logs and index < 2:
+                enabled = index == 0 or ready
+                caption = "Folder, profile & components" if index == 0 else later if ready else "Scan, then select components"
             else:
-                self.step_bar.set_step(1, "warn" if blocked else "ready", later)
+                tab = index - 1 if logs else index + 1
+                enabled = validation is not None and validation.tabs.isTabEnabled(tab)
+                caption = "Configure and run analysis" if tab == 1 else "Run analysis first" if not enabled else titles[index]
+            state = "current" if index == current else "complete" if index < current else "ready" if enabled else "locked"
+            if logs and index == 1 and index > current and blocked:
+                state = "warn"
+            self.step_bar.set_step(index, state, caption)
 
     def _update_actions(self) -> None:
         """Reflect what is actionable and keep the running task's inputs stable."""
@@ -731,25 +986,55 @@ class MainWindow(QMainWindow):
             return
         ready = not self.is_busy
         has_data = bool(self.scan_result and self.scan_result.grouped)
-        selected = self.selected_list.selected_rows()
+        highlighted = self.selected_list.selected_rows()
         controls = [
             (self.add_button, ready and bool(self.available_list.selected_rows())),
             (self.add_all_button, ready and bool(self.available_list.items())),
             (self.clear_button, ready and bool(self.selected_components)),
-            (self.move_up_button, ready and bool(selected) and selected[0] > 0),
-            (self.move_down_button, ready and bool(selected) and selected[-1] < len(self.selected_components) - 1),
+            (self.move_up_button, ready and bool(highlighted) and highlighted[0] > 0),  # nowhere to go from the first place
+            (self.move_down_button, ready and bool(highlighted) and highlighted[-1] < len(self.selected_components) - 1),
             (self.review_button, ready and has_data and bool(self.selected_components)),
         ]
         if hasattr(self, "export_button"):
             controls += [(self.export_button, ready and has_data and bool(self.selected_components) and not self._wrong_samples()),
-                         (self.back_button, ready)]
+                         (self.back_button, ready)]  # Continue to Analysis does not depend on the data being fit to export
         for button, enabled in controls:
             button.setEnabled(enabled)
         self.available_list.setEnabled(ready)
         self.selected_list.setEnabled(ready)
+        self._refresh_review_summary()
         self._update_steps()
 
     # ================================================================== theme
+    def _style_value_filter(self) -> None:
+        """Fusion draws the edge of a check box a shade darker than the window colour: in the dark theme that is the colour of the card
+        itself, and an unchecked box cannot be seen. This one check box gets a lighter window colour there (its edge is then about 4:1
+        against the card); in the light theme, and for every other widget, nothing changes."""
+        palette = QPalette()
+        if self.palette_tokens.mode == "dark":
+            palette.setColor(QPalette.ColorRole.Window, QColor(self.palette_tokens.muted))
+        self.value_filter.setPalette(palette)
+
+    def _canvas_bands(self) -> tuple[int, int]:
+        """What lies above and below the pages (the header, the status line): the circuit is drawn only in the space between."""
+        top = self.content.mapTo(self, QPoint(0, 0)).y()
+        return top, max(self.height() - top - self.content.height(), 0)
+
+    def _update_canvas(self) -> None:
+        """The Dashboard stands on the circuit board, which fills the window, behind the header and the status line too. In the light
+        theme those two wear the dark theme's colours while it is on show, so that they sit on the board and not on a bar of their own.
+        Nothing else changes: the other places hide the board, and the header and status line are as they always were."""
+        on_dashboard = self.workspace == "dashboard"
+        self.canvas.setVisible(on_dashboard)
+        dark = on_dashboard and self.palette_tokens.mode == "light"
+        if dark != self._chrome_dark:
+            self._chrome_dark = dark
+            for part in (self.header, self.statusBar()):
+                part.setPalette(make_palette(DARK) if dark else QPalette())
+                # a label with no colour of its own (the title) takes it from the application's palette, whatever the widget's is
+                part.setStyleSheet(stylesheet(DARK) + f"QLabel {{ color: {DARK.fg}; }}" if dark else "")
+        self._update_brand_logo()
+
     def _update_theme_button(self) -> None:
         self.theme_button.setText("☀  Light mode" if self.palette_tokens.mode == "dark" else "☾  Dark mode")
 
@@ -761,16 +1046,18 @@ class MainWindow(QMainWindow):
             if table is not None:
                 table.set_palette(self.palette_tokens)
         self.step_bar.set_palette(self.palette_tokens)
+        self._style_value_filter()
+        self.dashboard.set_palette(self.palette_tokens)
         if self.validation is not None:
             self.validation.set_palette(self.palette_tokens)
         self._update_theme_button()
-        self._update_brand_logo()
+        self._update_canvas()
         save_settings(self.settings)
 
     # ================================================================== helpers
     def _set_busy(self, busy: bool, *, cancellable: bool = False) -> None:
         self.is_busy = busy
-        for widget in [*self._busy_widgets, self.validation_switch]:
+        for widget in [*self._busy_widgets, self.validation_switch, self.home_button]:
             widget.setEnabled(not busy)
         self.cancel_button.setEnabled(busy and cancellable)
         self.progress.setVisible(busy)
@@ -797,10 +1084,10 @@ class MainWindow(QMainWindow):
     def _update_profile_hint(self) -> None:
         profile = self.profiles.get(self.profile_box.currentText())
         if not profile:
-            self.hint_label.setText("")
+            self.profile_box.setToolTip("")
             return
         kind = "Excel log" if profile.get("type") == "excel" else "Text log"
-        self.hint_label.setText(f"{kind}  ·  files: {', '.join(get_profile_extensions(profile))}")
+        self.profile_box.setToolTip(f"{kind}  ·  files: {', '.join(get_profile_extensions(profile))}")  # what the profile reads: on hover
 
     def manage_profiles(self) -> None:
         from .profile_dialog import ProfileManager
@@ -892,9 +1179,10 @@ class MainWindow(QMainWindow):
         self._scan_serial += 1
         self._scan_description = f"Data Mapping scan of {folder} (profile {profile_name})"
         self.limits = summarize_limits(result.grouped, result.components)  # the Min / Max columns and the limits panel
-        self._summary_key = self._grr_key = None
+        self._grr_key = None
         self._review_row = self._preview_page = 0
         self.reviewed_duplicates = set()
+        self._update_scan_badge()
 
         # Keep what the user had selected, or restore their choice from last time for this profile.
         remembered = self.selected_components or self.settings.component_sets.get(profile_name, [])
@@ -962,7 +1250,7 @@ class MainWindow(QMainWindow):
         self.scan_result = None
         self._scan_serial += 1
         self.limits = {}
-        self._summary_key = self._grr_key = None
+        self._grr_key = None
         self._review_row = 0
         self.selected_components = []
         self.reviewed_duplicates = set()
@@ -972,8 +1260,10 @@ class MainWindow(QMainWindow):
         self.verdict.setProperty("chip", None)
         self.verdict.setProperty("role", "muted")
         repolish(self.verdict)
+        self._update_scan_badge()
         self.details_button.setEnabled(False)
         self.search.setText("")
+        self.value_filter.setChecked(False)
         self._show_step("select")
         self._refresh_lists()
         if "review" in self._pages:
@@ -991,11 +1281,13 @@ class MainWindow(QMainWindow):
     # ================================================================== component lists
     def _refresh_available(self, *, reset_view: bool = False) -> None:
         components = self.scan_result.components if self.scan_result else []
-        view = available_view(components, self.selected_components, self.search.text())
+        view = available_view(components, self.selected_components, self.search.text(), numeric_only=self.value_filter.isChecked(),
+                              limits=self.limits)
         self.available_list.set_items(view.items, values=[limit_texts(self.limits, c) for c in view.items], empty_text=view.empty_text)
         if reset_view:
             self.available_list.reset_view()
         self.available_info.setText(view.info)
+        self.available_info.setVisible(bool(view.info))  # nothing to count before a scan
         self._update_actions()
 
     def _refresh_selected(self) -> None:
@@ -1050,7 +1342,7 @@ class MainWindow(QMainWindow):
 
     def _on_duplicates_reviewed(self, reviewed: set[str], applied: bool) -> None:
         self.reviewed_duplicates |= reviewed
-        self._summary_key = self._grr_key = None  # the chosen occurrences change values
+        self._grr_key = None  # the chosen occurrences change values
         self._data_changed()
         self.set_status(
             f"Duplicate choices applied for {len(reviewed)} component name(s)." if applied
@@ -1075,6 +1367,7 @@ class MainWindow(QMainWindow):
             self._selection_changed()
 
     def move_selected(self, direction: int) -> None:
+        """The ↑ ↓ below the list and Alt+↑ / Alt+↓: the highlighted components a place up or down, and they stay highlighted."""
         if self.is_busy:
             return
         rows = self.selected_list.selected_rows()
@@ -1093,9 +1386,20 @@ class MainWindow(QMainWindow):
         self._ensure_page("review")
         self._preview_timer.stop()
         self._refresh_preview()
-        self._refresh_checks()
         self._refresh_grr()
         self._update_actions()
+
+    def _refresh_review_summary(self) -> None:
+        """The state of the data beside the title. Read from what is already known: the scan, the choice and the file count;
+        nothing is worked out again."""
+        if not hasattr(self, "review_badge"):
+            return
+        if not self._review_ready():
+            set_badge(self.review_badge, "Nothing to review")
+        elif self._wrong_samples():
+            set_badge(self.review_badge, "File count needs fixing", "warn")
+        else:
+            set_badge(self.review_badge, "Dataset ready", "ok")
 
     def _edit_grr_criteria(self) -> None:
         GrrCriteriaDialog(self, self.grr_criteria, self._set_grr_criteria).present()
@@ -1126,12 +1430,15 @@ class MainWindow(QMainWindow):
                 grouped = result.grouped
                 self._background("grr", lambda: summarize_grr(grouped, components, repeats), lambda value: self._grr_done(key, value))
                 self.grr_grid.set_table(["Test", "%Study Var", "%SV/Tol", "NDC", "Result"], [], aligns=["w", "e", "e", "center", "center"],
-                                        empty_text="Calculating the GRR pre-check…", stretch=0)
+                                        empty_text="Calculating the GRR pre-check…", stretch=0, max_width=GRR_NAME_WIDTH)
                 self.grr_summary.setText("")
+                for tile in self.grr_counts.values():
+                    tile.set_count(None)
                 return
             self._grr_results = summarize_grr(result.grouped, components, repeats) if result and result.grouped else []
             self._grr_key = key
         rows, tags = [], {}
+        tally = dict.fromkeys(self.grr_counts, 0)  # how many tests are PASS, CONDITION and FAIL, for the tiles above the table
         for index, entry in enumerate(self._grr_results):
             status = quick_check(entry, self.grr_criteria)
             cells = [f"{value:.2f}" if value is not None else "N/A" for value in (entry.percent_study_var, entry.percent_tolerance)]
@@ -1139,8 +1446,13 @@ class MainWindow(QMainWindow):
             for column, each in enumerate((status.study, status.tolerance, status.ndc, status.overall), start=1):
                 tags[index, column] = levels[each]
             rows.append((entry.component, *cells, words[status.overall]))
+            if words[status.overall] in tally:
+                tally[words[status.overall]] += 1
+        for name, tile in self.grr_counts.items():
+            tile.set_count(tally[name] if rows else None)
         self.grr_grid.set_table(["Test", "%Study Var", "%SV/Tol", "NDC", "Result"], rows, aligns=["w", "e", "e", "center", "center"],
-                                empty_text="Select tests to calculate their GRR pre-check.", cell_tags=tags, stretch=0)
+                                empty_text="Select tests to calculate their GRR pre-check.", cell_tags=tags, stretch=0,
+                                max_width=GRR_NAME_WIDTH)
         left_out = [QUICK_LABELS[c.metric] for c in self.grr_criteria if not c.enabled]
         count = f"{len(rows)} test item{'s' if len(rows) != 1 else ''}"
         self.grr_summary.setText(count + (f" · not applied: {', '.join(left_out)}" if left_out else "") if rows else "")
@@ -1160,13 +1472,16 @@ class MainWindow(QMainWindow):
             return
         entry = self._grr_results[index]
         repeat_text = str(entry.repeats) if entry.repeats is not None else "unequal"
-        lines = [entry.component, f"{entry.parts} samples × {repeat_text} repeats"]
+        facts = [entry.component, f"{entry.parts} samples × {repeat_text} repeats"]  # on one line: the name, the design, the Study Var
         if entry.study_var is not None:
             variation = f"{entry.study_var:.2e}" if 0 < abs(entry.study_var) < 0.01 else f"{entry.study_var:.2f}"
-            lines.append(f"Study Var (6 × SD): {variation} {entry.unit}".rstrip())
+            facts.append(f"Study Var (6 × SD): {variation} {entry.unit}".rstrip())
+        lines = ["  ·  ".join(facts)]
         if entry.note:
             lines.append(entry.note)
         self.grr_detail.setText("\n".join(lines))
+        self._grr_note = bool(entry.note)  # how this test was judged is never left out of a short window
+        self._sync_review_extras()
 
     def _update_pager(self, first: int, shown: int, total: int, pages: int) -> None:
         for widget in self.pager:
@@ -1194,7 +1509,9 @@ class MainWindow(QMainWindow):
         self.preview_grid.set_table(table.headings, table.rows, table.tags if table.rows else None,
                                     aligns=["center", "w", "w", *["e"] * len(table.page_components)], empty_text=table.empty_text)
         self.preview_info.setText(table.note)
-        self.review_count.setText(table.count_text)
+        self._show_legend(table.tags)
+        self._sync_review_extras()
+        set_badge(self.review_count, table.count_text.strip("()"))  # "(30 rows)" is "30 rows" on a badge
         if not table.rows and (result is None or not result.grouped):
             self._refresh_limits()
             return
@@ -1217,11 +1534,9 @@ class MainWindow(QMainWindow):
         self.limits_title.setText(f"Limits ({len(components)})" if components else "Limits")
         headings, aligns = ["Component", "Value", "Min", "Max", "Unit"], ["w", "e", "e", "e", "w"]
         if not 0 <= self._review_row < len(self._preview_rows):  # no row to compare: just the limits
-            self.review_row_label.setText(NO_ROW_CHOSEN_TEXT)
             self.limits_grid.set_table(headings, limit_overview(components, self.limits), aligns=aligns, stretch=0, max_width=260)
             return
         row = self._preview_rows[self._review_row]
-        self.review_row_label.setText(f"Row {row.index}   ·   {row.sn}   ·   {row.filename}")
         rows, tags = limit_panel(row, components, self.limits)
         self.limits_grid.set_table(headings, rows, tags, aligns=aligns, stretch=0, max_width=260)
 
@@ -1249,44 +1564,9 @@ class MainWindow(QMainWindow):
             self._pending.pop(name, None)
             if wanted() == key:
                 self.set_status(f"The {name} of the review could not be worked out. See the log.")
-                if name == "summary":
-                    self.check_chips.set_chips([("bad", "!  The data could not be checked")])
 
         self._pending[name] = key
         self.tasks.run(lambda _report: work(), on_success=done, on_error=failed)
-
-    def _review_summary(self) -> ReviewSummary | None:
-        """Empty cells and out-of-limit rows over every row (not just the ones the table shows); kept until the data change.
-        None while a large selection is still being worked out in the background."""
-        result = self.scan_result
-        if result is None or not result.grouped or not self.selected_components:
-            return None
-        key = (id(result), tuple(self.selected_components))
-        if key != self._summary_key:
-            if self._is_big():
-                grouped, components, limits = result.grouped, list(self.selected_components), dict(self.limits)
-                self._background("summary", lambda: summarize_review(grouped, components, limits), lambda value: self._summary_done(key, value))
-                return None
-            self._summary = summarize_review(result.grouped, self.selected_components, self.limits)
-            self._summary_key = key
-        return self._summary
-
-    def _summary_done(self, key: tuple, summary: ReviewSummary) -> None:
-        self._summary, self._summary_key = summary, key
-        self._refresh_checks()
-
-    def _refresh_checks(self) -> None:
-        """The chips beside the Export button: what to know before saving."""
-        result, summary = self.scan_result, self._review_summary()
-        if result is None or not result.grouped or not self.selected_components:
-            self.check_chips.set_chips([])
-            return
-        if summary is None:  # a large selection: the answer arrives in a moment
-            self.check_chips.set_chips([("info", "Checking the data…")])
-            return
-        expected, repeats = self._optional_int(self.expected_edit), self._optional_int(self.repeats_edit)
-        wrong = self._wrong_samples() if repeats is not None else []
-        self.check_chips.set_chips(check_chips(result, summary, expected=expected, repeats=repeats, wrong=wrong))
 
     # ================================================================== export
     def export_excel(self) -> None:

@@ -1,5 +1,7 @@
 # Windows acceptance review of the Qt window
 
+**A snapshot, not the current state.** It describes the source and the exe at commit `aeee0fd`, before the V6 Dashboard and the Mapping and Review redesign, and before the owner's Attribute release (the flags are staged as `True` in the working tree). The test figures and the Attribute row below are those of that commit; for the state now see `docs/README.md`.
+
 Done on 2026-11-02 on the development machine (Windows 11 Enterprise 10.0.26100, 1920x1080, Python 3.13.4, PySide6 6.12, Microsoft
 Excel 16.0 build 20430, Edge and Chrome), after the migration from Tk, in two rounds: the acceptance review, then the release
 preparation. It was run against the source and against the exe that `tools\build.ps1` builds. The scripts that drove it are
@@ -10,7 +12,7 @@ through the application: the real window was driven by scripts, Windows UI Autom
 
 | Area | What was done | Result |
 |---|---|---|
-| Whole test suite | `python -m pytest` (offscreen) | 1,510 passed, 17 skipped (company data that is not published), 0 failed |
+| Whole test suite | `python -m pytest` (offscreen) | 1,510 passed, 17 skipped (company data that is not published), 0 failed (at `aeee0fd`; on 2026-11-02 in the working tree: 1,559 passed, 17 skipped, 5 failed, the Attribute flag tests) |
 | CI | GitHub Actions on windows-latest, Python 3.13.16, newest allowed dependencies | green on `af43d21` (lint and tests) |
 | Qt tests on the real platform | `QT_QPA_PLATFORM=windows python -m pytest tests\ui` (real window plugin, real fonts and window manager) | 191 passed |
 | Statistics | baselines, Minitab references and `datamapperx\statistics\` compared with the last Tk commit | byte-identical; 307 baseline and reference tests pass |
@@ -101,7 +103,7 @@ copy from a live one reliably (verified on the real exe). A safe cleanup would r
 | Memory is higher than Tk (107 MB working set, 54 MB private, against 64 MB) | non-blocking | modest in absolute terms; startup is faster |
 | The exe is not signed (version information and icon are present) | non-blocking for this release | same as before; Windows may show SmartScreen's warning for a downloaded copy |
 | Windows' 260-character path limit (settings file included, which only logs a warning) | non-blocking | the default data folder is `%APPDATA%\\DataMapperX`; Excel's own limit for opening a workbook is 218 characters |
-| Attribute Agreement is behind `ATTRIBUTE_RESULTS_READY` and `ATTRIBUTE_REPORTS_READY` (False) | non-blocking | by design, as in Tk; identical Cpk and Variable GR&R output with the flags on |
+| Attribute Agreement is behind `ATTRIBUTE_RESULTS_READY` and `ATTRIBUTE_REPORTS_READY` (False at `aeee0fd`) | non-blocking | by design, as in Tk; identical Cpk and Variable GR&R output with the flags on. Since then the owner has stated that the method is validated and has staged both flags as `True` (`docs/attribute-release-readiness.md`) |
 | 17 tests are skipped (confidential FT reference logs and `samples\`) | non-blocking | the data is not published; run them where it is |
 | The ownership control skips on a machine where the deliberate violation does not crash (CI) | non-blocking | the property itself is tested and passes there |
 | The Excel legend of "Measurement by Operator" lists 12 series | non-blocking | looks only |

@@ -34,14 +34,14 @@ class Palette:
 
 
 LIGHT = Palette(
-    mode="light", bg="#f3f6fa", surface="#ffffff", fg="#182536", muted="#526174", line="#dce3ec", accent="#005fb8",
-    ok="#167347", warn="#915900", danger="#ba2836", banner_bg="#e8f2fd", banner_fg="#164b7a",
-    on_accent="#ffffff", soft="#f1f5f9", pick="#dcebfb",
-    ok_bg="#e7f6ed", ok_line="#a9d9bd", warn_bg="#fff4dc", warn_line="#efd08a", bad_bg="#fdecec", bad_line="#f0b4b4",
+    mode="light", bg="#f3f6fb", surface="#ffffff", fg="#17293f", muted="#60758e", line="#dae4ef", accent="#0864b5",
+    ok="#147d5e", warn="#aa7217", danger="#b83746", banner_bg="#eaf3ff", banner_fg="#0864b5",
+    on_accent="#ffffff", soft="#f7f9fc", pick="#eaf3ff",
+    ok_bg="#e9f7ef", ok_line="#a9d9bd", warn_bg="#fff3d9", warn_line="#efd08a", bad_bg="#fff0f2", bad_line="#f0b4b4",
 )
 DARK = Palette(
-    mode="dark", bg="#151b24", surface="#1e2734", fg="#edf3fb", muted="#b0bfd0", line="#354459", accent="#73cbff",
-    ok="#78d4a0", warn="#f0c475", danger="#ff9ba7", banner_bg="#203a52", banner_fg="#cdeaff",
-    on_accent="#122739", soft="#263244", pick="#27435f",
-    ok_bg="#173a2d", ok_line="#3c7058", warn_bg="#3b2f12", warn_line="#7a6224", bad_bg="#40191c", bad_line="#85383d",
+    mode="dark", bg="#0e1928", surface="#18263a", fg="#e9f1fa", muted="#a2b5ca", line="#344760", accent="#3898ee",
+    ok="#78dbab", warn="#ffca78", danger="#ff8995", banner_bg="#1e3a58", banner_fg="#cdeaff",
+    on_accent="#ffffff", soft="#20314a", pick="#1e3a58",
+    ok_bg="#183f35", ok_line="#3c7058", warn_bg="#443521", warn_line="#7a6224", bad_bg="#472a31", bad_line="#85383d",
 )

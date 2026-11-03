@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QCursor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -103,11 +103,13 @@ from ..statistics.ratings import (
     read_ratings_table,
 )
 from ..statistics.study import validate_statistical_options
+from ..utils import to_number
 from ..workspace_data import MappingSource, build_mapping_dataset, int_field, reorder_dataset
 from .dialogs import ReportDialog, label, open_path
+from .report_preview import ReportPreview
 from .tasks import TaskRunner
 from .variables import Var, bind_check, bind_combo, bind_edit, bind_label, bind_radios, bind_spin
-from .widgets import ChartPanel, DataTable, ElidedLabel, ScrollTab, make_button, repolish
+from .widgets import Card, ChartPanel, DataTable, ElidedLabel, ScrollTab, make_button, repolish
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +124,8 @@ WITHIN_CHOICES = {"auto": "Automatic (from the subgroup size)",
 METHOD_NAMES = {"grr": "Variable Gage R&R", "capability": "Process Capability (Cp/Cpk)", "attribute": "Attribute Agreement"}
 PLAN_TITLES = {"grr": "Variable Gage R&R", "capability": "Process Capability", "attribute": "Attribute Agreement"}
 CONFIDENCE_LEVELS = ("90%", "95%", "99%")
-ATTRIBUTE_RESULTS_READY = False  # stays False until the Attribute Results, Details and Checks have been seen working in the window
-ATTRIBUTE_REPORTS_READY = False  # stays False until its PDF and Excel report have been opened and checked in their own programs
+ATTRIBUTE_RESULTS_READY = True  # released with 1.2.1 by the owner; False withholds the Attribute Results, Details and Checks again
+ATTRIBUTE_REPORTS_READY = True  # released with 1.2.1 by the owner; False withholds its PDF and Excel report again
 ATTRIBUTE_PREVIEW_ENV = "DATAMAPPERX_ATTRIBUTE_RESULTS"  # set to 1 to run Attribute Agreement before it is released, to check it
 ATTRIBUTE_REPORTS_ENV = "DATAMAPPERX_ATTRIBUTE_REPORTS"  # set to 1 to generate its PDF and Excel report before they are released
 ATTRIBUTE_PENDING = "Attribute Agreement can be set up here. Its results are still being checked, so it cannot be run yet."
@@ -173,9 +175,12 @@ def _row(*widgets: QWidget | int, spacing: int = 8) -> QHBoxLayout:
 class ValidationWorkspace(QWidget):
     """Data → Analysis Setup → Results → Report, with Run analysis always at hand (Quick Analysis)."""
 
+    navigation_changed = Signal()
+
     def __init__(self, palette: Palette, *, settings=None, save_settings: Callable[[], None] | None = None,
                  source: Callable[[], MappingSource | None] = lambda: None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("validationWorkspace")
         self.palette_tokens = palette
         self.settings = settings
         self._save_settings = save_settings or (lambda: None)
@@ -205,6 +210,7 @@ class ValidationWorkspace(QWidget):
         self._source_key: object = _UNSET  # nothing has been looked at yet
         self._scan: int | None = None
         self._dataset_generation = 0
+        self._setup_after_import = False  # the Dashboard's import: show the Analysis tab as soon as the file's data are ready
         self._visible: list = []
         self._charts: list = []
         self._marked: set[int] = set()  # the rows of the table with a warning mark
@@ -288,12 +294,13 @@ class ValidationWorkspace(QWidget):
             variable.trace(self._info_changed)
         self.all_columns_var.trace(lambda: self._show_details(self.selected_result()))
         self.chart_scale_var.trace(self._draw_chart)
+        self.precision_var.trace(self._refresh_report_preview)
 
     # ------------------------------------------------------------------ construction
     def _build(self, outer: QVBoxLayout) -> None:
         strip = QHBoxLayout()
         strip.setSpacing(10)
-        self.run_button = make_button("Run analysis", self.run_analysis, primary=True)
+        self.run_button = make_button("Run Analysis", self.run_analysis, primary=True)
         self.message_label = label("", "muted", wrap=True)
         bind_label(self.message_label, self.message_var)
         strip.addWidget(self.run_button)
@@ -321,6 +328,7 @@ class ValidationWorkspace(QWidget):
         outer.addWidget(self.stale_banner)
 
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("workspaceTabs")
         self.data_tab, self.results_tab, self.report_tab = QWidget(), QWidget(), QWidget()
         self.setup_tab = ScrollTab()  # a form: with large text it scrolls instead of being squeezed (the Report page fits by shrinking its list)
         for tab, title in ((self.data_tab, "Data"), (self.setup_tab, "Analysis"), (self.results_tab, "Results"), (self.report_tab, "Report")):
@@ -329,11 +337,12 @@ class ValidationWorkspace(QWidget):
         self._build_setup()
         self._build_results()
         self._build_report()
+        self.tabs.currentChanged.connect(self._refresh_report_preview)
         outer.addWidget(self.tabs, 1)
 
     def _build_data(self) -> None:
         layout = QVBoxLayout(self.data_tab)
-        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setContentsMargins(0, 8, 0, 0)
         top = QHBoxLayout()
         top.setSpacing(16)
         group = QButtonGroup(self)
@@ -397,60 +406,85 @@ class ValidationWorkspace(QWidget):
             self.preview.setColumnHidden(index, key not in shown)
 
     def _build_setup(self) -> None:
-        layout = QVBoxLayout(self.setup_tab.content)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(4)
-        layout.addWidget(label("Plan", "heading"))
+        columns = QHBoxLayout(self.setup_tab.content)
+        columns.setContentsMargins(0, 8, 0, 0)
+        columns.setSpacing(12)
+        methods = Card("01 · Analysis method", dense=True)
+        settings = Card("Study settings", dense=True, scrolls=True)
+        readiness = Card("02 · Dataset & readiness", dense=True, badge=True)
+        self.setup_cards = (methods, settings, readiness)
+        for card, stretch in zip(self.setup_cards, (72, 100, 115), strict=True):
+            columns.addWidget(card, stretch)
+        layout = settings.body
         self.plan_title = label("", "heading")
         bind_label(self.plan_title, self.plan_title_var)
-        self.plan_label = label("", "muted")  # e.g. 8 Test Items · 10 Samples
+        self.plan_label = label("", "muted", wrap=True)
         bind_label(self.plan_label, self.plan_var)
-        layout.addWidget(self.plan_title)
-        layout.addWidget(self.plan_label)
-        layout.addSpacing(8)
-        layout.addWidget(label("Study purpose", "heading"))
         group = QButtonGroup(self)
-        self.method_radios = {"grr": QRadioButton("MSA – Variable Gage R&R"),
-                              "capability": QRadioButton("Process Capability – Cp/Cpk, Pp/Ppk"),
-                              "attribute": QRadioButton("Attribute Agreement – PASS/FAIL ratings")}
-        for button in self.method_radios.values():
-            layout.addWidget(button)
+        self.method_radios = {}
+        descriptions = {"capability": "Cp · Cpk · Pp · Ppk", "grr": "%Study Var · %SV/Tol · NDC",
+                        "attribute": "PASS / FAIL · Kappa"}
+        for method in ("capability", "grr", "attribute"):
+            button = QRadioButton(PLAN_TITLES[method].replace("&", "&&"))
+            button.setObjectName("methodChoice")
+            button.setToolTip(descriptions[method])
+            self.method_radios[method] = button
+            methods.body.addWidget(button)
+            methods.body.addWidget(label(descriptions[method], "micro", wrap=True))
         bind_radios(self.method_radios, self.method_var, group)
+        methods.body.addWidget(make_button("About the method", self.show_about))
+        methods.body.addStretch(1)
+        methods.body.addWidget(label("Select a method, review settings, then run analysis.", "micro", wrap=True))
+        readiness.body.addWidget(self.plan_title)
+        readiness.body.addWidget(self.plan_label)
+        self.setup_source = ElidedLabel("", "muted", mode=Qt.TextElideMode.ElideMiddle)
+        readiness.body.addWidget(self.setup_source)
+        self.setup_items = DataTable(self.palette_tokens, row_lines=True, elide_middle=True)
+        readiness.body.addWidget(self.setup_items, 1)
+        readiness.body.addWidget(make_button("Review data & assignments", lambda: self.tabs.setCurrentWidget(self.data_tab)))
+        self.setup_warning = label("", "warn", wrap=True)
+        bind_label(self.setup_warning, self.hint_var, hide_empty=True)
+        readiness.body.addWidget(self.setup_warning)
+        self.readiness_badge = readiness.badge
 
         # Gage R&R
         self.grr_setup = QWidget()
         grr = QGridLayout(self.grr_setup)
-        grr.setContentsMargins(0, 10, 0, 0)
+        grr.setContentsMargins(0, 0, 0, 0)
         grr.setColumnStretch(1, 1)
         grr.setVerticalSpacing(8)
         self.study_factor_combo = QComboBox()
         self.study_factor_combo.addItems([str(k) for k in STUDY_FACTORS])
         bind_combo(self.study_factor_combo, self.study_factor_var)
         grr.addWidget(label("Study variation (k)"), 0, 0)
-        grr.addLayout(_row(self.study_factor_combo, label("Study Var = k × SD. The usual choice is 6 (±3σ).", "muted"), 1), 0, 1)
-        self.assign_check = QCheckBox("Label the repeated readings of a sample as trials 1, 2, 3… when the data have no Trial")
+        self.study_factor_combo.setToolTip("Study Var = k × SD. The usual choice is 6 (±3σ).")
+        grr.addWidget(self.study_factor_combo, 0, 1)
+        self.assign_check = QCheckBox("Assign missing trial numbers")
+        self.assign_check.setToolTip("Label repeated readings as trials 1, 2, 3 when no Trial is supplied. This does not establish measurement order.")
         bind_check(self.assign_check, self.assign_var)
         grr.addWidget(self.assign_check, 1, 0, 1, 2)
-        grr.addWidget(label("Only to organise the data in rows. It is not taken as the order of measurement.", "muted"), 2, 1)
         self.repeats_edit = QLineEdit()
         self.repeats_edit.setMaximumWidth(60)
         bind_edit(self.repeats_edit, self.repeats_var)
         grr.addWidget(label("Readings per sample"), 3, 0)
-        grr.addLayout(_row(self.repeats_edit, label("optional: samples with another count are flagged", "muted"), 1), 3, 1)
+        self.repeats_edit.setToolTip("Optional: samples with another reading count are flagged.")
+        grr.addWidget(self.repeats_edit, 3, 1)
         self.customer_combo = QComboBox()
-        self.customer_combo.setMinimumWidth(180)
+        self.customer_combo.setMinimumContentsLength(12)
+        self.customer_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.customer_combo.addItems([NO_CRITERIA, *self.customers])
         bind_combo(self.customer_combo, self.profile_var)
-        self.criteria_button = make_button("Customers…", self.open_customers)
-        grr.addWidget(label("Acceptance criteria"), 4, 0)
-        grr.addLayout(_row(self.customer_combo, self.criteria_button, label("optional: adds PASS / FAIL, never changes a figure", "muted"),
-                           1), 4, 1)
+        self.criteria_button = make_button("Criteria…", self.open_customers)
+        self.criteria_button.setToolTip("Customer criteria for %Study Var, %SV/Tol and NDC. Evaluation never changes statistical values.")
+        grr.addWidget(label("Acceptance criteria"), 4, 0, 1, 2)
+        grr.addWidget(self.customer_combo, 5, 0, 1, 2)
+        grr.addWidget(self.criteria_button, 6, 0, 1, 2)
         layout.addWidget(self.grr_setup)
 
         # Process capability
         self.cap_setup = QWidget()
         cap = QVBoxLayout(self.cap_setup)
-        cap.setContentsMargins(0, 10, 0, 0)
+        cap.setContentsMargins(0, 0, 0, 0)
         self.subgroup_check = QCheckBox("Group readings by Sample ID")
         bind_check(self.subgroup_check, self.subgroup_var)
         self.judge_check = QCheckBox("Enable acceptance criteria")
@@ -458,35 +492,35 @@ class ValidationWorkspace(QWidget):
         cap.addWidget(self.subgroup_check)
         cap.addWidget(self.judge_check)
         self.criteria_row = QWidget()
-        criteria = QHBoxLayout(self.criteria_row)
-        criteria.setContentsMargins(24, 0, 0, 0)
+        criteria = QVBoxLayout(self.criteria_row)
+        criteria.setContentsMargins(0, 0, 0, 0)
+        indices = QHBoxLayout()
         index_group = QButtonGroup(self)
         self.index_radios = {"cpk": QRadioButton("Cpk (Within)"), "ppk": QRadioButton("Ppk (Overall)")}
         for button in self.index_radios.values():
-            criteria.addWidget(button)
+            indices.addWidget(button)
         bind_radios(self.index_radios, self.index_var, index_group)
-        criteria.addWidget(label("must exceed", "muted"))
+        criteria.addLayout(indices)
         self.threshold_edit = QLineEdit()
         self.threshold_edit.setMaximumWidth(70)
         bind_edit(self.threshold_edit, self.threshold_var)
-        criteria.addWidget(self.threshold_edit)
-        criteria.addStretch(1)
+        criteria.addLayout(_row(label("Must exceed", "muted"), self.threshold_edit, 1))
         cap.addWidget(self.criteria_row)
         self.advanced_button = make_button("Advanced Settings ►", self._toggle_advanced)
         cap.addWidget(self.advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.advanced = QWidget()
-        advanced = QHBoxLayout(self.advanced)
+        advanced = QVBoxLayout(self.advanced)
         advanced.setContentsMargins(0, 0, 0, 0)
         advanced.addWidget(label("Within sigma"))
         self.within_combo = QComboBox()
         self.within_combo.addItems(list(WITHIN_CHOICES.values()))
-        self.within_combo.setMinimumWidth(380)
+        self.within_combo.setMinimumContentsLength(12)
+        self.within_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         bind_combo(self.within_combo, self.within_var)
         advanced.addWidget(self.within_combo)
-        self.within_hint = label("", "muted")
+        self.within_hint = label("", "muted", wrap=True)
         bind_label(self.within_hint, self.within_hint_var)
         advanced.addWidget(self.within_hint)
-        advanced.addStretch(1)
         self.advanced.hide()
         cap.addWidget(self.advanced)
         layout.addWidget(self.cap_setup)
@@ -494,33 +528,32 @@ class ValidationWorkspace(QWidget):
         # Attribute Agreement
         self.attr_setup = QWidget()
         attr = QVBoxLayout(self.attr_setup)
-        attr.setContentsMargins(0, 10, 0, 0)
+        attr.setContentsMargins(0, 0, 0, 0)
         self.confidence_combo = QComboBox()
         self.confidence_combo.addItems(CONFIDENCE_LEVELS)
         bind_combo(self.confidence_combo, self.confidence_var)
-        attr.addLayout(_row(label("Confidence level"), self.confidence_combo, label("for the interval of each percent agreement", "muted"), 1))
+        self.confidence_combo.setToolTip("Confidence level for the interval of each percent agreement.")
+        attr.addLayout(_row(label("Confidence level"), self.confidence_combo, 1))
         self.attr_judge_check = QCheckBox("Enable acceptance criteria")
         bind_check(self.attr_judge_check, self.judge_var)
         attr.addWidget(self.attr_judge_check)
         self.agreement_row = QWidget()
-        agreement = QHBoxLayout(self.agreement_row)
-        agreement.setContentsMargins(24, 0, 0, 0)
-        agreement.addWidget(label("Minimum agreement", "muted"))
+        agreement = QVBoxLayout(self.agreement_row)
+        agreement.setContentsMargins(0, 0, 0, 0)
         self.agreement_edit = QLineEdit()
         self.agreement_edit.setMaximumWidth(60)
         bind_edit(self.agreement_edit, self.agreement_var)
-        agreement.addWidget(self.agreement_edit)
-        agreement.addWidget(label("% for Within Appraisers and vs Standard, each on its own", "muted"))
-        agreement.addStretch(1)
+        agreement.addLayout(_row(label("Minimum agreement %", "muted"), self.agreement_edit, 1))
+        self.agreement_edit.setToolTip("Applied separately to Within Appraisers and vs Standard agreement.")
         attr.addWidget(self.agreement_row)
         layout.addWidget(self.attr_setup)
         layout.addStretch(1)
 
     def _build_results(self) -> None:
         layout = QVBoxLayout(self.results_tab)
-        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setContentsMargins(0, 8, 0, 0)
         head = QHBoxLayout()
-        self.summary_label = label("", "heading")
+        self.summary_label = label("", "heading", wrap=True)
         bind_label(self.summary_label, self.summary_var)
         head.addWidget(self.summary_label)
         self.notes_bar = QWidget()
@@ -537,9 +570,9 @@ class ValidationWorkspace(QWidget):
 
         # Two panes: above each other, or side by side when the window is wide enough
         self.split = QSplitter(Qt.Orientation.Vertical)
-        self.table_page = QWidget()
-        table = QVBoxLayout(self.table_page)
-        table.setContentsMargins(0, 0, 0, 0)
+        self.split.setChildrenCollapsible(False)
+        self.table_page = Card("Results table", dense=True)
+        table = self.table_page.body
         filters = QHBoxLayout()
         filters.addWidget(label("Search", "muted"))
         self.search_edit = QLineEdit()
@@ -553,7 +586,7 @@ class ValidationWorkspace(QWidget):
         self.sort_combo = QComboBox()
         filters.addWidget(self.sort_combo)
         table.addLayout(filters)
-        self.table = DataTable(self.palette_tokens)
+        self.table = DataTable(self.palette_tokens, row_lines=True)
         self.table.rowSelected.connect(self._select_result)
         self.table.cellPressed.connect(self._table_click)
         self.table.cellHover.connect(self._table_hover)
@@ -562,19 +595,24 @@ class ValidationWorkspace(QWidget):
         bind_label(self.review_label, self.review_var, hide_empty=True)
         table.addWidget(self.review_label)
 
-        self.right_pane = QWidget()
-        right = QVBoxLayout(self.right_pane)
-        right.setContentsMargins(0, 0, 0, 0)
-        self.selected_label = label("", "heading")
+        self.right_pane = Card(dense=True)
+        right = self.right_pane.body
+        self.selected_label = ElidedLabel("", "heading")
         bind_label(self.selected_label, self.selected_var, hide_empty=True)
         right.addWidget(self.selected_label)
         self.result_tabs = QTabWidget()
+        self.result_tabs.setObjectName("reviewTabs")
         right.addWidget(self.result_tabs, 1)
         self.split.addWidget(self.table_page)
         self.split.addWidget(self.right_pane)
-        self.split.setStretchFactor(0, 1)
-        self.split.setStretchFactor(1, 3)
+        self.split.setStretchFactor(0, 75)
+        self.split.setStretchFactor(1, 130)
         layout.addWidget(self.split, 1)
+        next_steps = QHBoxLayout()
+        next_steps.addWidget(make_button("← Analysis settings", lambda: self.tabs.setCurrentWidget(self.setup_tab)))
+        next_steps.addStretch(1)
+        next_steps.addWidget(make_button("Prepare report →", lambda: self.tabs.setCurrentWidget(self.report_tab), primary=True))
+        layout.addLayout(next_steps)
 
         # Charts
         chart_page = QWidget()
@@ -595,7 +633,7 @@ class ValidationWorkspace(QWidget):
         bind_radios(self.chart_scale_buttons, self.chart_scale_var, scale_group)
         self.chart_tools.hide()
         charts.addWidget(self.chart_tools)
-        self.chart_panel = ChartPanel()
+        self.chart_panel = ChartPanel(cell_height=220)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -658,55 +696,57 @@ class ValidationWorkspace(QWidget):
         self.sort_combo.currentTextChanged.connect(lambda text: self.sort_var.set(text) if text else None)
 
     def _build_report(self) -> None:
-        layout = QVBoxLayout(self.report_tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        columns = QHBoxLayout()
-        columns.setSpacing(40)
-        left = QGridLayout()
-        left.setVerticalSpacing(8)
-        left.addWidget(label("Study information (optional)", "heading"), 0, 0, 1, 2)
+        columns = QHBoxLayout(self.report_tab)
+        columns.setContentsMargins(0, 8, 0, 0)
+        columns.setSpacing(12)
+        config = Card("Study information", dense=True)
+        preview = Card("Live report preview", dense=True)
+        columns.addWidget(config, 7)
+        columns.addWidget(preview, 15)
+        self.report_cards = (config, preview)
+        form = ScrollTab()
+        left = QVBoxLayout(form.content)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(5)
+        config.body.addWidget(form, 1)
         self.info_entries: dict[str, QLineEdit] = {}
         fields = (("Gage name", self.gage_var), ("Date of study", self.date_var), ("Reported by", self.by_var), ("Misc", self.comments_var))
-        for row, (title, variable) in enumerate(fields, start=1):
-            left.addWidget(label(title), row, 0)
+        for title, variable in fields:
+            left.addWidget(label(title, "muted"))
             entry = QLineEdit()
-            entry.setMinimumWidth(280)
             bind_edit(entry, variable)
             if variable is self.date_var:  # chosen from a calendar, never typed
                 entry.setReadOnly(True)
                 entry.setMaximumWidth(130)
                 self.date_button = make_button("Choose date…", self.choose_date)
-                left.addLayout(_row(entry, self.date_button, 1), row, 1)
+                left.addLayout(_row(entry, self.date_button, 1))
             else:
-                left.addWidget(entry, row, 1)
+                left.addWidget(entry)
             self.info_entries[title] = entry
-        left.addWidget(label("Shown with each item when entered. The date of study is today unless you choose another day "
-                             "(DD-MM-YYYY).", "muted", wrap=True), len(fields) + 1, 0, 1, 2)
-        left.setRowStretch(len(fields) + 2, 1)
-        columns.addLayout(left)
-
-        right = QVBoxLayout()
-        right.addWidget(label("Include", "heading"))
+        self.info_entries["Date of study"].setToolTip("Study date (DD-MM-YYYY). Defaults to today.")
+        left.addWidget(label("Include", "subhead"))
         self.section_checks = {}
         for name in ALL_SECTIONS:
             check = QCheckBox(SECTION_NAMES[name])
             bind_check(check, self.sections[name])
-            right.addWidget(check)
+            left.addWidget(check)
             self.section_checks[name] = check
         items = QHBoxLayout()
-        self.coverage_label = label("", "heading")
+        self.coverage_label = ElidedLabel("", "muted")
         bind_label(self.coverage_label, self.coverage_var)
         items.addWidget(self.coverage_label, 1)
         items.addWidget(make_button("None", lambda: self._select_items(False)))
         items.addWidget(make_button("All", lambda: self._select_items(True)))
-        right.addLayout(items)
+        left.addLayout(items)
         self.item_list = QListWidget()
         self.item_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.item_list.setMinimumWidth(320)
+        self.item_list.setMinimumHeight(80)
         self.item_list.itemSelectionChanged.connect(self._update_coverage)
-        right.addWidget(self.item_list, 1)
-        columns.addLayout(right, 1)
-        layout.addLayout(columns, 1)
+        left.addWidget(self.item_list, 1)
+        self.report_preview = ReportPreview(self.report_tab)
+        preview.body.addWidget(self.report_preview, 1)
+        for variable in self.sections.values():
+            variable.trace(self._refresh_report_preview)
 
         actions = QHBoxLayout()
         self.pdf_button = make_button("Generate PDF…", lambda: self.generate_report(".pdf"), primary=True)
@@ -717,9 +757,25 @@ class ValidationWorkspace(QWidget):
         self.open_button.setEnabled(False)
         actions.addWidget(self.pdf_button)
         actions.addWidget(self.excel_button)
-        actions.addWidget(self.report_label, 1)
-        actions.addWidget(self.open_button)
-        layout.addLayout(actions)
+        config.body.addLayout(actions)
+        status = QHBoxLayout()
+        status.addWidget(self.report_label, 1)
+        status.addWidget(self.open_button)
+        config.body.addLayout(status)
+
+    def _refresh_report_preview(self, *_args) -> None:
+        if not hasattr(self, "report_preview") or self.tabs.currentWidget() is not self.report_tab:
+            return
+        context = None
+        results = []
+        withheld = self.study is not None and self.study.options.method == "attribute" and not attribute_reportable()
+        if self.study is not None and self.result_set is not None and self.evaluated is not None and self.included() \
+                and not self.stale and not withheld:
+            context, included = self._context()
+            results = self._report_results(included)
+        self.report_preview.set_report(results, context, decimals=self._precision(), stale=self.stale)
+        if withheld:
+            self.report_preview.notice.setText(ATTRIBUTE_REPORT_PENDING)
 
     # ------------------------------------------------------------------ small helpers
     @property
@@ -761,7 +817,7 @@ class ValidationWorkspace(QWidget):
 
     def set_palette(self, palette: Palette) -> None:
         self.palette_tokens = palette
-        for table in (self.preview, self.table, self.grr_tree):
+        for table in (self.preview, self.table, self.grr_tree, self.setup_items):
             table.set_palette(palette)
         self._show_details(self.selected_result())
         self._show_checks(self.selected_result())
@@ -891,21 +947,56 @@ class ValidationWorkspace(QWidget):
         else:
             self._prepare_dataset()
 
+    def open_ratings(self, imported: ImportedRatings, *, then_setup: bool = False) -> None:
+        """Use ratings that were read and checked elsewhere (the Dashboard's Excel file) as the study's data. With ``then_setup``
+        the Analysis tab is shown once the data are ready; nothing is run."""
+        self._setup_after_import = then_setup
+        if then_setup:
+            self.tabs.setCurrentWidget(self.data_tab)  # where the progress is seen
+        self._ratings_ready(imported)
+
+    def open_import(self, imported: ImportedData, path: str, *, method: str, then_setup: bool = False) -> None:
+        """Use a workbook that was read and checked elsewhere (the Dashboard's Excel file: a RawData.xlsx, or a Variable / Cpk sheet) as
+        the study's data, for the ``method`` the person chose. With ``then_setup`` the Analysis tab is shown once the data are ready;
+        nothing is run."""
+        self._setup_after_import = then_setup
+        if then_setup:
+            self.tabs.setCurrentWidget(self.data_tab)  # where the progress is seen
+        self.imported = imported
+        self.file_var.set(path)
+        if self.method_var.get() != method:
+            self.method_var.set(method)
+        if self.source_var.get() != "file":
+            self.source_var.set("file")  # prepares the dataset
+        else:
+            self._prepare_dataset()
+
+    def pick_rawdata(self) -> Path | None:
+        """Ask for a RawData.xlsx; None if the user cancels."""
+        path, _ = QFileDialog.getOpenFileName(self._dialog_parent(), "Choose a RawData.xlsx", "", "Excel workbook (*.xlsx);;All files (*.*)")
+        return Path(path) if path else None
+
     def choose_file(self) -> None:
         if self.source_var.get() == "ratings":
             return self.choose_ratings()
-        path, _ = QFileDialog.getOpenFileName(self._dialog_parent(), "Choose a RawData.xlsx", "", "Excel workbook (*.xlsx);;All files (*.*)")
+        path = self.pick_rawdata()
         if path:
-            self.open_file(Path(path))
+            self.open_file(path)
         return None
 
-    def open_file(self, path: Path) -> None:
+    def open_file(self, path: Path, *, then_setup: bool = False) -> None:
+        """Read a RawData.xlsx as the study's data. With ``then_setup`` the Analysis tab is shown once the data are ready (nothing is
+        run); if the file cannot be read, the Data tab stays in front with the reason."""
+        self._setup_after_import = then_setup
+        if then_setup:
+            self.tabs.setCurrentWidget(self.data_tab)  # where the progress, and a failure, are seen
         self.message_var.set(f"Reading {path.name}…")
         self.preparing = True
         self._refresh_state()
 
         def failed(exc):
             self.preparing = False
+            self._setup_after_import = False
             self.message_var.set(f"Could not read {path.name}: {exc}")
             self._refresh_state()
 
@@ -974,6 +1065,7 @@ class ValidationWorkspace(QWidget):
 
     def _clear_dataset(self, message: str) -> None:
         self.preparing = False
+        self._setup_after_import = False  # no data are coming
         self.dataset = self.study = self.result_set = self.evaluated = None
         self.dataset_var.set("No data yet.")
         self.hint_var.set("")
@@ -1008,6 +1100,11 @@ class ValidationWorkspace(QWidget):
         self.message_var.set(self._ready_message or "Ready. Press Run analysis, or set up the study first.")
         self._ready_message = ""
         self._settings_changed()  # shows the data as they will be analysed, with the design applied
+        if self._setup_after_import:
+            self._setup_after_import = False
+            if self.hint_var.get() and not self.setup_error:  # the warnings are on the Data tab, which this skips: say so
+                self.message_var.set(f"{self.message_var.get()} The Data tab lists warnings about these data.")
+            self.tabs.setCurrentWidget(self.setup_tab)
 
     def _refresh_data_view(self) -> None:
         """The data tab: a four-figure summary, warnings only when there is something to fix, and the readings as the analysis sees them."""
@@ -1204,6 +1301,7 @@ class ValidationWorkspace(QWidget):
         if self.study is not None:
             self.study.info = StudyInfo(self.gage_var.get().strip(), self.date_var.get().strip(), self.by_var.get().strip(),
                                         self.comments_var.get().strip())
+        self._refresh_report_preview()
 
     def _plan_text(self) -> str:
         """The data of the study in one line: 8 Test Items · 10 Samples."""
@@ -1322,6 +1420,26 @@ class ValidationWorkspace(QWidget):
         pending = ATTRIBUTE_PENDING if self.method_var.get() == "attribute" and not attribute_runnable() else ""
         blocked = self.setup_error or pending
         self.run_button.setEnabled(has_data and not blocked and not self.busy)
+        self.setup_cards[2].set_badge("No data" if not has_data else "Requires attention" if blocked else
+                                      "Working…" if self.busy else "Ready to analyze",
+                                      "warn" if blocked else "ok" if has_data and not self.busy else "neutral")
+        self.setup_source.setText("Mapped tester readings" if self.source_var.get() == "mapping" else self.file_var.get())
+        key = (id(self.dataset), self.method_var.get())
+        if getattr(self, "_setup_items_key", None) != key:
+            self._setup_items_key = key
+            grouped = defaultdict(list)
+            if self.dataset is not None:
+                for observation in self.dataset.observations:
+                    grouped[observation.test_item].append(observation)
+            rows = []
+            for name, observations in grouped.items():
+                limits = [(to_number(o.lsl), to_number(o.usl)) for o in observations]
+                provided = all(lo is not None and hi is not None and lo < hi for lo, hi in limits)
+                numeric = all(to_number(o.value) is not None for o in observations)
+                ratings = all(str(o.value).strip().upper() in ("PASS", "FAIL") for o in observations)
+                data = "Numeric" if numeric else "Ratings" if ratings else "Review"
+                rows.append((name, data, "—" if ratings else "Provided" if provided else "Review"))
+            self.setup_items.set_table(["Test item", "Data", "Limits"], rows, stretch=0, max_width=250)
         for tab, enabled in ((self.setup_tab, has_data), (self.results_tab, has_result), (self.report_tab, has_result)):
             self.tabs.setTabEnabled(self.tabs.indexOf(tab), enabled)
         if blocked:
@@ -1348,6 +1466,8 @@ class ValidationWorkspace(QWidget):
         elif (has_result and not stale and self.report_var.get().startswith("Update the results")) or \
                 self.report_var.get() == ATTRIBUTE_REPORT_PENDING:
             self.report_var.set("")
+        self._refresh_report_preview()
+        self.navigation_changed.emit()
 
     def _problems(self) -> list[tuple[str, str]]:
         """(test item, message) for every item that could not be analysed: what has to be fixed in the data or the settings."""
@@ -1637,6 +1757,7 @@ class ValidationWorkspace(QWidget):
     def _update_coverage(self) -> None:
         total, chosen = self.item_list.count(), len(self.item_list.selectedItems())
         self.coverage_var.set("" if not total else f"Included {chosen} of {total} items")
+        self._refresh_report_preview()
 
     def _context(self):
         if self.study is None or self.result_set is None or self.evaluated is None:
@@ -1707,10 +1828,20 @@ class ValidationWorkspace(QWidget):
         super().resizeEvent(event)
         wide = self.width() >= WIDE_RESULTS
         orientation = Qt.Orientation.Horizontal if wide else Qt.Orientation.Vertical
+        self.split.setStretchFactor(0, 75 if wide else 0)
+        self.split.setStretchFactor(1, 130 if wide else 1)
         if self.split.orientation() != orientation:
             self.split.setOrientation(orientation)
-            self.split.setSizes([380, 700] if wide else [170, 440])
+            self.split.setSizes([477, 827] if wide else [220, 440])
+        if not wide:
+            QTimer.singleShot(0, self, self._size_stacked_results)
         self.selected_label.setVisible(wide and bool(self.selected_var.get()))
+
+    def _size_stacked_results(self) -> None:
+        if self.split.orientation() == Qt.Orientation.Vertical:
+            height = max(0, self.split.height() - self.split.handleWidth())
+            table = min(220, height // 2)
+            self.split.setSizes([table, height - table])
 
 
 class ReadOnlyTextView(QWidget):

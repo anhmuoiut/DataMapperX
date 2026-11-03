@@ -283,7 +283,7 @@ def test_the_review_step_is_locked_until_there_is_something_to_review(app, windo
     assert bar.state(1) == "ready" and window.review_button.isEnabled()
     window.review_button.click()
     assert window.step == "review" and window.content.currentWidget() is window._pages["review"]
-    assert (bar.state(0), bar.caption(0), bar.state(1)) == ("complete", "3 components selected", "current")
+    assert (bar.state(0), bar.caption(0), bar.state(1)) == ("complete", "Folder, profile & components", "current")
     window.back_button.click()
     assert window.step == "select" and (bar.state(0), bar.state(1)) == ("current", "ready")
     bar.click(1)
@@ -318,31 +318,6 @@ def test_the_step_bar_shows_states_and_ignores_locked_steps(app):
 
     QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=QPoint(700, 27))  # a real click on the second step
     assert clicked == [1, 0, 1]
-
-
-def test_check_chips_wrap_when_narrow_and_only_rebuild_on_change(app):
-    from PySide6.QtWidgets import QLabel
-
-    from datamapperx.ui.widgets import ChipRow
-
-    row = ChipRow()
-    chips = [("ok", "✓  10 of 10 samples"), ("ok", "✓  3 files per sample"), ("warn", "!  20 empty cells in 2 columns"),
-             ("info", "Outside min–max: rows 5, 13")]
-    row.set_chips(chips)
-    row.resize(2400, 100)
-    row.show()
-    app.processEvents()
-    labels = row.findChildren(QLabel)
-    assert len({label.y() for label in labels}) == 1
-    row.resize(330, 100)
-    app.processEvents()
-    assert len({label.y() for label in row.findChildren(QLabel)}) >= 2 and row.chips() == chips
-    row.set_chips(chips)  # unchanged: the same widgets stay
-    assert row.findChildren(QLabel) == labels
-    row.set_chips([("bad", "!  one")])
-    assert row.chips() == [("bad", "!  one")]
-    row.set_chips([])
-    assert row.chips() == []
 
 
 # ----------------------------------------------------------------------------- readiness and the busy state
@@ -380,10 +355,11 @@ def test_a_busy_window_keeps_the_component_selection_and_the_step(app, window, t
         for button in (window.add_button, window.add_all_button, window.clear_button, window.move_up_button, window.move_down_button,
                        window.review_button, window.export_button, window.back_button):
             assert not button.isEnabled()
+        assert not window.selected_list.isEnabled()  # and with it the × of every row
         assert window.cancel_button.isEnabled() and window.progress.isVisibleTo(window)
         for action in (window.add_components, window.add_all_shown, window.remove_components, lambda: window._add_at(0),
-                       lambda: window._remove_at(0), window.clear_selected, lambda: window.move_selected(1), window.reset_workflow,
-                       lambda: window._on_step_clicked(1)):
+                       lambda: window._remove_at(0), window.clear_selected, lambda: window.move_selected(1),
+                       lambda: window.reset_workflow(), lambda: window._on_step_clicked(1)):
             action()
             assert window.selected_components == selected and window.available_list.items() == available
             assert window.folder_edit.text() == source and window.step == "select"
@@ -423,7 +399,7 @@ def test_a_new_scan_or_a_reset_returns_to_the_first_step(app, window, tmp_path):
 def test_the_workspace_switch_and_the_shortcuts_that_bring_data_mapping_back(app, window, tmp_path):
     ready_to_review(app, window, tmp_path / "logs")
     window._show_workspace("validation")
-    assert window.workspace == "validation" and window.validation is not None and not window.step_bar.isVisibleTo(window)
+    assert window.workspace == "validation" and window.validation is not None and window.step_bar.isVisibleTo(window)  # one bar for the whole way
     assert window.validation_switch.property("primary") is True and window.mapping_switch.property("primary") is False
     window._in_mapping(lambda: None)
     assert window.workspace == "mapping" and window.step_bar.isVisibleTo(window)
@@ -474,7 +450,6 @@ def test_the_review_compares_the_clicked_row_with_the_limits(app, window, tmp_pa
     window._show_step("review")
     unit = window.limits["R1"]["unit"]
     assert window.limits_title.text() == "Limits (2)"
-    assert window.review_row_label.text() == "Row 1   ·   VSE001   ·   VSE001_1.log"
     first = limits_rows(window)
     assert first[0] == (("R1", "+12.0E+00 ▲", "+0.0E+00", "+9.0E+00", unit), "out")
     assert first[1][0][:2] == ("R2", "+3.0E+00") and first[1][1] == ""
@@ -483,12 +458,10 @@ def test_the_review_compares_the_clicked_row_with_the_limits(app, window, tmp_pa
     assert window._review_row == 2
     row = limits_rows(window)
     assert row[0][0][1] == "+5.0E+00" and row[0][1] == "" and row[1][0][1] == "–" and row[1][1] == "gap"
-    assert window.review_row_label.text() == "Row 3   ·   VSE002   ·   VSE002_1.log"
     assert window.side_tabs.currentWidget() is window.limits_page  # choosing a row shows its limits
 
     window.preview_grid.select_row(5)  # VSE003_2: R1 below its minimum
     assert limits_rows(window)[0][0][1] == "-1.0E+00 ▼" and limits_rows(window)[0][1] == "out"
-    assert ("info", "Outside min–max: rows 1, 6") in window.check_chips.chips()
     window._show_step("select")
     window._show_step("review")  # coming back keeps the row you were looking at
     assert window._review_row == 5 and window.preview_grid.selected_index() == 5
@@ -510,27 +483,17 @@ def test_the_tables_tint_rows_with_missing_values_and_wrong_file_counts(app, win
     assert model.data(model.index(2, 3), Qt.ItemDataRole.BackgroundRole).name() == window.palette_tokens.warn_bg
     assert model.data(model.index(6, 3), Qt.ItemDataRole.BackgroundRole).name() == window.palette_tokens.bad_bg
     window._toggle_theme()  # recoloured with the theme
-    assert model.data(model.index(6, 3), Qt.ItemDataRole.BackgroundRole).name() == window.palette_tokens.bad_bg == "#40191c"
+    assert model.data(model.index(6, 3), Qt.ItemDataRole.BackgroundRole).name() == window.palette_tokens.bad_bg == "#472a31"
 
 
-def test_the_checks_beside_the_export_button_summarise_the_data(app, window, tmp_path):
+def test_a_sample_short_of_the_expected_count_leaves_the_export_on_and_asks_when_exporting(app, window, tmp_path):
     folder = tmp_path / "logs"
     folder.mkdir()
     limit_logs(folder)
     scan(app, window, folder, expected=4)  # one sample short
     window.add_all_shown()
     window._show_step("review")
-    assert window.check_chips.chips() == [
-        ("warn", "!  3 of 4 samples. You will be asked to confirm"), ("ok", "✓  2 files per sample"),
-        ("warn", "!  1 empty cell in 1 column"), ("info", "Outside min–max: rows 1, 6"),
-    ]
     assert window.export_button.isEnabled()
-    window.expected_edit.setText("3")
-    window._refresh_checks()
-    assert window.check_chips.chips()[0] == ("ok", "✓  3 of 3 samples")
-    window.clear_selected()
-    pump(app, lambda: not window._preview_timer.isActive())
-    assert window.check_chips.chips() == []  # nothing selected, nothing to check
 
 
 def test_export_is_blocked_on_the_review_while_a_sample_has_the_wrong_number_of_files(app, window, tmp_path, monkeypatch):
@@ -542,7 +505,6 @@ def test_export_is_blocked_on_the_review_while_a_sample_has_the_wrong_number_of_
     window.add_all_shown()
     assert window.step_bar.state(1) == "warn" and "Fix" in window.step_bar.caption(1)
     window._show_step("review")
-    assert ("bad", "!  VSE003 has 1 files, not 2. Export is blocked") in window.check_chips.chips()
     assert not window.export_button.isEnabled() and window.step_bar.state(1) == "current"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: pytest.fail("blocked")))
     window.export_excel()  # still refuses if called some other way
@@ -570,7 +532,6 @@ def test_the_preview_shows_one_page_of_columns_and_the_export_keeps_all_of_them(
     assert not window.pager_prev.isEnabled() and window.pager_next.isEnabled()
     assert grid.headings()[3] == "comp_00" and grid.headings()[-1] == "comp_19"
     assert "all 45 columns" in window.preview_info.text()  # the missing value is on the last page, still counted
-    assert ("warn", "!  1 empty cell in 1 column") in window.check_chips.chips()
 
     window._page_preview(1)
     pump(app, lambda: window.pager_label.text() == "Columns 21–40 of 45" and not window._preview_timer.isActive())
@@ -1024,17 +985,14 @@ def test_a_large_selection_is_checked_in_the_background_and_the_window_stays_fre
     scan(app, window, folder, repeats=3)
     window.add_all_shown()
     window._show_step("review")
-    assert window.check_chips.chips() == [("info", "Checking the data…")]  # said at once, nothing waited for
-    assert window.grr_grid.rows() == [] and window.is_busy is False
-    pump(app, lambda: bool(window.grr_grid.rows()) and window.check_chips.chips() != [("info", "Checking the data…")])
+    assert window.grr_grid.rows() == [] and window.is_busy is False  # nothing waited for
+    pump(app, lambda: bool(window.grr_grid.rows()))
     assert [row[0] for row in window.grr_grid.rows()] == ["X", "Y"] and window.grr_grid.rows()[0][-1] == "FAIL"
-    assert ("ok", "✓  No empty cells") in window.check_chips.chips()
     # a selection that changed meanwhile: the answer for the old one is thrown away
     window.clear_selected()
     window._add(["X"])
     window._show_step("review")
-    assert window.check_chips.chips() == [("info", "Checking the data…")]
     window.clear_selected()
     pump(app, lambda: not window.tasks.busy and not window._preview_timer.isActive())
-    assert window.grr_grid.rows() == [] and window.check_chips.chips() == []
-    assert window._summary_key[1] != ("X",) and window._grr_key[1] != ("X",)
+    assert window.grr_grid.rows() == []
+    assert window._grr_key[1] != ("X",)

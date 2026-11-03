@@ -33,8 +33,12 @@ def released(monkeypatch):
 
 @pytest.fixture
 def unreleased(monkeypatch):
+    """Attribute Agreement withheld: both release flags off and the check-on-purpose variables unset, so that the gates that hold it
+    back are still tested (the program is shipped with the flags on: ``test_attribute_agreement_is_released``)."""
     for name in (workspace.ATTRIBUTE_PREVIEW_ENV, workspace.ATTRIBUTE_REPORTS_ENV):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(workspace, "ATTRIBUTE_RESULTS_READY", False)
+    monkeypatch.setattr(workspace, "ATTRIBUTE_REPORTS_READY", False)
 
 
 @pytest.fixture
@@ -115,7 +119,14 @@ def test_acceptance_settings_appear_only_for_the_method_that_uses_them(app, ws, 
     assert ws.agreement_row.isHidden()
 
 
-def test_the_release_flags_are_still_off_and_the_variables_override_them(monkeypatch, unreleased):
+def test_attribute_agreement_is_released(monkeypatch):
+    for name in (workspace.ATTRIBUTE_PREVIEW_ENV, workspace.ATTRIBUTE_REPORTS_ENV):
+        monkeypatch.delenv(name, raising=False)
+    assert workspace.ATTRIBUTE_RESULTS_READY is True and workspace.ATTRIBUTE_REPORTS_READY is True  # as the program is shipped
+    assert workspace.attribute_runnable() and workspace.attribute_reportable()
+
+
+def test_when_the_release_flags_are_off_the_variables_override_them(monkeypatch, unreleased):
     assert workspace.ATTRIBUTE_RESULTS_READY is False and workspace.ATTRIBUTE_REPORTS_READY is False
     assert not workspace.attribute_runnable() and "cannot be run yet" in workspace.ATTRIBUTE_PENDING
     assert not workspace.attribute_reportable() and "not available yet" in workspace.ATTRIBUTE_REPORT_PENDING
@@ -181,6 +192,7 @@ def test_attribute_agreement_cannot_be_run_or_reported_until_it_is_released(app,
 def test_a_report_of_attribute_agreement_is_withheld_until_its_own_switch_is_on(app, ws, tmp_path, monkeypatch):
     monkeypatch.setenv(workspace.ATTRIBUTE_PREVIEW_ENV, "1")
     monkeypatch.delenv(workspace.ATTRIBUTE_REPORTS_ENV, raising=False)
+    monkeypatch.setattr(workspace, "ATTRIBUTE_REPORTS_READY", False)  # its reports withheld (the program is shipped with them on)
     load(app, ws, tmp_path)
     run(app, ws)
     assert len(ws.results) == 1 and not ws.pdf_button.isEnabled() and not ws.excel_button.isEnabled()
